@@ -299,6 +299,7 @@ def test_selector_where():
     rngs = spx.Rngs(0)
     m = Net(rngs=rngs)
     only_weights = spx.select().where_variable(lambda v, p: p.endswith("weight")).apply(m)
+    assert only_weights, "selector returned no matches"
     assert all(p.endswith("weight") for p, _ in only_weights)
 
 

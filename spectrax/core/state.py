@@ -371,8 +371,16 @@ class State:
 
         The inner mapping may be either a *nested* dict
         (``{"layer": {"weight": arr}}``) or a *flat* dotted-path dict
-        (``{"layer.weight": arr}``).  Nested form is preferred and is
-        what :meth:`raw` returns.
+        (``{"layer.weight": arr}``); presence of any non-empty inner
+        ``dict`` value triggers nested interpretation, otherwise the
+        keys are split on ``.`` via :func:`str_to_path`. Nested form
+        is preferred and is what :meth:`raw` returns. Live writers
+        are not attached on user-side construction; they are wired
+        only by :func:`spectrax.export`.
+
+        Args:
+            data: Initial backing mapping. ``None`` constructs an
+                empty :class:`State`.
         """
         if data is None:
             d: dict[str, dict[str, Leaf]] = {}

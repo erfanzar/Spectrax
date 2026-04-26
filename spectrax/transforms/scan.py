@@ -4,19 +4,25 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Module-aware :mod:`jax.lax` scan wrappers.
 
-Signature::
+Two functions are exported:
 
-    scan(fn, init_module, xs, *, length=None, mutable=(), unroll=1)
+* :func:`scan` is the module-aware analogue of :func:`jax.lax.scan` for
+  the ``(module, x) -> y`` step shape. The module's state is partitioned
+  by the ``mutable`` selector into a *carry* (the declared-mutable
+  collections) and an *invariant* (everything else). Only the carry is
+  threaded through :func:`jax.lax.scan`; the invariant is required to
+  stay structurally identical from step to step, otherwise the
+  ``mutable=`` declaration was incomplete and a :class:`ValueError`
+  with a remediation hint is raised. After the scan returns, the final
+  carry is overlaid back on top of the invariant and the resulting
+  state is written back to ``init_module`` via
+  :func:`~spectrax.transforms.split_merge.apply_mutations`.
 
-``scan`` uses ``fn(module, x) -> y``. The module's state is partitioned
-into a *carry* (the declared-mutable collections) and an *invariant*
-(everything else). Only the carry is threaded through the scan; the
-invariant is required to stay structurally identical from step to step.
-
-This module also provides :func:`associative_scan`, a module-aware
-wrapper around :func:`jax.lax.associative_scan` for *pure* associative
-binary functions. Unlike :func:`scan`, there is no module-state carry,
-so mutations are rejected explicitly.
+* :func:`associative_scan` wraps :func:`jax.lax.associative_scan` for
+  *pure* associative binary combine functions. Because that primitive
+  performs a tree-shaped parallel prefix with no carry, there is no
+  well-defined place to thread module mutations; any direct write to
+  the captured module raises :class:`~spectrax.IllegalMutationError`.
 """
 
 from __future__ import annotations
@@ -81,7 +87,16 @@ def associative_scan(
     gdef, state = export(module)
 
     def combine(a: Any, b: Any) -> Any:
-        """Rebind a fresh module for this pairwise combine and forbid writes."""
+        """Rebind a fresh module for this pairwise combine and forbid every write.
+
+        :func:`jax.lax.associative_scan` calls the combine ``O(n log n)``
+        times in a parallel-prefix pattern; rebinding ``(gdef, state)``
+        per call gives each call a fresh, identically-seeded module
+        instance. The graph epoch is recorded before invoking ``fn`` so
+        any structural mutation (adding/removing a child module) is
+        caught, and per-variable identity snapshots are checked
+        afterward to guarantee no value-level write slipped through.
+        """
         m = bind(gdef, state)
         epoch_before = _graph_epoch()
         snapshots = [(path, var.kind, var, var._value) for path, var in live_variables(m)]
@@ -157,7 +172,19 @@ def scan(
     carry_state, invariant = mutable_sel.partition_state(init_module, state)
 
     def step(carry: State, x: Any) -> tuple[State, Any]:
-        """Single scan step: merge state, run ``fn``, re-partition."""
+        """Single scan step: merge invariant onto carry, run ``fn``, re-partition.
+
+        Overlays the per-iteration ``carry`` on top of the captured
+        invariant, rebinds a fresh module from the merged state, runs
+        the user-provided ``fn(module, x)`` inside the inside-transform
+        thread-local, and partitions the resulting state into a new
+        carry plus invariant. The new invariant is checked against the
+        original via :func:`_check_invariant_equal` (key-set equality)
+        and :func:`~spectrax.transforms.split_merge.assert_state_unchanged`
+        (per-leaf identity); any difference indicates the caller's
+        ``mutable=`` selector did not cover a collection that ``fn``
+        actually wrote to.
+        """
         full = carry.overlay(invariant)
         m = bind(gdef, full)
         _set_inside_transform(True)
@@ -183,11 +210,22 @@ def scan(
 
 
 def _check_invariant_equal(a: State, b: State) -> None:
-    """Assert ``a`` and ``b`` have the same ``(collection, path)`` keys.
+    """Assert two states share the same ``(collection, path)`` key set.
 
-    Structural (key-set) check only; value equality is too strong under
-    tracing. Mismatches raise :class:`ValueError` prompting the user to
-    declare the differing collection as mutable.
+    Used by :func:`scan` and the control-flow primitives in
+    :mod:`spectrax.transforms.control_flow` to catch the case where a
+    user's body added or removed entries from the supposedly-invariant
+    portion of the module state across iterations / branches. Only the
+    key set is compared because value equality on tracers is undefined
+    during JAX tracing — per-leaf identity is checked separately by
+    :func:`~spectrax.transforms.split_merge.assert_state_unchanged`.
+
+    Args:
+        a: Reference state captured before the loop / branch.
+        b: State observed after one iteration / branch run.
+
+    Raises:
+        ValueError: If the key sets differ.
     """
     a_keys = {(c, p) for c, p in a.paths()}
     b_keys = {(c, p) for c, p in b.paths()}

@@ -197,7 +197,24 @@ def compile_ranked_executables(
         my_fns = {logical: stage_fns[logical] for logical in my_logical_stages}
 
         def make_program(rank, rank_actions, rank_fns):
-            """Build one rank's program as a jitted callable."""
+            """Build one rank's compiled-pipeline callable.
+
+            Closes over ``rank``, the rank's ordered :class:`Action`
+            list, and a logical-stage -> stage-function mapping so the
+            inner jitted function evaluates exactly the work this rank
+            owns.
+
+            Args:
+                rank: Physical pipeline rank.
+                rank_actions: Ordered :class:`Action` list executed by
+                    ``rank``.
+                rank_fns: Mapping of logical stage index to its stage
+                    function (closed jaxpr evaluator).
+
+            Returns:
+                A jitted ``(stage_params, mb_inputs, mb_cotangents,
+                *mb_targets)`` callable.
+            """
 
             @jax.jit
             def rank_fn(all_stage_params, mb_inputs, mb_cotangents, *mb_targets):
@@ -243,7 +260,15 @@ def compile_ranked_executables(
                         params = tuple(all_stage_params[logical])
 
                         def _stage_primary(*p_and_x, _fn=sfn, _n=len(params)):
-                            """Stage primary output as a function of params and input."""
+                            """Return the stage's primary activation as a function of ``(params, x)``.
+
+                            Used as the :func:`jax.vjp` target so the
+                            backward call differentiates with respect
+                            to both parameters and the staged input.
+                            ``_fn`` and ``_n`` are bound at definition
+                            time to avoid closure leaks across
+                            consecutive backward equations.
+                            """
                             p = p_and_x[:_n]
                             x = p_and_x[_n]
                             out = _fn(*p, x)
@@ -259,7 +284,7 @@ def compile_ranked_executables(
                             g_params_accum[logical] = g_p
                         else:
                             g_params_accum[logical] = jax.tree.map(
-                                lambda a, b: a + b,
+                                lambda u, v: u + v,
                                 g_params_accum[logical],
                                 g_p,
                             )
@@ -318,11 +343,24 @@ def run_ranked_pipeline(
     params_tree = tuple(tuple(params) for params in params_per_stage)
 
     def _primary(out: Any) -> Any:
-        """Extract a stage's primary activation output."""
+        """Pick the first element from a stage output tuple, else return as-is.
+
+        Stage callables built from clusters with multiple outvars
+        return tuples; single-output stages return the array directly.
+        This helper normalises both cases for the sequential loss
+        accumulator.
+        """
         return out[0] if isinstance(out, (tuple, list)) else out
 
     def _micro_loss(params: tuple[tuple[Any, ...], ...], x_mb: Any, *targets_mb: Any) -> Any:
-        """Sequential microbatch loss through all logical stages."""
+        """Sequentially evaluate every logical stage on one microbatch and return the loss.
+
+        Used for the reference single-rank simulation that produces
+        ground-truth gradients via :func:`jax.value_and_grad`. Each
+        stage's primary activation feeds the next stage's input, and
+        ``loss_fn`` consumes the final activation against the
+        microbatch targets.
+        """
         h = x_mb
         for logical, fn in enumerate(stage_fns):
             h = _primary(fn(*params[logical], h))
@@ -345,9 +383,14 @@ def run_ranked_pipeline(
     mean_loss = loss_sum * inv_m
     grads = jax.tree.map(lambda g: g * inv_m, grad_accum)
     if stage_shardings is not None:
+        V = schedule.virtual_stages_per_rank()
+        logical_to_rank: dict[int, int] = {}
+        for r in range(n_stages):
+            for v in range(V):
+                logical_to_rank[schedule.logical_at(r, v, n_stages)] = r
         placed = []
         for logical, grad in enumerate(grads):
-            rank = logical % n_stages
+            rank = logical_to_rank[logical]
             placed.append(jax.device_put(grad, stage_shardings[rank]))
         return mean_loss, placed
     return mean_loss, list(grads)

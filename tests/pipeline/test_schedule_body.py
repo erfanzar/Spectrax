@@ -335,9 +335,9 @@ class TestScheduledBodyVirtualStages:
         ref_loss, ref_grads = _analytic_reference_vstage(weights, xs, tgt, m)
         assert jnp.allclose(loss, ref_loss, atol=1e-3, rtol=1e-4)
         for (r, v), ref in ref_grads.items():
-            assert jnp.allclose(
-                grads["w"][r, v], ref, atol=1e-3, rtol=1e-4
-            ), f"mismatch at ({r},{v}): got {grads['w'][r, v]}, ref {ref}"
+            assert jnp.allclose(grads["w"][r, v], ref, atol=1e-3, rtol=1e-4), (
+                f"mismatch at ({r},{v}): got {grads['w'][r, v]}, ref {ref}"
+            )
 
 
 class TestScheduledBodyVirtualStageSmoke:

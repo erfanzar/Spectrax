@@ -53,7 +53,26 @@ __all__ = ["auto_split", "split_block_stack"]
 
 
 def _resolve_stage(pp_stage: int | str, n_pp: int) -> int:
-    """Resolve a ``pp_stage`` annotation to a concrete stage index."""
+    """Resolve a ``pp_stage`` annotation to a concrete stage index.
+
+    Accepts the strings ``"first"`` / ``"last"`` and any integer
+    (negative indices count from the end, mirroring Python list
+    semantics). The resulting index is bounds-checked against
+    ``n_pp``.
+
+    Args:
+        pp_stage: User-supplied annotation. Either an ``int`` or one
+            of the string aliases ``"first"`` / ``"last"``.
+        n_pp: Total number of pipeline stages, used to interpret
+            negative indices and the ``"last"`` alias.
+
+    Returns:
+        A non-negative integer in ``[0, n_pp)``.
+
+    Raises:
+        ValueError: If ``pp_stage`` is an unrecognised string or an
+            integer that resolves outside ``[0, n_pp)``.
+    """
     if isinstance(pp_stage, str):
         if pp_stage == "first":
             return 0
@@ -69,16 +88,45 @@ def _resolve_stage(pp_stage: int | str, n_pp: int) -> int:
 
 
 def _default_block_stage(index: int, n_blocks: int, n_pp: int) -> int:
-    """Map block ``index`` to a balanced contiguous default pipeline rank."""
+    """Map block ``index`` to a balanced contiguous default pipeline rank.
+
+    Used when a block carries no explicit ``pp_stage``. The mapping
+    keeps blocks contiguous within a stage (block ``i`` and ``i+1``
+    land on the same rank when possible) so cross-rank transport only
+    happens at stage boundaries, not inside a stage.
+
+    Args:
+        index: Position of the block in the original ``ModuleList``.
+        n_blocks: Total number of blocks.
+        n_pp: Number of pipeline stages.
+
+    Returns:
+        The rank index this block defaults to.
+    """
     return min(n_pp - 1, (index * n_pp) // n_blocks)
 
 
 def _block_stage_indices(blocks: list[Module], n_pp: int) -> list[int]:
-    """Resolve per-block stage ownership.
+    """Resolve per-block stage ownership for an entire block list.
 
-    Explicit ``block.pp_stage`` annotations win. Unannotated blocks use the
-    balanced contiguous default mapping. The resolved sequence must be
-    monotonic, otherwise stage order would no longer match model order.
+    Walks ``blocks`` in order, asking :func:`_resolve_stage` for any
+    block carrying an explicit ``pp_stage`` annotation and falling
+    back to :func:`_default_block_stage` otherwise. The final
+    sequence must be non-decreasing — block ``i+1`` cannot land on a
+    rank earlier than block ``i`` because that would let an
+    activation flow backwards through the pipeline mid-forward.
+
+    Args:
+        blocks: The original ``ModuleList`` contents.
+        n_pp: Number of pipeline stages.
+
+    Returns:
+        A list of length ``len(blocks)`` whose entries are stage
+        indices in ``[0, n_pp)``.
+
+    Raises:
+        ValueError: If the resolved sequence is not monotonic, i.e.
+            a user annotation puts a later block on an earlier stage.
     """
     n_blocks = len(blocks)
     stages: list[int] = []
@@ -97,10 +145,23 @@ def _block_stage_indices(blocks: list[Module], n_pp: int) -> list[int]:
 
 
 def _forward_positional_params(module: Module) -> list[inspect.Parameter]:
-    """Return meaningful positional params from ``module.forward``.
+    """Return the meaningful positional params from ``module.forward``.
 
-    Wrappers such as ``spx.remat`` often expose ``forward(*args, **kwargs)``;
-    those generic varargs should not trigger multi-carry warnings.
+    Used to detect blocks whose ``forward`` accepts more than one
+    positional argument so we can emit a ``block_carry`` warning.
+    Wrappers such as :func:`spx.remat` often expose
+    ``forward(*args, **kwargs)``; those generic varargs would falsely
+    trigger the warning, so they are filtered out by restricting to
+    ``POSITIONAL_ONLY`` and ``POSITIONAL_OR_KEYWORD`` kinds.
+
+    Args:
+        module: A :class:`Module` whose ``forward`` is to be
+            inspected.
+
+    Returns:
+        The subset of ``inspect.signature(module.forward).parameters``
+        that represent real positional arguments (not ``self`` and
+        not ``*args``).
     """
     sig = inspect.signature(module.forward)
     return [
@@ -112,6 +173,13 @@ def _forward_positional_params(module: Module) -> list[inspect.Parameter]:
 
 class _StageWrapper(Module):
     """One pipeline stage's worth of submodules, chained ``pre -> blocks -> post``.
+
+    Constructed by :func:`split_block_stack` to repackage a slice of
+    a user's model into a single :class:`Module` that the runtime can
+    treat as one pipeline stage. The wrapper preserves enough metadata
+    (``pre_names``, ``post_names``, ``carry_indices``) for
+    :meth:`forward` to know which positional arguments to feed each
+    inner block.
 
     Supports both single-arg and multi-arg block signatures. When a
     block returns a tuple, the tuple is unpacked as positional args
@@ -133,7 +201,27 @@ class _StageWrapper(Module):
         post: list[tuple[str, Module]],
         carry_indices: tuple[int, ...] = (0,),
     ):
-        """Store pre/blocks/post submodules as attributes."""
+        """Materialise pre/blocks/post submodules as attributes of this stage.
+
+        The pre/post modules are reattached under their original
+        attribute names so the final module's pytree structure mirrors
+        the user's hand-written model. The repeated blocks are wrapped
+        in a fresh :class:`ModuleList` named ``blocks`` regardless of
+        the source name.
+
+        Args:
+            pre: ``(name, module)`` pairs to install before the block
+                run (e.g. embedding, norm).
+            blocks: The slice of original ``ModuleList`` blocks
+                assigned to this stage.
+            post: ``(name, module)`` pairs to install after the block
+                run (e.g. final norm, lm_head).
+            carry_indices: Indices into the positional-args tuple that
+                identify which arguments are *carried* by each block
+                (i.e. updated and forwarded). Other arguments are
+                broadcast to every block unchanged. See
+                :meth:`forward` for the semantics.
+        """
         super().__init__()
         for name, m in pre:
             setattr(self, name, m)
@@ -148,16 +236,31 @@ class _StageWrapper(Module):
         """Run pre -> blocks -> post, threading carry + broadcast args.
 
         Args are split into **carry** (change each block) and
-        **broadcast** (same for all blocks) by carry_indices.
-        Blocks receive (*carry, *broadcast) and return updated
-        carry values. Pre/post modules receive only the first carry arg.
+        **broadcast** (same for all blocks) by ``carry_indices``.
+        Blocks receive ``(*carry, *broadcast)`` and return updated
+        carry values. Pre/post modules receive only the first carry
+        arg (the canonical "hidden state" position).
 
-        Example: carry_indices=(0, 3) with args
-        (hidden, mask, pos_ids, kv_cache) means carry is
-        (hidden, kv_cache) and broadcast is (mask, pos_ids).
-        Block called as blk(hidden, kv_cache, mask, pos_ids)
-        returns (new_hidden, new_kv_cache) which replaces carry
+        Example: ``carry_indices=(0, 3)`` with args
+        ``(hidden, mask, pos_ids, kv_cache)`` means carry is
+        ``(hidden, kv_cache)`` and broadcast is ``(mask, pos_ids)``.
+        Block called as ``blk(hidden, kv_cache, mask, pos_ids)``
+        returns ``(new_hidden, new_kv_cache)`` which replaces carry
         for the next block.
+
+        Args:
+            *args: Positional arguments to the stage. The first arg is
+                always treated as the primary carry; other carries are
+                determined by :attr:`carry_indices`.
+            **kwargs: Keyword arguments. Forwarded only to the *first*
+                pre-module call; subsequent calls drop them so blocks
+                don't receive accidental keyword leakage.
+
+        Returns:
+            Either the single primary output (when the stage produces
+            one positional value) or the full updated argument tuple
+            (when the stage produces multiple). Matches what the
+            downstream stage will receive as its ``*args``.
         """
         ci = self.carry_indices
         n_args = len(args)
@@ -193,20 +296,48 @@ def split_block_stack(
 ) -> list[Module]:
     """Split ``model`` into ``n_pp`` :class:`_StageWrapper` stages.
 
-    Respects ``pp_stage`` annotations on Module children. Children
-    with ``pp_stage`` set are placed on the specified stage; children
-    without it fall back to auto-detection (before ``blocks`` → stage 0,
-    after ``blocks`` → stage ``n_pp - 1``).
+    The split has three pieces: pre-block modules (e.g. ``embed``),
+    the contents of the ``blocks`` :class:`ModuleList`, and post-block
+    modules (e.g. ``norm_f`` / ``head``). Each block is assigned to a
+    stage by :func:`_block_stage_indices`; pre/post modules respect
+    explicit ``pp_stage`` annotations and otherwise default to stage
+    0 / stage ``n_pp - 1`` respectively.
+
+    Block signatures with multiple positional arguments (e.g. a
+    ``forward(hidden, mask, pos_ids)``) are handled via the
+    ``block_carry`` class attribute on the block: it lists which
+    positional indices are *carried* (mutated and forwarded) vs
+    broadcast unchanged across blocks. Without ``block_carry`` and
+    with multi-arg blocks the split emits a :class:`UserWarning`
+    suggesting a setting.
+
+    Respects ``pp_stage`` annotations on :class:`Module` children:
+    children with ``pp_stage`` set are placed on the specified stage;
+    children without it fall back to auto-detection (before ``blocks``
+    -> stage 0, after ``blocks`` -> stage ``n_pp - 1``).
 
     Args:
         model: The full model with a ``blocks: ModuleList``.
-        n_pp: Number of pipeline stages. Must divide ``len(blocks)``.
-        blocks_attr: Name of the :class:`ModuleList` attribute.
-        pre_attrs: Override auto-detected pre-block children.
-        post_attrs: Override auto-detected post-block children.
+        n_pp: Number of pipeline stages. Should divide ``len(blocks)``
+            for balanced splits, but uneven splits are also accepted.
+        blocks_attr: Name of the :class:`ModuleList` attribute on
+            ``model``. Defaults to ``"blocks"``.
+        pre_attrs: Override the auto-detected list of pre-block
+            children. ``None`` means auto-detect via
+            :func:`_auto_pre_post`.
+        post_attrs: Override the auto-detected list of post-block
+            children. ``None`` means auto-detect.
 
     Returns:
-        ``n_pp`` :class:`_StageWrapper` instances.
+        A list of ``n_pp`` :class:`_StageWrapper` instances, ready to
+        be passed to a pipeline runtime.
+
+    Raises:
+        ValueError: If ``model`` lacks ``blocks_attr``, the attribute
+            is empty, or block-level ``pp_stage`` annotations are not
+            non-decreasing.
+        TypeError: If ``model.<blocks_attr>`` is not sized (no
+            ``__len__``).
     """
     blocks = getattr(model, blocks_attr, None)
     if blocks is None:
@@ -277,10 +408,31 @@ def split_block_stack(
 
 
 def auto_split(model: Module, n_pp: int) -> list[Module]:
-    """Top-level entry: prefer ``model.pipeline_split(n_pp)`` if defined.
+    """Slice ``model`` into ``n_pp`` per-stage modules for pipeline parallelism.
 
-    Falls back to :func:`split_block_stack` which auto-detects
-    ``blocks`` + pre/post Modules, respecting ``pp_stage`` annotations.
+    The preferred user override is to define a
+    ``pipeline_split(n_pp)`` method on the model class — that method
+    can implement model-specific splitting (multi-tower architectures,
+    cross-attention bridges, etc.) without touching the runtime. When
+    no such method exists we fall back to :func:`split_block_stack`,
+    which auto-detects the ``blocks: ModuleList`` + surrounding
+    pre/post modules and respects any ``pp_stage`` annotations the
+    user has attached.
+
+    Args:
+        model: The full single-device model.
+        n_pp: Number of pipeline stages.
+
+    Returns:
+        A list of ``n_pp`` :class:`Module` instances suitable for
+        wrapping with :class:`~spectrax.nn.PipelineSequential` or
+        feeding directly into a pipeline runtime as
+        :class:`PipelineStage` callables.
+
+    Raises:
+        ValueError: If ``model.pipeline_split`` returns the wrong
+            shape, or if the fallback :func:`split_block_stack` cannot
+            find a valid ``blocks`` attribute.
     """
     if hasattr(model, "pipeline_split"):
         out = model.pipeline_split(n_pp)
@@ -295,8 +447,27 @@ def auto_split(model: Module, n_pp: int) -> list[Module]:
 
 
 def _auto_pre_post(model: Module, blocks_attr: str) -> tuple[list[str], list[str]]:
-    """Walk ``model.__dict__`` in insertion order; classify each Module
-    attribute as 'before blocks' or 'after blocks'."""
+    """Classify ``model``'s :class:`Module` children by position relative to ``blocks``.
+
+    Walks ``model.__dict__`` in insertion order — the order in which
+    ``__init__`` set the attributes — and returns two lists of
+    attribute names: one for modules declared before ``blocks_attr``,
+    one for modules declared after. The ``blocks_attr`` itself is
+    skipped.
+
+    The insertion-order traversal mirrors the user's intent: a module
+    declared earlier in ``__init__`` is assumed to run earlier in the
+    forward pass, so it belongs on an earlier pipeline stage.
+
+    Args:
+        model: The model whose children to classify.
+        blocks_attr: Name of the ``ModuleList`` attribute that
+            partitions the model into pre / post halves.
+
+    Returns:
+        ``(pre_attrs, post_attrs)`` — names of :class:`Module`
+        children before and after ``blocks_attr`` respectively.
+    """
     pre: list[str] = []
     post: list[str] = []
     seen_blocks = False

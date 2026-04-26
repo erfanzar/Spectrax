@@ -2,7 +2,7 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Small shared utilities for functional ops."""
+"""Small shared utilities for the functional ops in :mod:`spectrax.functional`."""
 
 from __future__ import annotations
 
@@ -17,10 +17,22 @@ def promote_dtype(
     *arrays: ArrayLike,
     dtype: DType | None = None,
 ) -> tuple[Array, ...]:
-    """Cast every array to a common dtype.
+    """Cast every input array to a common dtype.
 
-    If ``dtype`` is ``None``, the result uses
-    :func:`jax.numpy.promote_types` across the inputs' dtypes.
+    Used by layers that mix activations and parameters of different
+    precisions (e.g. fp32 weights with bf16 inputs). When ``dtype`` is
+    ``None`` the result dtype is derived by folding
+    :func:`jax.numpy.promote_types` across the inputs in order, which
+    matches NumPy's "promote everything to the widest" rule.
+
+    Args:
+        *arrays: Arbitrary array-like inputs.
+        dtype: Optional explicit target dtype. ``None`` (default)
+            triggers automatic promotion across the inputs.
+
+    Returns:
+        A tuple of arrays in the same order as the inputs, each cast to
+        the resolved dtype. An empty input tuple returns ``()``.
     """
     arrs = [jnp.asarray(a) for a in arrays]
     if dtype is None:

@@ -148,9 +148,9 @@ def test_hybrid_grads_match_reference(hybrid_stages, xy, hybrid_mesh):
     assert len(grads) == 4
     for i, pg in enumerate(grads):
         for path in pg:
-            assert jnp.allclose(
-                pg[path], ref_grads[i][path], atol=1e-3, rtol=1e-3
-            ), f"Grad mismatch at stage {i}, path {path!r}"
+            assert jnp.allclose(pg[path], ref_grads[i][path], atol=1e-3, rtol=1e-3), (
+                f"Grad mismatch at stage {i}, path {path!r}"
+            )
 
 
 def test_homogeneous_forward_passes_extra_inputs_to_stages():

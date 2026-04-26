@@ -2,7 +2,29 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Interleaved (virtual-stage) schedules: InterleavedH1, InterleavedGPipe, Interleaved1F1BPlusOne, KimiK2."""
+"""Interleaved (virtual-stage) pipeline schedules.
+
+Each physical rank hosts more than one logical stage in these
+schedules. By spreading the work of multiple stages across the same
+device the bubble shrinks roughly by a factor of
+``virtual_stages``, at the cost of additional ``ppermute`` hops per
+microbatch when consecutive logical stages live on different physical
+ranks.
+
+This module exposes:
+
+* :class:`InterleavedH1` — interleaved 1F1B (Narayanan et al., 2021).
+* :class:`InterleavedGPipe` — the GPipe-style ordering analogue.
+* :class:`Interleaved1F1BPlusOne` — :class:`InterleavedH1` with a
+  single warmup forward prepended (instructional building block).
+* :class:`KimiK2` — Moonshot AI's 2024 variant: bumps each logical
+  stage's warmup count by ``extra_warmup`` and folds the bump into
+  the steady state (no extra time-step row).
+
+Plus the internal :func:`_build_physical_virtual_1f1b` list scheduler
+that handles dependency-correct emission for any
+``logical_at`` mapping.
+"""
 
 from __future__ import annotations
 
@@ -42,7 +64,13 @@ class InterleavedH1(Schedule):
     stage_layout: Literal["contiguous", "interleaved", "loop"] = "loop"
 
     def __post_init__(self) -> None:
-        """Validate configuration."""
+        """Validate :attr:`virtual_stages` and :attr:`stage_layout`.
+
+        Raises:
+            ValueError: If :attr:`virtual_stages` is less than 1, or
+                if :attr:`stage_layout` is not one of the three
+                supported values.
+        """
         super().__post_init__()
         if self.virtual_stages < 1:
             raise ValueError(f"InterleavedH1.virtual_stages must be >= 1, got {self.virtual_stages}.")
@@ -52,16 +80,32 @@ class InterleavedH1(Schedule):
             )
 
     def virtual_stages_per_rank(self) -> int:
-        """Number of virtual stages per physical device."""
+        """Return :attr:`virtual_stages` — overrides the flat-schedule default."""
         return self.virtual_stages
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
-        """Map ``(rank, virt)`` to its logical-stage index.
+        """Map ``(rank, virt)`` to its logical-stage index under :attr:`stage_layout`.
 
-        ``stage_layout="contiguous"`` hosts consecutive logical chunks per
-        physical rank, reducing cross-rank activation transfers. The classic
-        virtual-pipeline layout is available with
-        ``stage_layout="interleaved"``.
+        The three supported layouts trade off transport cost vs
+        per-rank balance:
+
+        * ``"contiguous"``: rank ``r`` hosts logical stages
+          ``r * V .. (r+1) * V - 1`` — minimal cross-rank transfers
+          but worst bubble.
+        * ``"interleaved"``: classic virtual-pipeline layout
+          (Narayanan 2021); rank ``r`` hosts
+          ``r, r + n, r + 2n, ...`` — best bubble.
+        * ``"loop"``: zig-zag layout that flips direction every
+          virtual chunk so adjacent logical stages share a rank when
+          possible — good middle ground.
+
+        Args:
+            rank: Physical rank index.
+            virt: Virtual-stage index on this rank.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            The logical-stage index in ``[0, V * n_stages)``.
         """
         if self.stage_layout == "contiguous":
             return rank * self.virtual_stages + virt
@@ -71,7 +115,21 @@ class InterleavedH1(Schedule):
         return virt * n_stages + rank
 
     def next_logical_loc(self, rank: int, virt: int, n_stages: int):
-        """Return the ``(rank, virt)`` of the next logical stage (or ``None``)."""
+        """Return the ``(rank, virt)`` of the next logical stage, or ``None``.
+
+        Inverse-maps :meth:`logical_at` for ``logical + 1`` so the
+        runtime knows where to ``ppermute`` an activation after this
+        action produces it.
+
+        Args:
+            rank: Current physical rank.
+            virt: Current virtual-stage index.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Downstream ``(rank, virt)`` or ``None`` if this position
+            is the final logical stage.
+        """
         nxt = self.logical_at(rank, virt, n_stages) + 1
         if nxt >= self.virtual_stages * n_stages:
             return None
@@ -85,7 +143,18 @@ class InterleavedH1(Schedule):
         return (nxt % n_stages, nxt // n_stages)
 
     def terminal_loc(self, n_stages: int) -> tuple[int, int]:
-        """Return the ``(rank, virt)`` hosting the terminal logical stage."""
+        """Return the ``(rank, virt)`` hosting the terminal logical stage.
+
+        Convenience wrapper that inverse-maps the highest logical
+        stage under the active :attr:`stage_layout`.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``(rank, virt)`` for the logical stage that runs
+            ``loss_fn``.
+        """
         terminal = self.virtual_stages * n_stages - 1
         if self.stage_layout == "contiguous":
             return (terminal // self.virtual_stages, terminal % self.virtual_stages)
@@ -97,7 +166,18 @@ class InterleavedH1(Schedule):
         return (terminal % n_stages, terminal // n_stages)
 
     def _skip_auto_fuse_1f1b(self) -> bool:
-        """Physical list scheduling already optimizes rank occupancy."""
+        """Tell runtimes to bypass the FWD/BWD fusion pass.
+
+        :func:`_build_physical_virtual_1f1b` already runs a
+        critical-path-aware list scheduler that produces a tight
+        physical-rank occupancy. Re-running
+        :func:`fuse_1f1b_steady_state` over its output rarely finds
+        adjacent FWD/BWD pairs and would only add spurious
+        :class:`FusedTask` cells, so the runtime opts out.
+
+        Returns:
+            ``True`` always.
+        """
         return True
 
     def build(self, n_stages: int) -> list[list[Action | None]]:
@@ -125,7 +205,17 @@ class InterleavedH1(Schedule):
         )
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak ≈ ``n_stages x virtual_stages``."""
+        """Peak ≈ ``n_stages * virtual_stages`` saved activations per rank.
+
+        Each physical rank carries ``virtual_stages`` independent
+        warmup queues, each bounded by ``n_stages`` like flat 1F1B.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``n_stages * virtual_stages``.
+        """
         return n_stages * self.virtual_stages
 
 
@@ -156,7 +246,12 @@ class InterleavedGPipe(Schedule):
     stage_layout: Literal["contiguous", "interleaved", "loop"] = "loop"
 
     def __post_init__(self) -> None:
-        """Validate ``virtual_stages >= 1``."""
+        """Validate :attr:`virtual_stages` and :attr:`stage_layout`.
+
+        Raises:
+            ValueError: If ``virtual_stages < 1`` or ``stage_layout``
+                is not one of the three supported values.
+        """
         super().__post_init__()
         if self.virtual_stages < 1:
             raise ValueError(f"InterleavedGPipe.virtual_stages must be >= 1, got {self.virtual_stages}.")
@@ -167,11 +262,23 @@ class InterleavedGPipe(Schedule):
             )
 
     def virtual_stages_per_rank(self) -> int:
-        """Number of virtual stages per physical device."""
+        """Return :attr:`virtual_stages`."""
         return self.virtual_stages
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
-        """Map ``(rank, virt)`` to its logical-stage index."""
+        """Map ``(rank, virt)`` to its logical-stage index.
+
+        Same layout choices as :meth:`InterleavedH1.logical_at`; see
+        that docstring for layout semantics.
+
+        Args:
+            rank: Physical rank index.
+            virt: Virtual-stage index.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Logical-stage index in ``[0, V * n_stages)``.
+        """
         if self.stage_layout == "contiguous":
             return rank * self.virtual_stages + virt
         if self.stage_layout == "loop":
@@ -180,7 +287,16 @@ class InterleavedGPipe(Schedule):
         return virt * n_stages + rank
 
     def next_logical_loc(self, rank: int, virt: int, n_stages: int):
-        """Return the ``(rank, virt)`` of the next logical stage (or ``None``)."""
+        """Return the ``(rank, virt)`` of the next logical stage, or ``None``.
+
+        Args:
+            rank: Current physical rank.
+            virt: Current virtual-stage index.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Downstream ``(rank, virt)`` or ``None`` if terminal.
+        """
         nxt = self.logical_at(rank, virt, n_stages) + 1
         if nxt >= self.virtual_stages * n_stages:
             return None
@@ -194,7 +310,15 @@ class InterleavedGPipe(Schedule):
         return (nxt % n_stages, nxt // n_stages)
 
     def terminal_loc(self, n_stages: int) -> tuple[int, int]:
-        """Return the ``(rank, virt)`` hosting the terminal logical stage."""
+        """Return the ``(rank, virt)`` hosting the terminal logical stage.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``(rank, virt)`` for the logical stage that runs
+            ``loss_fn``.
+        """
         terminal = self.virtual_stages * n_stages - 1
         if self.stage_layout == "contiguous":
             return (terminal // self.virtual_stages, terminal % self.virtual_stages)
@@ -245,7 +369,19 @@ class InterleavedGPipe(Schedule):
         return grid
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak ≈ ``virtual_stages x microbatches`` (all saved before BWD)."""
+        """Peak ≈ ``virtual_stages * microbatches`` saved activations per rank.
+
+        GPipe-style ordering means every microbatch's forward
+        activation must survive until the backward pass, multiplied
+        by the number of virtual stages each rank owns.
+
+        Args:
+            n_stages: Number of physical pipeline ranks (unused; the
+                bound is per-rank).
+
+        Returns:
+            ``virtual_stages * microbatches``.
+        """
         return self.virtual_stages * self.microbatches
 
 
@@ -299,7 +435,26 @@ class Interleaved1F1BPlusOne(InterleavedH1):
 
 
 def _warmup_bumped_1f1b_queue(logical: int, n_logical: int, microbatches: int, *, extra_warmup: int) -> list[Action]:
-    """Build one logical stage's 1F1B action queue with Kimi-style warmup."""
+    """Build one logical stage's 1F1B action queue with optional warmup bump.
+
+    Standard 1F1B emits ``min(n_logical - logical, microbatches)``
+    forwards in warmup, then strict 1F1B alternation; the
+    ``extra_warmup`` parameter pulls additional forwards into warmup
+    (capped at ``microbatches``) to reproduce the Kimi-K2 per-stage
+    +1 forward behaviour without per-physical-rank bookkeeping.
+
+    Args:
+        logical: Logical stage index in ``[0, n_logical)``.
+        n_logical: Total number of logical stages.
+        microbatches: Microbatches per step.
+        extra_warmup: Additional forwards to fold into warmup
+            (typically 0 or 1).
+
+    Returns:
+        Ordered list of :class:`Action` s this logical stage runs,
+        warmup forwards first, then strict ``F, B, F, B, ...``
+        alternation, then any remaining backward drain.
+    """
     warmup = min(min(n_logical - logical, microbatches) + extra_warmup, microbatches)
     queue: list[Action] = [Action(Phase.FWD, mb) for mb in range(warmup)]
     fwd_head = warmup
@@ -324,10 +479,40 @@ def _build_physical_virtual_1f1b(
 ) -> list[list[Action | None]]:
     """List-schedule virtual 1F1B directly on physical ranks.
 
-    A logical-grid remap can leave physical-rank bubbles when two virtual
-    stages collide on one rank. This keeps each logical stage's 1F1B queue and
-    all data dependencies, then chooses ready work per physical rank by
-    remaining critical path.
+    The naive approach — build a 1F1B grid for ``n_logical`` logical
+    stages and remap each cell to its physical rank — leaves bubbles
+    whenever two virtual stages on the same rank want the same time
+    step. This function avoids that by:
+
+    1. Building each logical stage's queue with
+       :func:`_warmup_bumped_1f1b_queue` (so warmup, steady state and
+       drain are individually correct).
+    2. Recording the data-dependency DAG: per-stage queue order,
+       ``BWD`` waits on ``FWD`` of the same ``(stage, mb)``,
+       ``FWD`` of stage ``s`` waits on ``FWD`` of stage ``s-1``, and
+       ``BWD`` of stage ``s`` waits on ``BWD`` of stage ``s+1``.
+    3. Computing a memoised critical path per task (longest-finish
+       time) so the list scheduler picks the most schedule-critical
+       ready task on each physical rank at each time step.
+    4. Iterating time steps: for each rank, gather the ready actions
+       across its ``virtual_stages`` queues, pick the highest
+       critical-path task, emit it, advance counters.
+
+    Args:
+        n_stages: Number of physical pipeline ranks.
+        virtual_stages: Virtual stages per physical rank.
+        microbatches: Microbatches per step.
+        extra_warmup: Forwarded to :func:`_warmup_bumped_1f1b_queue`.
+        logical_at: ``(rank, virt, n_stages) -> logical`` mapping.
+
+    Returns:
+        The dependency-correct ``(T, n_stages)`` action grid.
+
+    Raises:
+        ValueError: If ``logical_at`` returns out-of-range stages or
+            assigns the same logical stage to two virtual locations.
+        RuntimeError: If the scheduler stalls (would indicate a bug
+            in ``logical_at`` or the dependency model).
     """
     n = n_stages
     v = virtual_stages
@@ -355,7 +540,16 @@ def _build_physical_virtual_1f1b(
     successors: dict[tuple[int, Phase, int], set[tuple[int, Phase, int]]] = {key: set() for key in task_keys}
 
     def add_dep(task: tuple[int, Phase, int], dep: tuple[int, Phase, int]) -> None:
-        """Record ``task`` -> ``dep`` in both adjacency lists (predecessors and successors)."""
+        """Record that ``task`` depends on ``dep`` in the bidirectional DAG.
+
+        Maintains both the predecessor map (used by the scheduler to
+        check readiness) and the successor map (used by the
+        critical-path computation).
+
+        Args:
+            task: The dependent ``(logical, phase, microbatch)`` key.
+            dep: The dependency ``(logical, phase, microbatch)`` key.
+        """
         predecessors.setdefault(task, set()).add(dep)
         successors.setdefault(dep, set()).add(task)
 
@@ -384,7 +578,15 @@ def _build_physical_virtual_1f1b(
 
         Uses simple per-action latencies (BWD costs ~2x FWD on most
         hardware) summed along the longest downstream path. Used to
-        rank ready tasks so the most schedule-critical work fires first.
+        rank ready tasks so the most schedule-critical work fires
+        first.
+
+        Args:
+            task: ``(logical, phase, microbatch)`` key.
+
+        Returns:
+            Latency-weighted longest path from ``task`` to the
+            terminal logical stage.
         """
         cached = critical_cache.get(task)
         if cached is not None:
@@ -485,14 +687,28 @@ class KimiK2(InterleavedH1):
     extra_warmup: int = 1
 
     def __post_init__(self) -> None:
-        """Validate the warmup bump."""
+        """Validate that :attr:`extra_warmup` is non-negative.
+
+        Raises:
+            ValueError: If ``extra_warmup`` is negative.
+        """
         super().__post_init__()
         if self.extra_warmup < 0:
             raise ValueError(f"KimiK2.extra_warmup must be >= 0, got {self.extra_warmup}.")
 
     def build(self, n_stages: int) -> list[list[Action | None]]:
-        """Same logical->physical remap as :class:`InterleavedH1` but
-        the underlying per-logical-stage 1F1B uses +1 warmup."""
+        """Emit the Kimi-K2 grid: interleaved 1F1B with bumped warmup.
+
+        Same logical-to-physical remap as :class:`InterleavedH1` but
+        the underlying per-logical-stage 1F1B queue uses
+        ``extra_warmup`` additional forwards (default ``1``).
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            The ``(T, n_stages)`` action grid.
+        """
         return _build_physical_virtual_1f1b(
             n_stages=n_stages,
             virtual_stages=self.virtual_stages,

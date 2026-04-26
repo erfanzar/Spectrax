@@ -5,11 +5,26 @@
 """Module-aware autodiff: :func:`grad`, :func:`value_and_grad`,
 :func:`jvp`, and :func:`vjp`.
 
-The differentiation target is selected by ``wrt`` — a
-:class:`~spectrax.Selector` or one of its sugar forms. By default
-spectrax differentiates the ``"parameters"`` collection of the first
-:class:`~spectrax.Module` argument. Every non-spectrax keyword is
-forwarded to :func:`jax.value_and_grad` verbatim.
+These wrappers add :class:`~spectrax.Module` awareness on top of JAX's
+autodiff primitives. For :func:`grad` and :func:`value_and_grad` the
+differentiation target is selected by ``wrt`` — a
+:class:`~spectrax.Selector` or any of its sugar forms (``"parameters"``,
+``("parameters", "batch_stats")``, etc.) — and is partitioned out of the
+target :class:`~spectrax.Module`'s state via
+:meth:`Selector.partition_state <spectrax.Selector.partition_state>`. The
+non-target portion is captured as constant ``rest_state`` so JAX never
+traces through it.
+
+For :func:`jvp` and :func:`vjp` the same module-aware split/merge shim
+from :mod:`spectrax.transforms.split_merge` is used: cotangents and
+tangents that the user supplies as :class:`~spectrax.Module` (or
+:class:`~spectrax.State`) are automatically reshaped to match the JAX
+internal representation, and the returned cotangents are converted back
+to user-friendly :class:`~spectrax.State` form before being handed back.
+
+Every non-spectrax keyword (``has_aux``, ``holomorphic``, ``allow_int``,
+``reduce_axes``) is forwarded to the underlying
+:func:`jax.value_and_grad` / :func:`jax.vjp` / :func:`jax.jvp` verbatim.
 """
 
 from __future__ import annotations
@@ -56,26 +71,51 @@ def value_and_grad(
     allow_int: bool = False,
     reduce_axes: Sequence[AxisName] = (),
 ) -> F:
-    """Module-aware :func:`jax.value_and_grad`.
+    """Differentiate ``fn`` with respect to a selected module subset, returning value and grads.
+
+    Module-aware analogue of :func:`jax.value_and_grad`. Internally,
+    :func:`~spectrax.export` snapshots the target module, ``wrt``'s
+    selector partitions the state into ``(target, rest)``, and
+    :func:`jax.value_and_grad` differentiates against ``target`` only —
+    ``rest`` is closed over as a non-traced constant. When the partition
+    leaves nothing in ``rest`` (the common case of differentiating all
+    parameters) the implementation falls back to a direct
+    :func:`jax.value_and_grad` over the whole module pytree, guarded by
+    :func:`~spectrax.transforms.split_merge.make_direct_readonly` so the
+    function body is forbidden from mutating the module during the
+    forward pass.
 
     Args:
-        fn: Function whose first :class:`Module` argument is the target
-            of differentiation. When called without ``fn`` returns a
-            decorator factory.
-        wrt: Selector for the state to differentiate (default:
-            ``"parameters"``).
-        argnum: Which positional argument is the differentiated
-            :class:`Module`. Defaults to the first Module argument.
-        has_aux: Forwarded to :func:`jax.value_and_grad`. When ``True``,
-            ``fn`` is expected to return ``(value, aux)``.
-        holomorphic, allow_int, reduce_axes: Forwarded to
+        fn: Function whose ``argnum``-th argument is the target
+            :class:`~spectrax.Module`. When called without ``fn``
+            returns a decorator factory so ``@spx.value_and_grad(...)``
+            works.
+        wrt: :class:`~spectrax.Selector` (or selector sugar, e.g.
+            ``"parameters"``) selecting the differentiation target.
+            Defaults to the ``"parameters"`` collection.
+        argnum: Positional index of the differentiated module. Defaults
+            to the first :class:`~spectrax.Module` argument.
+        has_aux: When ``True``, ``fn`` is expected to return
+            ``(value, aux)`` and the wrapper returns
+            ``((value, aux), grads)``. Forwarded to
             :func:`jax.value_and_grad`.
+        holomorphic: Forwarded to :func:`jax.value_and_grad`; treat
+            inputs/outputs as holomorphic functions of complex inputs.
+        allow_int: Forwarded to :func:`jax.value_and_grad`; permit
+            integer-typed inputs to be differentiated (yielding zero
+            grads).
+        reduce_axes: Forwarded to :func:`jax.value_and_grad` when
+            non-empty.
 
     Returns:
-        A wrapped callable returning ``(value, grads)`` — or
-        ``((value, aux), grads)`` if ``has_aux``. ``grads`` is a
-        :class:`~spectrax.State` with the same shape as the selected
-        subset.
+        A wrapped callable. Without ``has_aux``: returns
+        ``(value, grads)``. With ``has_aux``: returns
+        ``((value, aux), grads)``. ``grads`` is a
+        :class:`~spectrax.State` mirroring the selected subset.
+
+    Raises:
+        TypeError: If the resolved positional argument is not a
+            :class:`~spectrax.Module`.
     """
     if fn is None:
         return lambda f: value_and_grad(
@@ -93,7 +133,15 @@ def value_and_grad(
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        """Partition the module's state, differentiate, and re-merge."""
+        """Partition the module's state, differentiate against the target subset, and re-merge.
+
+        Looks up the target module at position ``argnum`` (or the first
+        :class:`~spectrax.Module` if unset), splits its state via
+        ``wrt``'s selector, and dispatches either to a direct
+        :func:`jax.value_and_grad` over the module pytree (when ``rest``
+        is empty) or to a state-partitioned pure closure that overlays
+        ``target`` and ``rest`` before calling ``fn``.
+        """
         idx = argnum if argnum is not None else _find_first_module(args)
         model = args[idx]
         if not isinstance(model, Module):
@@ -120,7 +168,17 @@ def value_and_grad(
             other: tuple[Any, ...],
             kw: dict[str, Any],
         ) -> tuple[Any, Any]:
-            """Pure closure fed to :func:`jax.value_and_grad`."""
+            """Pure closure fed to :func:`jax.value_and_grad`.
+
+            Overlays the differentiation target on top of the captured
+            non-target state, rebinds a fresh module, splices it into
+            the user's positional arguments at ``idx``, and runs ``fn``
+            inside the inside-transform thread-local. Returns
+            ``(value, aux_or_None)`` — the wrapper always sets
+            ``has_aux=True`` on the inner :func:`jax.value_and_grad`
+            call so it can pass ``rest_state`` and ``aux`` through
+            uniformly.
+            """
             merged = target_state.overlay(rest_state)
             m = bind(gdef, merged)
             spliced = list(other)
@@ -161,10 +219,28 @@ def grad(
     allow_int: bool = False,
     reduce_axes: Sequence[AxisName] = (),
 ) -> F:
-    """Module-aware :func:`jax.grad`.
+    """Differentiate ``fn`` and return only the gradients.
 
-    Thin wrapper over :func:`value_and_grad` that drops the value
-    component. See :func:`value_and_grad` for argument semantics.
+    Thin module-aware wrapper around :func:`value_and_grad` that
+    discards the value component. With ``has_aux=True`` returns
+    ``(grads, aux)``; otherwise returns ``grads`` directly. See
+    :func:`value_and_grad` for the meaning of every argument.
+
+    Args:
+        fn: Function to differentiate. When omitted returns a decorator
+            factory.
+        wrt: Selector for the differentiation target.
+        argnum: Positional index of the differentiated module.
+        has_aux: When ``True`` return ``(grads, aux)``.
+        holomorphic: Forwarded to :func:`jax.value_and_grad`.
+        allow_int: Forwarded to :func:`jax.value_and_grad`.
+        reduce_axes: Forwarded to :func:`jax.value_and_grad` when
+            non-empty.
+
+    Returns:
+        A wrapped callable returning ``grads`` (or ``(grads, aux)`` if
+        ``has_aux`` is set), where ``grads`` is a
+        :class:`~spectrax.State` parallel to the selected subset.
     """
     if fn is None:
         return lambda f: grad(
@@ -189,7 +265,12 @@ def grad(
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        """Return only the gradient half of the :func:`value_and_grad` output."""
+        """Return only the gradient half of the :func:`value_and_grad` output.
+
+        Strips the value (and aux when ``has_aux`` is unset) from the
+        underlying :func:`value_and_grad` return so the user sees the
+        same surface as :func:`jax.grad`.
+        """
         out = vg(*args, **kwargs)
         if has_aux:
             (_, aux), grads = out
@@ -209,13 +290,44 @@ def vjp(
 ) -> Any:
     """Module-aware :func:`jax.vjp`.
 
-    When called directly, behaves like ``jax.vjp`` but returns
-    :class:`State` cotangents for any :class:`Module` primal arguments.
-    When called without primals it returns a wrapped function.
+    Two call shapes are supported:
 
-    ``mutable=`` controls which module collections may be written back
-    during the primal forward pass. The returned pullback is pure and
-    only computes cotangents.
+    * **Direct**: ``spx.vjp(fn, primal_a, primal_b, ...)`` immediately
+      runs the forward pass and returns ``(out, pullback)`` (or
+      ``(out, pullback, aux)`` when ``has_aux``).
+    * **Decorator/wrapper**: ``spx.vjp(fn, has_aux=...)`` returns a
+      wrapper accepting positional primals — useful for building partial
+      VJPs with shared options.
+
+    Module primals are exported to ``(GraphDef, State)`` and the pure
+    body is built by
+    :func:`~spectrax.transforms.split_merge.make_pure` /
+    :func:`~spectrax.transforms.split_merge.make_pure_readonly` (or
+    their single-positional fast-path variants). ``mutable=`` controls
+    which collections may be written back during the primal forward
+    pass: when set, mutations are applied to the live module before
+    returning. The returned pullback is itself pure — it only computes
+    cotangents and never re-mutates modules.
+
+    Cotangents handed back are converted into user-friendly form by
+    :func:`_splice_module_cotangents` /
+    :func:`_splice_one_cotangent`: the cotangent for each
+    :class:`~spectrax.Module` primal is a :class:`~spectrax.State`,
+    while non-module primals receive ordinary JAX pytree cotangents.
+
+    Args:
+        fn: Function whose VJP is being computed.
+        *primals: Optional positional primals; when supplied, the
+            forward pass executes immediately.
+        has_aux: When ``True``, ``fn`` is expected to return
+            ``(value, aux)``.
+        reduce_axes: Forwarded to :func:`jax.vjp` when non-empty.
+        mutable: Selector controlling write-back of module mutations
+            during the primal pass.
+
+    Returns:
+        Either ``(out, pullback)`` / ``(out, pullback, aux)`` when
+        primals are supplied, or a wrapper callable otherwise.
     """
     if fn is None:
         return lambda f: vjp(f, has_aux=has_aux, reduce_axes=reduce_axes, mutable=mutable)
@@ -225,7 +337,12 @@ def vjp(
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        """Decorator-mode wrapper: defer the actual ``_vjp_call`` until args are supplied."""
+        """Decorator-mode wrapper: defer ``_vjp_call`` until primals arrive.
+
+        Rejects keyword primals (since :func:`jax.vjp` does not support
+        them), then forwards positional primals into the shared
+        :func:`_vjp_call` implementation.
+        """
         _ensure_no_kwargs("vjp", kwargs)
         return _vjp_call(fn, args, has_aux=has_aux, reduce_axes=reduce_axes, mutable=mutable)
 
@@ -242,17 +359,42 @@ def jvp(
 ) -> Any:
     """Module-aware :func:`jax.jvp`.
 
-    Direct-call form:
+    Two call shapes:
 
-    ``spx.jvp(fn, primals, tangents, ...)``
+    * **Direct**: ``spx.jvp(fn, primals, tangents, has_aux=...)`` runs
+      forward + tangent computation immediately.
+    * **Decorator/wrapper**: ``spx.jvp(fn, has_aux=...)(primals, tangents)``
+      defers until ``(primals, tangents)`` are supplied.
 
-    Decorator/wrapper form:
+    For each :class:`~spectrax.Module` primal the user may supply a
+    matching tangent as either a :class:`~spectrax.Module` (which is
+    re-exported to its state), a :class:`~spectrax.State` directly, or
+    any pytree matching the module's state structure.
 
-    ``spx.jvp(fn, ...)(primals, tangents)``
+    ``mutable=`` controls write-back of module mutations performed
+    during the primal forward pass — those updates are applied to the
+    live module via
+    :func:`~spectrax.transforms.split_merge.apply_mutations` before
+    returning. The tangent computation itself is always pure.
 
-    Module primals accept tangents either as a matching :class:`Module`,
-    a :class:`State`, or an arbitrary pytree matching the module's
-    exported state.
+    Args:
+        fn: Function whose JVP is being computed.
+        primals: Sequence of primal values. Sentinel-defaulted so the
+            decorator form is detectable.
+        tangents: Sequence of tangent values, parallel to ``primals``.
+        has_aux: When ``True``, ``fn`` returns ``(value, aux)`` and the
+            wrapper returns ``(out, tangent_out, aux)``.
+        mutable: Selector controlling write-back of module mutations
+            during the forward pass.
+
+    Returns:
+        ``(out, tangent_out)`` (or ``(out, tangent_out, aux)`` when
+        ``has_aux``) in direct-call form, or a wrapper callable
+        otherwise.
+
+    Raises:
+        TypeError: If ``primals`` and ``tangents`` have different
+            lengths.
     """
     if fn is None:
         return lambda f: jvp(f, has_aux=has_aux, mutable=mutable)
@@ -265,17 +407,32 @@ def jvp(
         primals_: Sequence[Any],
         tangents_: Sequence[Any],
     ) -> Any:
-        """Decorator-mode wrapper: defer ``_jvp_call`` until ``(primals, tangents)`` are supplied."""
+        """Decorator-mode wrapper: defer ``_jvp_call`` until ``(primals, tangents)`` arrive.
+
+        Forwards the eventual ``(primals, tangents)`` invocation through
+        the shared :func:`_jvp_call` implementation, preserving
+        ``has_aux`` and ``mutable`` from the outer ``spx.jvp`` call.
+        """
         return _jvp_call(fn, primals_, tangents_, has_aux=has_aux, mutable=mutable)
 
     return wrapped
 
 
 def _find_first_module(args: tuple[Any, ...]) -> int:
-    """Return the positional index of the first :class:`Module` in ``args``.
+    """Return the positional index of the first :class:`~spectrax.Module` in ``args``.
+
+    Used by :func:`value_and_grad` (and transitively :func:`grad`) to
+    pick the differentiation target when the caller did not pass an
+    explicit ``argnum``.
+
+    Args:
+        args: Positional arguments forwarded to the wrapped function.
+
+    Returns:
+        The index of the first :class:`~spectrax.Module`.
 
     Raises:
-        TypeError: If no positional argument is a :class:`Module`.
+        TypeError: If no positional argument is a :class:`~spectrax.Module`.
     """
     for i, a in enumerate(args):
         if isinstance(a, Module):
@@ -284,7 +441,20 @@ def _find_first_module(args: tuple[Any, ...]) -> int:
 
 
 def _ensure_no_kwargs(name: str, kwargs: dict[str, Any]) -> None:
-    """Reject kwargs for transforms whose public API mirrors raw JAX."""
+    """Reject keyword arguments for transforms whose public API mirrors raw JAX.
+
+    :func:`jax.vjp` and :func:`jax.jvp` do not accept keyword arguments
+    in their wrapped-call form, so the spectrax wrappers refuse them
+    too rather than silently dropping the kwargs on the floor.
+
+    Args:
+        name: Public name of the calling transform, embedded in the
+            error message.
+        kwargs: Keyword arguments collected by the wrapper.
+
+    Raises:
+        TypeError: If ``kwargs`` is non-empty.
+    """
     if kwargs:
         raise TypeError(
             f"spectrax.{name}() does not support keyword arguments in wrapped-call form. "
@@ -293,7 +463,24 @@ def _ensure_no_kwargs(name: str, kwargs: dict[str, Any]) -> None:
 
 
 def _split_module_tangents(refs: list[Any], tangents: tuple[Any, ...]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-    """Split positional tangents into module-state tangents and stripped tangents."""
+    """Separate the module-state tangents from the rest of the positional tangents.
+
+    For every located module in ``refs``, looks up the tangent at the
+    same positional index, exports it to a :class:`~spectrax.State` if
+    the user supplied a :class:`~spectrax.Module` (otherwise keeps the
+    pytree as-is), and replaces the entry in the stripped-tangents tuple
+    with ``None``. The result is two parallel tuples that match the
+    pure function's ``(states, stripped_args, stripped_kwargs)`` shape.
+
+    Args:
+        refs: Located module refs from
+            :func:`~spectrax.transforms.split_merge.locate_and_strip_fast`.
+        tangents: User-supplied positional tangents.
+
+    Returns:
+        A pair ``(state_tangents, stripped_tangents)`` parallel to
+        ``refs`` and ``tangents`` respectively.
+    """
     stripped_tangents = list(tangents)
     state_tangents: list[Any] = []
     for ref in refs:
@@ -308,7 +495,13 @@ def _split_module_tangents(refs: list[Any], tangents: tuple[Any, ...]) -> tuple[
 def _splice_module_cotangents(
     refs: list[Any], stripped_cotangents: tuple[Any, ...], state_cotangents: tuple[Any, ...]
 ) -> tuple[Any, ...]:
-    """Rebuild a cotangent tuple parallel to the original primal args."""
+    """Rebuild a cotangent tuple matching the original primal positions.
+
+    Inverse of :func:`_split_module_tangents`: takes the cotangents JAX
+    produced for the non-module pytree positions plus the cotangents for
+    the module states, and slots the module cotangents back into the
+    positions they occupied in the user's primal tuple.
+    """
     out = list(stripped_cotangents)
     for ref, ct in zip(refs, state_cotangents, strict=False):
         out[ref.locator] = ct
@@ -316,24 +509,59 @@ def _splice_module_cotangents(
 
 
 def _splice_one_cotangent(locator: int, other_cotangents: tuple[Any, ...], state_cotangent: Any) -> tuple[Any, ...]:
-    """Rebuild a cotangent tuple for one positional Module primal."""
+    """Rebuild a cotangent tuple for the single-positional-Module fast path.
+
+    Args:
+        locator: Position the module occupied in the user's primal
+            tuple.
+        other_cotangents: Cotangents JAX produced for every non-module
+            primal, in the same order as the original user call minus
+            the module slot.
+        state_cotangent: Cotangent produced for the module's state.
+
+    Returns:
+        A tuple parallel to the user's original primal tuple.
+    """
     out = list(other_cotangents)
     out.insert(locator, state_cotangent)
     return tuple(out)
 
 
 def _zeros_like_tree(tree: Any) -> Any:
-    """Build a zero cotangent pytree matching ``tree``."""
+    """Build a zero-filled cotangent pytree with the same structure as ``tree``.
+
+    Used to seed the cotangent for the ``new_states`` half of a
+    ``pure_with_updates`` pullback so the user only ever sees the
+    cotangent for the actual function output.
+    """
     return jax.tree.map(jax.numpy.zeros_like, tree)
 
 
 def _state_is_empty(state: State) -> bool:
-    """Return ``True`` when ``state`` contains no leaves."""
+    """Return ``True`` when ``state`` contains no collections."""
     return not state.collections()
 
 
 def _module_like_to_state(value: Any) -> State:
-    """Convert a Module-shaped cotangent into the public State form."""
+    """Coerce a Module-shaped cotangent into the public :class:`~spectrax.State` form.
+
+    JAX returns cotangents whose pytree structure matches the primal's
+    structure — so cotangents for a :class:`~spectrax.Module` primal
+    arrive as a :class:`~spectrax.Module`-shaped object. This helper
+    normalizes them to :class:`~spectrax.State` so users see one
+    consistent cotangent type regardless of which internal autodiff
+    path was taken.
+
+    Args:
+        value: The cotangent to convert.
+
+    Returns:
+        A :class:`~spectrax.State` carrying the same leaves.
+
+    Raises:
+        TypeError: If ``value`` is neither a :class:`~spectrax.Module`
+            nor a :class:`~spectrax.State`.
+    """
     if isinstance(value, State):
         return value
     if isinstance(value, Module):
@@ -343,7 +571,25 @@ def _module_like_to_state(value: Any) -> State:
 
 
 def _convert_direct_tangents(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[Any, ...] | None:
-    """Convert State tangents into Module tangents for direct JAX autodiff."""
+    """Convert :class:`~spectrax.State` tangents into Module-pytree tangents.
+
+    When ``mutable=()`` :func:`vjp` / :func:`jvp` use the direct-JAX
+    autodiff path that operates on the live :class:`~spectrax.Module`
+    pytree directly. JAX's autodiff requires tangents whose pytree
+    structure matches the primal's — so :class:`~spectrax.State`-shaped
+    tangents must be re-bound onto a temporary module and re-flattened
+    against the primal's treedef before being handed to JAX.
+
+    Args:
+        primals: User-supplied primal tuple.
+        tangents: User-supplied tangent tuple, parallel to ``primals``.
+
+    Returns:
+        A tuple of tangents matching each primal's pytree structure,
+        or ``None`` when a tangent for a module primal was neither a
+        :class:`~spectrax.Module` nor a :class:`~spectrax.State` (the
+        caller falls back to the slow split/merge path in that case).
+    """
     converted = list(tangents)
     for i, primal in enumerate(primals):
         if not isinstance(primal, Module):
@@ -362,7 +608,13 @@ def _convert_direct_tangents(primals: tuple[Any, ...], tangents: tuple[Any, ...]
 
 
 def _convert_direct_cotangents(primals: tuple[Any, ...], cotangents: tuple[Any, ...]) -> tuple[Any, ...]:
-    """Convert direct-JAX Module cotangents back to SpecTrax public types."""
+    """Translate raw JAX cotangents into the user-facing types.
+
+    Walks ``primals`` / ``cotangents`` in parallel and converts every
+    cotangent that corresponds to a :class:`~spectrax.Module` primal
+    into a :class:`~spectrax.State` via :func:`_module_like_to_state`.
+    Non-module cotangents pass through unchanged.
+    """
     out: list[Any] = []
     for primal, cotangent in zip(primals, cotangents, strict=False):
         out.append(_module_like_to_state(cotangent) if isinstance(primal, Module) else cotangent)
@@ -377,7 +629,18 @@ def _vjp_call(
     reduce_axes: Sequence[AxisName],
     mutable: SelectorSugar,
 ) -> Any:
-    """Shared implementation for direct and wrapped :func:`vjp`."""
+    """Shared backend for direct and wrapped :func:`vjp` invocations.
+
+    Branches on ``mutable_sel`` and on whether the call is the
+    single-positional-Module fast path; selects the appropriate
+    pure-body factory from :mod:`spectrax.transforms.split_merge` and
+    threads the result through :func:`jax.vjp`. After a forward pass
+    that captures mutations, write-back is performed via
+    :func:`~spectrax.transforms.split_merge.apply_mutations`. The
+    returned pullback uses :func:`_splice_module_cotangents` /
+    :func:`_splice_one_cotangent` to reshape JAX cotangents back into
+    the primal-tuple layout.
+    """
     args = tuple(primals)
     mutable_sel = resolve_mutable(mutable)
     direct_guarded = make_direct_readonly(fn)
@@ -636,7 +899,18 @@ def _jvp_call(
     has_aux: bool,
     mutable: SelectorSugar,
 ) -> Any:
-    """Shared implementation for direct and wrapped :func:`jvp`."""
+    """Shared backend for direct and wrapped :func:`jvp` invocations.
+
+    Validates arity, exports module primals to states, splits tangents
+    via :func:`_split_module_tangents`, and dispatches to
+    :func:`jax.jvp` against either the single-positional or general
+    pure-body factory. When ``has_aux`` is set the implementation
+    bifurcates: the primal pass runs once to obtain ``(out, aux)`` and
+    a separate ``has_aux=False``-flavored pure body is built for the
+    actual JVP so JAX never sees the auxiliary output. When
+    ``mutable_sel`` is non-``None``, captured mutations from the primal
+    pass are written back to the live module before returning.
+    """
     args = tuple(primals)
     tangent_args = tuple(tangents)
     if len(args) != len(tangent_args):

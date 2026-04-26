@@ -50,7 +50,20 @@ __all__ = ["MultiOptimizer", "Optimizer"]
 
 
 def _require_optax() -> Any:
-    """Raise :class:`ImportError` with an install hint when optax is missing."""
+    """Return the imported :mod:`optax` module, raising if it isn't installed.
+
+    The optax import is attempted once at module load and cached in
+    the module-level ``_optax``; this helper centralises the
+    user-facing error so every public entry point can call it on
+    demand without duplicating the install hint.
+
+    Returns:
+        The imported :mod:`optax` module.
+
+    Raises:
+        ImportError: optax is not importable. The message includes a
+            ``pip install`` hint and chains the original import error.
+    """
     if _optax is None:
         raise ImportError(
             "spectrax.contrib.Optimizer requires optax. Install with "
@@ -114,6 +127,15 @@ class Optimizer:
 
         Kept public so :meth:`tree_unflatten` can rebuild instances
         without calling :mod:`optax`'s ``tx.init`` again.
+
+        Args:
+            tx: The :class:`optax.GradientTransformation` to apply.
+            selector: The :class:`~spectrax.Selector` picking the
+                trainable subset.
+            opt_state: An optax state pytree, normally produced by
+                ``tx.init`` (or carried across a jit boundary).
+            step: A scalar JAX int (typically ``int32``) tracking
+                how many updates have been applied.
         """
         self.tx = tx
         self.selector = selector
@@ -217,12 +239,27 @@ class Optimizer:
         static ``aux_data`` — they must be hashable (optax
         transformations are namedtuple-shaped so comparing by identity
         is enough; spectrax :class:`Selector` s are frozen dataclasses).
+
+        Returns:
+            ``((opt_state, step), (tx, selector))`` — JAX's flatten
+            convention.
         """
         return (self.opt_state, self.step), (self.tx, self.selector)
 
     @classmethod
     def tree_unflatten(cls, aux: tuple[Any, Selector], children: tuple[Any, Any]) -> Optimizer:
-        """Pytree unflatten: rebuild from ``(aux, children)``."""
+        """Rebuild an :class:`Optimizer` from its flattened representation.
+
+        Inverse of :meth:`tree_flatten`. Calls :meth:`__init__` directly
+        so no further :mod:`optax` work is performed.
+
+        Args:
+            aux: The static aux pair ``(tx, selector)``.
+            children: The dynamic leaves ``(opt_state, step)``.
+
+        Returns:
+            A new :class:`Optimizer` instance with the given parts.
+        """
         opt_state, step = children
         tx, selector = aux
         return cls(tx=tx, selector=selector, opt_state=opt_state, step=step)
@@ -327,11 +364,23 @@ class MultiOptimizer:
         return new_parameters, MultiOptimizer(new_subs, self.owned_paths)
 
     def apply_eager(self, module: Module, grads: State) -> MultiOptimizer:
-        """Eager-mode: run :meth:`update` and sync results back to ``module``.
+        """Eager-mode: run :meth:`update` and write results back to ``module``.
 
-        Not safe inside a transform (mutates the live module). The
-        trainable slice is reconstructed from ``module``'s current
-        state by unioning every sub's owned paths.
+        Not safe inside a transform (it mutates the live module via
+        :func:`spectrax.update`). The trainable slice is rebuilt from
+        ``module``'s current state by unioning every sub's owned
+        ``(kind, path)`` set, so leaves outside any sub's ownership
+        pass through unmodified.
+
+        Args:
+            module: Live module whose trainable variables should be
+                updated in place.
+            grads: Gradient :class:`State` for the union of trainable
+                slices.
+
+        Returns:
+            The new :class:`MultiOptimizer` with each sub's state
+            advanced one step. Rebind: ``mopt = mopt.apply_eager(...)``.
         """
         _gdef, state = export(module)
         all_paths: set[tuple[str, str]] = set().union(*self.owned_paths) if self.owned_paths else set()
@@ -341,7 +390,14 @@ class MultiOptimizer:
         return new_multi
 
     def tree_flatten(self) -> tuple[tuple[Optimizer, ...], tuple[frozenset[tuple[str, str]], ...]]:
-        """Flatten: the subs are dynamic children, owned-paths is static aux."""
+        """Pytree flatten: subs are dynamic children, owned-paths is static aux.
+
+        Each sub :class:`Optimizer` is itself pytree-registered, so
+        flattening recursively produces a flat list of optax leaves.
+
+        Returns:
+            ``(tuple_of_subs, owned_paths)`` — JAX's flatten convention.
+        """
         return tuple(self.subs), self.owned_paths
 
     @classmethod
@@ -350,15 +406,33 @@ class MultiOptimizer:
         aux: tuple[frozenset[tuple[str, str]], ...],
         children: tuple[Optimizer, ...],
     ) -> MultiOptimizer:
-        """Unflatten: rebuild from ``(aux, children)``."""
+        """Rebuild a :class:`MultiOptimizer` from its flattened representation.
+
+        Args:
+            aux: The static ``owned_paths`` tuple.
+            children: The dynamic sub-optimizer tuple.
+
+        Returns:
+            A new :class:`MultiOptimizer` with the given parts.
+        """
         return cls(list(children), aux)
 
 
 def _slice_state(state: State, paths: set[tuple[str, str]] | frozenset[tuple[str, str]]) -> State:
-    """Return the sub-:class:`State` containing only the listed ``(collection, path)`` pairs.
+    """Project ``state`` down to the leaves at the given ``(collection, path)`` pairs.
 
-    Leaves outside ``paths`` are omitted from the output so the slice
-    can be consumed by :mod:`optax` without shape mismatches.
+    Used by :class:`MultiOptimizer` to materialise the per-sub
+    parameter / gradient slices passed into each
+    :meth:`Optimizer.update`. Leaves outside ``paths`` are omitted
+    entirely so the resulting :class:`State` has the same shape as
+    what :mod:`optax` saw at ``init`` time.
+
+    Args:
+        state: The full state to project.
+        paths: Iterable of ``(collection, path)`` keys to keep.
+
+    Returns:
+        A new :class:`State` containing only the listed leaves.
     """
     out: dict[str, dict[str, Any]] = {}
     for c, p in paths:

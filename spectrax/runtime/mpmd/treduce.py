@@ -71,11 +71,40 @@ class Op:
     """
 
     def state(self, aval: core.AbstractValue) -> jax.Array:
-        """Return an initial accumulator for a per-microbatch output of avals ``aval``."""
+        """Return the identity accumulator for a per-microbatch output described by ``aval``.
+
+        Called once at the beginning of a :func:`treduce` to initialise
+        the running state. The returned array's shape and dtype should
+        be compatible with whatever :meth:`update` will fold in for
+        each microbatch.
+
+        Args:
+            aval: Abstract value of one microbatch's contribution
+                (matches the body output's per-microbatch aval).
+
+        Returns:
+            A concrete JAX array used as the starting accumulator.
+        """
         raise NotImplementedError
 
     def update(self, state: jax.Array, value: jax.Array, idx: jax.Array) -> jax.Array:
-        """Fold ``value`` (from microbatch ``idx``) into ``state``."""
+        """Fold microbatch ``idx``'s ``value`` into the running ``state``.
+
+        The op is invoked once per microbatch in the order chosen by the
+        active pipeline schedule (which need not be sequential). ``idx``
+        is the microbatch index supplied as a traced :class:`jax.Array`
+        so :class:`Concat`-style ops can write into a stacking buffer.
+
+        Args:
+            state: Current accumulator returned by the previous
+                :meth:`update` (or :meth:`state` on the first call).
+            value: Per-microbatch contribution returned by the user
+                body for microbatch ``idx``.
+            idx: Microbatch index (rank-0 ``int32`` array).
+
+        Returns:
+            The new accumulator value.
+        """
         raise NotImplementedError
 
 
@@ -88,11 +117,32 @@ class Add(Op):
     """
 
     def state(self, aval: core.AbstractValue) -> jax.Array:
-        """Return a zero accumulator shaped like ``aval``."""
+        """Return a zero accumulator with ``aval``'s shape and dtype.
+
+        Args:
+            aval: Abstract value describing a single microbatch's grad
+                shape — the resulting buffer holds the running sum.
+
+        Returns:
+            ``jnp.zeros(aval.shape, dtype=aval.dtype)``.
+        """
         return jnp.zeros(aval.shape, dtype=aval.dtype)
 
     def update(self, state: jax.Array, value: jax.Array, idx: jax.Array) -> jax.Array:
-        """Return ``state + value`` (microbatch index is unused)."""
+        """Add the microbatch contribution ``value`` to ``state``.
+
+        ``idx`` is intentionally unused — :class:`Add` is associative and
+        commutative across microbatches so the accumulation order picked
+        by the active schedule does not affect the result.
+
+        Args:
+            state: Current sum.
+            value: New microbatch contribution.
+            idx: Microbatch index (ignored).
+
+        Returns:
+            ``state + value``.
+        """
         del idx
         return jax.lax.add(state, value)
 
@@ -108,24 +158,76 @@ class Concat(Op):
     length: int
 
     def state(self, aval: core.AbstractValue) -> jax.Array:
-        """Return a zero buffer of shape ``(length, *aval.shape)`` dtype ``aval.dtype``."""
+        """Return a zero-initialised stacking buffer of shape ``(length, *aval.shape)``.
+
+        The leading axis has size ``length`` (the microbatch count) so
+        :meth:`update` can write each microbatch's value into its own
+        slot without reallocation.
+
+        Args:
+            aval: Abstract value of one microbatch's contribution.
+
+        Returns:
+            A zero buffer with shape ``(self.length, *aval.shape)`` and
+            dtype ``aval.dtype``.
+        """
         return jnp.zeros((self.length, *aval.shape), dtype=aval.dtype)
 
     def update(self, state: jax.Array, value: jax.Array, idx: jax.Array) -> jax.Array:
-        """Write ``value`` into slot ``idx`` of the concatenation buffer."""
+        """Insert ``value`` at index ``idx`` along the leading axis of ``state``.
+
+        Uses :func:`jax.lax.dynamic_update_index_in_dim` so that ``idx``
+        may be a traced :class:`jax.Array` — necessary because the
+        microbatch index is not always a Python literal under
+        schedule-driven dispatch.
+
+        Args:
+            state: The stacking buffer.
+            value: The microbatch contribution to write.
+            idx: Microbatch index (rank-0 ``int32`` array).
+
+        Returns:
+            ``state`` with ``value`` written into slot ``idx``.
+        """
         return jax.lax.dynamic_update_index_in_dim(state, value, idx, axis=0)
 
 
 @dataclass(frozen=True)
 class Max(Op):
-    """Accumulate per-microbatch values by max (elementwise)."""
+    """Accumulate per-microbatch values by elementwise maximum.
+
+    Suitable for max-reduction quantities like absolute-value norms or
+    per-batch numerical-stability statistics. Like :class:`Add`, ``Max``
+    is associative and commutative so the schedule's microbatch order is
+    irrelevant.
+    """
 
     def state(self, aval: core.AbstractValue) -> jax.Array:
-        """Return a ``-inf`` accumulator shaped like ``aval``."""
+        """Return a ``-inf`` accumulator with ``aval``'s shape and dtype.
+
+        Starting from negative infinity makes the first :meth:`update`
+        return that microbatch's value verbatim — the identity element
+        for elementwise ``max`` over real-valued data.
+
+        Args:
+            aval: Abstract value of one microbatch's contribution.
+
+        Returns:
+            A ``-inf``-filled buffer shaped like ``aval``.
+        """
         return jnp.full(aval.shape, -jnp.inf, dtype=aval.dtype)
 
     def update(self, state: jax.Array, value: jax.Array, idx: jax.Array) -> jax.Array:
-        """Return ``max(state, value)`` elementwise."""
+        """Return the elementwise maximum of ``state`` and ``value``.
+
+        Args:
+            state: Current running max.
+            value: New microbatch contribution.
+            idx: Microbatch index (ignored — order-independent).
+
+        Returns:
+            ``jnp.maximum(state, value)``.
+        """
         del idx
         return jax.lax.max(state, value)
 
@@ -152,7 +254,14 @@ class _HashableSchedule:
         self.schedule = schedule
 
     def __hash__(self) -> int:
-        """Hash by object identity of the wrapped schedule."""
+        """Hash by object identity of the wrapped schedule.
+
+        Using ``id(...)`` keeps the wrapper hashable even though the
+        underlying schedule dataclass may be mutable. Two distinct
+        schedule instances with the same field values still collide
+        only if they happen to live at the same Python ``id`` (which
+        would require GC reuse).
+        """
         return id(self.schedule)
 
     def __eq__(self, other: object) -> bool:
@@ -188,7 +297,7 @@ class _HashableOps:
         return isinstance(other, _HashableOps) and self.ops == other.ops
 
     def __repr__(self) -> str:
-        """Pass through the tuple's repr."""
+        """Render the wrapper as ``_HashableOps(<ops repr>)`` for debugging."""
         return f"_HashableOps({self.ops!r})"
 
 

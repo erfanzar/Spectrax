@@ -2,7 +2,21 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Dense (fully-connected) layers: :class:`Linear` and :class:`Bilinear`."""
+"""Dense (fully-connected) layers: :class:`Linear` and :class:`Bilinear`.
+
+:class:`Linear` is the canonical ``y = x @ W + b`` layer; :class:`Bilinear`
+implements a learned three-way interaction ``y[..., o] = sum(x1[..., i]
+* W[i, j, o] * x2[..., j]) + b[o]`` between two distinct input streams.
+Both layers obey the framework-wide conventions:
+
+* Logical axis names ``("in", "out")`` (and ``("in1", "in2", "out")``
+  for the bilinear weight) are attached to every parameter, so a
+  surrounding mesh can resolve sharding by axis name.
+* Mixed precision is opt-in through
+  :func:`~spectrax.core.policy.current_policy`: if a policy with a
+  non-``None`` ``compute_dtype`` is active, both the input and the
+  parameters are downcast to that dtype before the matmul.
+"""
 
 from __future__ import annotations
 
@@ -19,11 +33,24 @@ from ..rng.rngs import Rngs, resolve_rngs
 
 
 class Linear(Module):
-    """Standard dense layer: ``y = x @ W + b``.
+    """Standard dense (fully-connected) layer: ``y = x @ W + b``.
 
-    The weight has shape ``(in_features, out_features)``; the bias is
-    optional. Logical axis names ``("in", "out")`` are attached to the
-    weight and ``("out",)`` to the bias for sharding resolution.
+    Stores the weight under the canonical name ``weight`` with shape
+    ``(in_features, out_features)`` and (optionally) a bias under
+    ``bias`` with shape ``(out_features,)``. Logical axis names
+    ``("in", "out")`` are attached to the weight and ``("out",)`` to
+    the bias so a mesh can resolve sharding by name.
+
+    Mixed precision: when a :class:`~spectrax.core.policy.Policy` is
+    active and exposes a non-``None`` ``compute_dtype``, the input and
+    both parameters are cast to that dtype before the matmul. The
+    stored parameters themselves are unchanged.
+
+    Deferred shape inference: passing ``in_features=None`` allocates a
+    :class:`~spectrax.core.variable.DeferredParameter` whose true
+    shape is filled in from ``x.shape[-1]`` on the first forward
+    call. The deferred path is not safe under JAX transforms and
+    triggers the standard ``_resolve_deferred`` guard.
     """
 
     weight: Parameter
@@ -46,20 +73,34 @@ class Linear(Module):
         """Initialize the dense layer.
 
         Args:
-            in_features: Trailing input feature count.  ``None`` defers
-                shape inference to the first forward pass.
-            out_features: Output feature count.
-            use_bias: When ``True`` (default), create and add a bias.
+            in_features: Trailing input feature count. ``None`` defers
+                shape inference until the first :meth:`forward` call,
+                where the actual size is read off ``x.shape[-1]``.
+            out_features: Output feature count (size of the trailing
+                axis of ``y``).
+            use_bias: When ``True`` (default), allocate and add a
+                ``(out_features,)`` bias initialized via ``b_init``.
             rngs: Source of PRNG keys for parameter initialization.
-            w_init: Weight initializer (default:
-                :func:`~spectrax.init.kaiming_uniform` with ``"linear"``
-                gain).
-            b_init: Bias initializer (default: :func:`~spectrax.init.zeros`).
-            dtype: Parameter dtype; defaults to ``float32``.
-            param_dtype: Alias for *dtype*.  Provided for compatibility with
-                frameworks that separate computation dtype from parameter dtype.
-            sharding: Optional sharding for the weight.
-            bias_sharding: Optional sharding for the bias.
+                Accepts an :class:`Rngs`, an ``int`` seed, or
+                ``None``; resolved via :func:`resolve_rngs`.
+            w_init: Weight initializer. Defaults to
+                :func:`~spectrax.init.kaiming_uniform` with the
+                ``"linear"`` gain (i.e. unit gain — a plain
+                Glorot-style Kaiming uniform sized for a linear layer
+                with no following non-linearity).
+            b_init: Bias initializer. Defaults to
+                :func:`~spectrax.init.zeros`.
+            dtype: Storage dtype for the parameters. Defaults to
+                ``float32`` when both ``dtype`` and ``param_dtype``
+                are ``None``.
+            param_dtype: Alias for ``dtype``; takes precedence when
+                both are supplied. Provided for parity with frameworks
+                that split parameter storage and computation dtype.
+            sharding: Optional sharding (or axis-name tuple) for the
+                weight; combined with the auto-attached axis names
+                ``("in", "out")``.
+            bias_sharding: Optional sharding for the bias (axis names
+                ``("out",)``).
         """
         super().__init__()
         self.in_features = in_features
@@ -92,7 +133,23 @@ class Linear(Module):
             )
 
     def forward(self, x: ArrayLike, **_: object) -> Array:
-        """Compute ``y = x @ W + b`` (bias optional)."""
+        """Compute ``y = x @ W + b`` (bias added only when configured).
+
+        On the first call, if ``in_features`` was deferred, the weight
+        is materialised from ``x.shape[-1]``. When a mixed-precision
+        policy is active, ``x`` and the parameters are cast to
+        ``policy.compute_dtype`` before the dot.
+
+        Args:
+            x: Input tensor; trailing axis must equal
+                :attr:`in_features` (or determines it on the first
+                call when deferred).
+            **_: Ignored; accepted for container interoperability.
+
+        Returns:
+            ``x @ W + b`` (or ``x @ W`` when ``use_bias=False``) with
+            shape ``x.shape[:-1] + (out_features,)``.
+        """
         xa = jnp.asarray(x)
         if self.in_features is None:
             in_features = int(xa.shape[-1])
@@ -112,10 +169,18 @@ class Linear(Module):
 
 
 class Bilinear(Module):
-    """Bilinear layer: ``y[..., o] = sum(x1[..., i] * W[i, j, o] * x2[..., j]) + b[o]``.
+    """Bilinear interaction layer.
 
-    Useful for interactions between two distinct input streams
-    (feature-feature products, encoder-decoder mixing, …).
+    Implements ``y[..., o] = sum_ij x1[..., i] * W[i, j, o] * x2[..., j]
+    + b[o]``, computed via :func:`jax.numpy.einsum` with the equation
+    ``"...i,ijo,...j->...o"``. Use it for learned feature-feature
+    products — e.g. encoder/decoder mixing, score functions, or
+    second-order feature crosses.
+
+    The leading shapes of ``x1`` and ``x2`` broadcast under standard
+    NumPy rules, so a typical use is ``Bilinear(d, d, d_out)(x, x)``
+    with shared inputs to obtain a learned quadratic form. Logical
+    axis names ``("in1", "in2", "out")`` are attached to the weight.
     """
 
     weight: Parameter
@@ -137,15 +202,26 @@ class Bilinear(Module):
         """Initialize the bilinear layer.
 
         Args:
-            in1_features: Feature count of the first input.
-            in2_features: Feature count of the second input.
-            out_features: Output feature count.
-            use_bias: When ``True`` (default), create and add a bias.
-            rngs: Source of PRNG keys.
-            dtype: Parameter dtype; defaults to ``float32``.
-            param_dtype: Alias for *dtype*.
-            sharding: Optional sharding for the weight.
-            bias_sharding: Optional sharding for the bias.
+            in1_features: Trailing feature count of the first input
+                (size of the ``i`` axis on the weight).
+            in2_features: Trailing feature count of the second input
+                (size of the ``j`` axis on the weight).
+            out_features: Output feature count (size of the ``o``
+                axis on the weight, and of the bias).
+            use_bias: When ``True`` (default), allocate and add a
+                ``(out_features,)`` zero-initialized bias.
+            rngs: Source of PRNG keys for parameter initialization.
+                Accepts an :class:`Rngs`, an ``int`` seed, or
+                ``None``; resolved via :func:`resolve_rngs`.
+            dtype: Storage dtype for the parameters. Defaults to
+                ``float32`` when both ``dtype`` and ``param_dtype``
+                are ``None``.
+            param_dtype: Alias for ``dtype``; takes precedence when
+                both are supplied.
+            sharding: Optional sharding for the three-axis weight
+                (axis names ``("in1", "in2", "out")``).
+            bias_sharding: Optional sharding for the bias (axis names
+                ``("out",)``).
         """
         super().__init__()
         self.in1_features = in1_features
@@ -172,7 +248,20 @@ class Bilinear(Module):
             )
 
     def forward(self, x1: ArrayLike, x2: ArrayLike, **_: object) -> Array:
-        """Compute the bilinear form and optionally add the bias."""
+        """Compute the bilinear form and add the bias when configured.
+
+        Args:
+            x1: First input with trailing axis equal to
+                :attr:`in1_features`.
+            x2: Second input with trailing axis equal to
+                :attr:`in2_features`. The leading shapes of ``x1`` and
+                ``x2`` broadcast against each other.
+            **_: Ignored; accepted for container interoperability.
+
+        Returns:
+            ``y`` with shape ``broadcast(x1.shape[:-1], x2.shape[:-1])
+            + (out_features,)``.
+        """
         y = jnp.einsum("...i,ijo,...j->...o", x1, self.weight.value, x2)
         if self.use_bias:
             y = y + self.bias.value

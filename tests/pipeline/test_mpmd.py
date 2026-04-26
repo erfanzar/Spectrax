@@ -307,9 +307,9 @@ def test_mpmd_interleaved_virtual_stages_match_single_device(xy, mpmd_mesh):
             if c != "parameters":
                 continue
             ref_leaf = ref_full.get("parameters", prefix + path)
-            assert jnp.allclose(
-                pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3
-            ), f"Grad mismatch at logical stage {i}, path {path!r}"
+            assert jnp.allclose(pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3), (
+                f"Grad mismatch at logical stage {i}, path {path!r}"
+            )
 
 
 def test_mpmd_profiler_records_per_task_times(hom_model, xy, mpmd_mesh):

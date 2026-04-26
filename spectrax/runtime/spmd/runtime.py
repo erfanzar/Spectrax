@@ -46,7 +46,18 @@ _PLACED_CACHE: dict[Any, tuple[State, State]] = {}
 
 
 def _microbatch(x: jax.Array, m: int) -> jax.Array:
-    """Reshape ``x`` (leading axis = batch) into ``(m, batch//m, ...)``."""
+    """Reshape ``x`` (leading axis = batch) into ``(m, batch // m, ...)``.
+
+    Args:
+        x: Array whose leading axis is the global batch.
+        m: Number of microbatches.
+
+    Returns:
+        ``x`` with the leading axis split into ``(m, batch // m)``.
+
+    Raises:
+        ValueError: If the batch size isn't divisible by ``m``.
+    """
     b = x.shape[0]
     if b % m:
         raise ValueError(f"Batch size {b} not divisible by number of microbatches {m}.")
@@ -54,12 +65,41 @@ def _microbatch(x: jax.Array, m: int) -> jax.Array:
 
 
 def _is_leaf(x: Any) -> bool:
-    """Treat JAX arrays / Variables as pytree leaves."""
+    """Pytree leaf predicate: stop traversal at JAX arrays and :class:`Variable` s.
+
+    Used to keep :func:`jax.tree.map` from descending into a
+    :class:`Variable` (which carries metadata pytree-style alongside
+    its raw array) when the runtime needs to slice the array directly.
+
+    Args:
+        x: Any pytree node.
+
+    Returns:
+        ``True`` if ``x`` should be treated as a leaf.
+    """
     return isinstance(x, jax.Array | Variable)
 
 
 def _extract_stages(container: PipelineSequential) -> tuple[Any, tuple[State, ...]]:
-    """Export each stage; verify all share the same :class:`GraphDef`."""
+    """Export every stage in ``container`` and assert :class:`GraphDef` homogeneity.
+
+    The SPMD pipeline runtime requires all stages to share the same
+    structural :class:`GraphDef` so it can stack their parameter
+    states along a leading stage axis. Heterogeneous pipelines must
+    use the MPMD path (:func:`spectrax.runtime.sxcall`) instead.
+
+    Args:
+        container: A :class:`PipelineSequential` model.
+
+    Returns:
+        ``(graphdef, per_stage_states)`` — the shared graph
+        definition and a tuple of one :class:`State` per stage.
+
+    Raises:
+        TypeError: If ``container`` is not a :class:`PipelineSequential`.
+        ValueError: If any stage's :class:`GraphDef` differs from
+            stage 0's.
+    """
     if not isinstance(container, PipelineSequential):
         raise TypeError(f"spx.pipeline expects a PipelineSequential, got {type(container).__name__}.")
     stages = container.stages
@@ -78,7 +118,21 @@ def _extract_stages(container: PipelineSequential) -> tuple[Any, tuple[State, ..
 
 
 def _stack_states(states: tuple[State, ...]) -> State:
-    """Stack per-stage states along a leading ``n_stages`` axis."""
+    """Stack per-stage :class:`State` values into a single stacked :class:`State`.
+
+    Walks the first state's ``(collection, path)`` keys and stacks
+    each leaf across every per-stage state along a new leading axis.
+    Used to build the ``(n_stages, ...)``-leading parameter state
+    that the runtime then shards along the pipeline axis.
+
+    Args:
+        states: Per-stage states (all assumed to share the same
+            collection / path layout).
+
+    Returns:
+        A single :class:`State` whose leaves are stacked across the
+        stage axis.
+    """
     out: dict[str, dict[str, Any]] = {}
     first_items = tuple(states[0].items())
     for c, p, _ in first_items:
@@ -123,7 +177,24 @@ def _unstack_state(stacked: State, n: int) -> tuple[State, ...]:
 
 
 def _split_params_rest(state: State) -> tuple[State, State]:
-    """Split ``state`` into ``(params, rest)``. Only params differentiate."""
+    """Split ``state`` into ``(params, rest)`` along the ``"parameters"`` collection.
+
+    The runtime only differentiates through the ``"parameters"``
+    collection; everything else (buffers, RNG, optimizer state)
+    flows through as non-differentiable inputs to
+    :func:`jax.value_and_grad`. Splitting up front keeps the autodiff
+    boundary clean and avoids the cost of computing zero cotangents
+    for the non-parameter leaves.
+
+    Args:
+        state: A :class:`State` containing both parameters and
+            other collections.
+
+    Returns:
+        ``(params, rest)`` where ``params`` holds only the
+        ``"parameters"`` collection and ``rest`` holds everything
+        else.
+    """
     raw = state.raw()
     params_raw: dict[str, dict[str, Any]] = {}
     rest_raw: dict[str, dict[str, Any]] = {}
@@ -236,7 +307,20 @@ def _extract_and_stack(
 
 
 def _stage_state_signature(states: tuple[State, ...]) -> _StageSignature:
-    """Signature that changes when live stage leaves are replaced."""
+    """Build a structural signature that invalidates when stage leaves are replaced.
+
+    Used as the cache key for :func:`_extract_and_stack` so an
+    optimizer step that replaces leaves in place still triggers a
+    re-stack on the next call. Mixing ``id(leaf)`` (catches identity
+    changes) with shape and dtype (catches structural changes from
+    e.g. parameter resizing) covers both common mutation patterns.
+
+    Args:
+        states: Per-stage states.
+
+    Returns:
+        A tuple suitable for use as a dictionary key.
+    """
     out: list[tuple[str, str, int, tuple[int, ...], str]] = []
     for stage_idx, state in enumerate(states):
         for collection, path, leaf in state.items():
@@ -318,11 +402,39 @@ def _build_spmd_step(
     """
 
     def stage_apply(params, rest, x):
-        """Apply a stage's forward to ``x`` using its ``(params, rest)``."""
+        """Apply a stage's forward to ``x`` using its ``(params, rest)`` split state.
+
+        The :class:`State` is reassembled with ``params.overlay(rest)``
+        so the user-side stage callable sees a single state.
+
+        Args:
+            params: Per-stage parameter state.
+            rest: Per-stage non-parameter state.
+            x: Input activation.
+
+        Returns:
+            The stage's output.
+        """
         return bind(gdef, params.overlay(rest))(x)
 
     def forward_through_stages(stacked_params, stacked_rest, x):
-        """Run ``x`` forward through all ``n_stages`` stages in order."""
+        """Run ``x`` forward through all ``n_stages`` stages in order.
+
+        Indexes ``stacked_params[s]`` and ``stacked_rest[s]`` at the
+        static offset ``s`` for each stage. Because the stacked state
+        is sharded along the pipeline axis before this function runs,
+        XLA places stage ``s``'s forward on device ``s`` and inserts
+        the cross-device transfer between stages automatically — no
+        explicit ``ppermute``.
+
+        Args:
+            stacked_params: Stage-stacked params.
+            stacked_rest: Stage-stacked non-parameter state.
+            x: Microbatch input.
+
+        Returns:
+            Final-stage output.
+        """
         for s in range(n_stages):
             idx = s
             p_s = jax.tree.map(lambda t, i=idx: t[i], stacked_params, is_leaf=_is_leaf)
@@ -331,12 +443,30 @@ def _build_spmd_step(
         return x
 
     def total_loss(stacked_params, stacked_rest, mb_batch):
-        """Mean per-microbatch loss, vmapped over the mb axis."""
+        """Mean per-microbatch loss, vmapped over the microbatch axis.
+
+        Args:
+            stacked_params: Stage-stacked parameters (the variable
+                being differentiated).
+            stacked_rest: Stage-stacked non-parameter state.
+            mb_batch: Tuple ``(xs, *targets)`` with leading mb axis.
+
+        Returns:
+            Scalar mean loss as ``float32``.
+        """
         xs = mb_batch[0]
         targets = mb_batch[1:]
 
         def per_mb(x_mb, *tgt_mb):
-            """Scalar loss for a single microbatch."""
+            """Scalar loss for a single microbatch.
+
+            Args:
+                x_mb: One microbatch's input.
+                *tgt_mb: One microbatch's targets.
+
+            Returns:
+                Scalar loss.
+            """
             out = forward_through_stages(stacked_params, stacked_rest, x_mb)
             return loss_fn(out, *tgt_mb)
 
@@ -345,7 +475,22 @@ def _build_spmd_step(
 
     @jax.jit
     def step(stacked_params, stacked_rest, *mb_batch):
-        """Jitted step: ``(stacked_params, stacked_rest, *mb_batch) -> (loss, per_stage_grads)``."""
+        """Jitted step: ``(stacked_params, stacked_rest, *mb_batch) -> (loss, per_stage_grads)``.
+
+        Wraps :func:`total_loss` in :func:`jax.value_and_grad` and
+        unstacks the resulting per-stage gradient inside the jit so
+        the layout transform is fused with the backward.
+
+        Args:
+            stacked_params: Stage-stacked parameter state, sharded
+                along the pipeline axis.
+            stacked_rest: Stage-stacked non-parameter state.
+            *mb_batch: Microbatched ``(xs, *targets)``.
+
+        Returns:
+            ``(loss, per_stage_grads)`` — scalar loss plus a tuple
+            of per-stage parameter-grad :class:`State` s.
+        """
         loss, grads_stacked = jax.value_and_grad(total_loss)(stacked_params, stacked_rest, mb_batch)
         grads_per_stage = tuple(
             jax.tree.map(lambda t, i=s: t[i], grads_stacked, is_leaf=_is_leaf) for s in range(n_stages)
@@ -356,5 +501,10 @@ def _build_spmd_step(
 
 
 def _clear_cache() -> None:
-    """Wipe the :func:`spmd_run` compile cache. Mainly for tests."""
+    """Wipe the :func:`spmd_run` compile cache.
+
+    Mainly for tests that want to force a re-trace between runs (e.g.
+    to validate that compilation succeeds from a cold cache, or to
+    free memory in between parametrised cases).
+    """
     _COMPILE_CACHE.clear()

@@ -2,7 +2,15 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Zero-bubble H1 schedule."""
+"""Zero-bubble H1 schedule (Qi et al., ICLR 2024).
+
+The H1 variant of zero-bubble pipeline parallelism splits each
+backward into an input-gradient half (:attr:`Phase.BWD_I`) and a
+weight-gradient half (:attr:`Phase.BWD_W`). The former stays on the
+critical path; the latter is reorderable and slots into what would
+otherwise be bubble time, driving the schedule's idle ratio toward
+zero without raising peak activation memory.
+"""
 
 from __future__ import annotations
 
@@ -102,5 +110,16 @@ class ZeroBubbleH1(Schedule):
         return grid
 
     def peak_activations(self, n_stages: int) -> int:
-        """Same peak as 1F1B — BWD_W does not extend activation lifetime."""
+        """Same peak as :class:`Std1F1B` — splitting BWD does not change lifetime.
+
+        BWD_W reads the same saved input as BWD_I, so injecting BWD_W
+        into bubble slots does not extend any activation's lifetime.
+        The per-stage peak is still bounded by ``n_stages``.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``n_stages``.
+        """
         return n_stages

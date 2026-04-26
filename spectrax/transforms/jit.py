@@ -60,7 +60,32 @@ _UNSET: Any = object()
 def _live_module_refs(
     args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[int, ...]]:
-    """Return ``(layout_key, gdef_key, id_key)`` for top-level Module args."""
+    """Build cache-key tuples for the top-level :class:`~spectrax.Module` arguments.
+
+    Used by the readonly fast path in :func:`jit`: instead of going
+    through the full split/merge shim, the wrapped call dispatches a
+    direct :func:`jax.jit` over the live module pytree, keyed by the
+    triple ``(layout, gdef, id)``. This avoids an export per call when
+    the same module instance is repeatedly passed in.
+
+    For each module the export cache is consulted; if it is stale (the
+    global graph epoch advanced since the last export) the cache is
+    refreshed via :func:`~spectrax.export`.
+
+    Args:
+        args: Positional arguments passed to the wrapped function.
+        kwargs: Keyword arguments passed to the wrapped function.
+
+    Returns:
+        A triple ``(layout_key, gdef_key, id_key)``:
+
+        * ``layout_key`` records the ``("arg"|"kwarg", index|name)``
+          position of every module.
+        * ``gdef_key`` collects the corresponding :class:`~spectrax.GraphDef`
+          values for the structural compile cache.
+        * ``id_key`` collects the Python ``id`` of each module instance
+          for the identity-based hot-path cache.
+    """
     layout: list[Any] = []
     gdefs: list[Any] = []
     ids: list[int] = []
@@ -367,11 +392,18 @@ def jit(
         return out
 
     def lower(*args: Any, **kwargs: Any) -> Any:
-        """Lower the same module-aware call shape as ``wrapped``.
+        """Lower the call to a :class:`jax.stages.Lowered` without dispatching it.
 
-        This mirrors ``jax.jit(...).lower(...)`` for AOT users while still
-        preserving SpecTrax's graph-def keyed cache.  Mutation write-back is a
-        runtime side effect, so lowering only prepares the transformed call.
+        Mirrors :meth:`jax.jit.lower` for ahead-of-time users while still
+        preserving the graph-def-keyed compile cache. Picks the same
+        scope-aware / direct / pure dispatch path as ``wrapped`` would,
+        builds the right pure body for that path, calls ``.lower(...)``
+        on the resulting jitted function, and returns the
+        :class:`~jax.stages.Lowered`. Side effects of the runtime
+        wrapper (specifically
+        :func:`~spectrax.transforms.split_merge.apply_mutations`) are
+        skipped — lowering is purely about preparing the compiled
+        artifact.
         """
         ctx_stack = _ctx_stack_get()
         if ctx_stack:
@@ -447,21 +479,26 @@ def jit(
 
 
 def _is_mpmd_mesh(mesh: Any) -> bool:
-    """Return whether ``mesh`` should use the MPMD ``sxjit`` path."""
+    """Return whether ``mesh`` is an MPMD mesh requiring the ``sxjit`` runtime.
+
+    Treats either an explicit ``is_mpmd`` boolean attribute or the
+    structural duck-typing trio (``mpmd_dim``, ``submesh``,
+    ``sub_sharding``) as evidence of an MPMD mesh.
+    """
     return bool(getattr(mesh, "is_mpmd", False)) or (
         hasattr(mesh, "mpmd_dim") and hasattr(mesh, "submesh") and hasattr(mesh, "sub_sharding")
     )
 
 
 def _normalize_argnums_for_sxjit(argnums: int | Sequence[int] | None) -> int | tuple[int, ...] | None:
-    """Coerce ``argnums`` into the form ``sxjit`` expects: ``None``/``int``/tuple."""
+    """Coerce ``argnums`` into the ``None``/``int``/``tuple`` shape ``sxjit`` accepts."""
     if argnums is None or isinstance(argnums, int):
         return argnums
     return tuple(argnums)
 
 
 def _normalize_argnames_for_sxjit(argnames: str | Iterable[str] | None) -> str | tuple[str, ...] | None:
-    """Coerce ``argnames`` into the form ``sxjit`` expects: ``None``/``str``/tuple."""
+    """Coerce ``argnames`` into the ``None``/``str``/``tuple`` shape ``sxjit`` accepts."""
     if argnames is None or isinstance(argnames, str):
         return argnames
     return tuple(argnames)

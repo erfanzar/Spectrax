@@ -125,20 +125,38 @@ def sxstage_iter(x: Any, *, stage: int | None = None, sharding: Any = None) -> A
 
 @sxstage_iter_p.def_impl
 def _mpmd_stage_iter_impl(*args, stage, sharding, treedef):
-    """Eager / trace-less path: identity."""
+    """Concrete-evaluation rule for :data:`sxstage_iter_p`.
+
+    Returns ``args`` verbatim — at trace-less / eager dispatch the
+    marker has no observable effect, so single-device runs match the
+    unmarked function exactly. The ``stage``, ``sharding`` and
+    ``treedef`` parameters are pure metadata consumed only by the MPMD
+    compiler pass.
+    """
     del stage, sharding, treedef
     return args
 
 
 @sxstage_iter_p.def_abstract_eval
 def _mpmd_stage_iter_abs(*args, stage, sharding, treedef):
-    """Abstract eval: same avals as inputs (identity semantics)."""
+    """Abstract-eval rule for :data:`sxstage_iter_p`.
+
+    The marker is the identity, so its output avals equal its input
+    avals. Used by JAX during tracing to propagate shape/dtype
+    information through marked code paths.
+    """
     del stage, sharding, treedef
     return args
 
 
 def _mpmd_stage_iter_transpose(cotangents, *args, stage, sharding, treedef):
-    """Linear-transpose rule: cotangents pass through unchanged."""
+    """Linear-transpose rule for :data:`sxstage_iter_p`.
+
+    Because the marker is the identity, its transpose is also the
+    identity: incoming cotangents flow back through unchanged. This
+    keeps :func:`jax.grad` / :func:`jax.vjp` numerically equivalent
+    between marked and unmarked models.
+    """
     del args, stage, sharding, treedef
     return cotangents
 
@@ -147,7 +165,14 @@ ad.deflinear2(sxstage_iter_p, _mpmd_stage_iter_transpose)
 
 
 def _mpmd_stage_iter_lowering(ctx, *args, stage, sharding, treedef):
-    """MLIR lowering: identity — just pass the operands through."""
+    """MLIR lowering rule for :data:`sxstage_iter_p`.
+
+    Emits no HLO of its own — the marker's operands are returned as
+    its results, so XLA sees only a pass-through and the compiled
+    program matches the unmarked function. The MPMD compiler removes
+    these primitives before lowering when it splits the jaxpr by
+    marker boundaries.
+    """
     del ctx, stage, sharding, treedef
     return list(args)
 
@@ -586,7 +611,16 @@ def split_by_markers(
         """Build a Python callable that evaluates ``cluster_jaxpr`` with bound consts."""
 
         def stage_fn(*args):
-            """Evaluate the captured cluster jaxpr against ``args``."""
+            """Evaluate ``cluster_jaxpr`` against ``args`` with the captured consts.
+
+            Args:
+                *args: Stage input activations as positional arrays,
+                    matching ``cluster_jaxpr.invars`` in order.
+
+            Returns:
+                Tuple of stage output activations matching
+                ``cluster_jaxpr.outvars``.
+            """
             return tuple(core.eval_jaxpr(cluster_jaxpr, consts, *args))
 
         stage_fn.__name__ = f"stage_fn_{id(cluster_jaxpr) & 0xFFFF:04x}"

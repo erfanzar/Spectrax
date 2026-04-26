@@ -110,9 +110,9 @@ def test_pipeline_loss_matches_reference(schedule_cls, model, xy, mesh, referenc
         schedule=schedule_cls(microbatches=_M),
         loss_fn=_loss_fn,
     )
-    assert jnp.allclose(
-        loss, ref_loss, atol=1e-4, rtol=1e-4
-    ), f"Pipeline loss {float(loss):.6f} != reference {float(ref_loss):.6f} for schedule {schedule_cls.__name__}"
+    assert jnp.allclose(loss, ref_loss, atol=1e-4, rtol=1e-4), (
+        f"Pipeline loss {float(loss):.6f} != reference {float(ref_loss):.6f} for schedule {schedule_cls.__name__}"
+    )
 
 
 def test_pipeline_grads_match_reference_gpipe(model, xy, mesh, reference):
@@ -129,9 +129,9 @@ def test_pipeline_grads_match_reference_gpipe(model, xy, mesh, reference):
     for stage_i, (pg, rg) in enumerate(zip(pipeline_grads, ref_grads, strict=False)):
         for path, ref_leaf in rg.items():
             pipe_leaf = pg.get("parameters", path)
-            assert jnp.allclose(
-                pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3
-            ), f"Grad mismatch at stage {stage_i}, path {path!r}"
+            assert jnp.allclose(pipe_leaf, ref_leaf, atol=1e-3, rtol=1e-3), (
+                f"Grad mismatch at stage {stage_i}, path {path!r}"
+            )
 
 
 def test_pipeline_interleaved_smoke(model, xy, mesh):

@@ -96,8 +96,25 @@ class SpxMesh:
 
     @property
     def is_mpmd(self) -> bool:
-        """``True`` iff ``mpmd_axis`` is set (i.e. pipeline parallelism enabled)."""
-        return self.mpmd_axis is not None
+        """``True`` iff there is a real MPMD pipeline (mpmd_axis set AND its dim > 1).
+
+        @erfanzar NOTE:
+            Naming an mpmd_axis with dim==1 is a degenerate single-stage
+            pipeline — semantically equivalent to no pipeline at all.
+            Treating it as MPMD routes every ``spx.jit`` through the
+            heavy MPMD pipeline runtime (cluster builder, per-rank
+            re-jit, layout reassignment) and forces XLA to insert
+            layout-reformat copies at JIT boundaries because the MPMD
+            path does not honor caller-allocated array layouts. We
+            require the axis to actually have parallel size to flip
+            this on.
+        """
+        if self.mpmd_axis is None:
+            return False
+        try:
+            return int(self.jax_mesh.shape[self.mpmd_axis]) > 1
+        except (KeyError, AttributeError, TypeError):
+            return True
 
     @property
     def mpmd_mesh(self):
@@ -472,28 +489,32 @@ def calculate_host_mesh_shape(
             f"Mesh size {total_mesh_size} doesn't match available devices "
             f"{total_devices * num_processes} (local x processes)."
         )
-    host_mesh = list(global_mesh_shape)
-    remaining_process_split = num_processes
-    idx = 0
-    while remaining_process_split > 1 and idx < len(host_mesh):
-        dim_size = host_mesh[idx]
-        if dim_size >= remaining_process_split:
-            factor = remaining_process_split
-            host_mesh[idx] = dim_size // factor
-            remaining_process_split = 1
-        else:
-            factor = dim_size
-            host_mesh[idx] = 1
-            remaining_process_split //= factor
-        idx += 1
-    host_total = int(np.prod(host_mesh))
-    if host_total != total_devices:
+
+    def _walk(remaining: int, dims: tuple[int, ...]) -> tuple[int, ...] | None:
+        """Find inter-host factors that multiply to ``remaining``, dim by dim.
+
+        Prefers larger factors on the leading dims (matching the historical
+        greedy intent of keeping per-host blocks contiguous on trailing axes).
+        """
+        if not dims:
+            return () if remaining == 1 else None
+        d = dims[0]
+        for f in range(d, 0, -1):
+            if d % f == 0 and remaining % f == 0:
+                rest = _walk(remaining // f, dims[1:])
+                if rest is not None:
+                    return (f, *rest)
+        return None
+
+    inter_host = _walk(num_processes, tuple(global_mesh_shape))
+    if inter_host is None:
         raise ValueError(
-            f"Host mesh shape {tuple(host_mesh)} uses {host_total} devices "
-            f"instead of {total_devices}. Ensure ``num_processes`` factors "
-            f"the global mesh shape."
+            f"Cannot factor num_processes={num_processes} across global mesh "
+            f"shape {tuple(global_mesh_shape)} so that each per-process slice "
+            f"contains exactly {total_devices} devices."
         )
-    return tuple(host_mesh)
+    host_mesh = tuple(d // f for d, f in zip(global_mesh_shape, inter_host, strict=False))
+    return host_mesh
 
 
 def _cached_mesh(
@@ -505,7 +526,13 @@ def _cached_mesh(
     allow_split_physical_axes: bool,
     backend: str | None,
 ) -> Mesh:
-    """Hashable-args wrapper around :func:`_cached_mesh_impl`."""
+    """Hashable-args wrapper around :func:`_cached_mesh_impl`.
+
+    Coerces every sequence argument to a tuple (so :func:`functools.cache`
+    can use them as dict keys) and falls back to
+    :func:`jax.default_backend` when ``backend`` is ``None``. The actual
+    mesh creation happens in :func:`_cached_mesh_impl`.
+    """
     return _cached_mesh_impl(
         axis_dims=tuple(axis_dims),
         axis_names=tuple(axis_names),

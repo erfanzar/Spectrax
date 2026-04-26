@@ -2,7 +2,24 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""DualPipe-V schedule and per-rank task builder."""
+"""DualPipe-V schedule and per-rank task builder (DeepSeek-V3).
+
+DualPipe-V is the V-shaped bidirectional schedule used by DeepSeek-V3.
+Every physical rank hosts two virtual stages: one that runs in the
+forward direction (rank ``r`` -> ``r+1``) and one that runs in the
+reverse direction (rank ``r+1`` -> ``r``). The two virtual stages
+mirror each other so each microbatch visits every rank twice before
+hitting the loss.
+
+This module provides:
+
+* :class:`DualPipeV` — the :class:`Schedule` subclass that emits the
+  V-shape grid for any spectrax pipeline runtime.
+* :func:`dualpipev_tasks` — a per-rank, eight-section task list that
+  matches DeepSeek's reference ``dualpipev.py``. Useful for building
+  custom executors or experimental runners outside spectrax's grid
+  representation.
+"""
 
 from __future__ import annotations
 
@@ -86,20 +103,43 @@ class DualPipeV(Schedule):
         return grid
 
     def virtual_stages_per_rank(self) -> int:
-        """Always 2 for the V-shape topology (forward and reverse virtuals)."""
+        """Always ``2`` for the V-shape topology (forward and reverse virtuals)."""
         return 2
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
         """Map ``(rank, virt)`` to its logical stage under the V shape.
 
         ``virt == 0`` traces ranks ``0..n-1`` as logical stages
-        ``0..n-1``; ``virt == 1`` traces ranks ``n-1..0`` as logical
-        stages ``n..2n-1``.
+        ``0..n-1`` (forward direction); ``virt == 1`` traces ranks
+        ``n-1..0`` as logical stages ``n..2n-1`` (reverse direction).
+
+        Args:
+            rank: Physical rank index in ``[0, n_stages)``.
+            virt: Virtual-stage index, ``0`` (forward leg) or ``1``
+                (reverse leg).
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Logical-stage index in ``[0, 2 * n_stages)``.
         """
         return rank if virt == 0 else 2 * n_stages - 1 - rank
 
     def next_logical_loc(self, rank: int, virt: int, n_stages: int):
-        """Return the ``(rank, virt)`` of the next logical stage (or ``None``)."""
+        """Return the ``(rank, virt)`` of the next logical stage, or ``None``.
+
+        Walks the V-shape: in the forward leg the next stage is the
+        next physical rank; at the apex (logical ``n - 1``) the path
+        bounces and starts walking ranks back down on virtual stage 1.
+
+        Args:
+            rank: Current physical rank.
+            virt: Current virtual-stage index.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Downstream ``(rank, virt)`` or ``None`` if this is the
+            terminal logical stage (``logical == 2 * n_stages - 1``).
+        """
         current = self.logical_at(rank, virt, n_stages)
         nxt = current + 1
         if nxt >= 2 * n_stages:
@@ -109,11 +149,32 @@ class DualPipeV(Schedule):
         return (2 * n_stages - 1 - nxt, 1)
 
     def terminal_loc(self, n_stages: int) -> tuple[int, int]:
-        """Terminal stage is logical ``2n-1``, which lives at ``(0, 1)``."""
+        """Return ``(0, 1)`` — terminal logical stage ``2n-1`` lives on rank 0's reverse leg.
+
+        Because the V bounces back, the final logical stage runs on
+        physical rank ``0``'s reverse virtual stage. The runtime fires
+        ``loss_fn`` here.
+
+        Args:
+            n_stages: Number of physical pipeline ranks (unused).
+
+        Returns:
+            Always ``(0, 1)``.
+        """
         return (0, 1)
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak ≈ ``2 * n_stages`` (both virtuals hold activations)."""
+        """Peak ≈ ``2 * n_stages`` saved activations per rank (one per virtual leg).
+
+        Each rank holds ``n_stages`` saved activations from the
+        forward leg and another ``n_stages`` from the reverse leg.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``2 * n_stages``.
+        """
         return 2 * n_stages
 
 
@@ -161,12 +222,20 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
     stage_counts: dict[tuple[int, Phase], int] = {}
 
     def _next_mb(stage_id: int, phase: Phase) -> int:
-        """Return the next microbatch index for ``(stage_id, phase)``, post-incrementing the counter.
+        """Return the next microbatch index for ``(stage_id, phase)`` and bump the counter.
 
-        Each (stage, phase) gets its own monotonically increasing
-        microbatch counter so the same logical stage produces
-        microbatches 0, 1, 2, ... in the order the schedule schedules
-        them.
+        Each ``(logical_stage, phase)`` pair gets its own
+        monotonically increasing microbatch counter so the same
+        logical stage produces microbatches 0, 1, 2, ... in the order
+        the schedule emits them.
+
+        Args:
+            stage_id: Logical-stage index (``0 .. 2 * mpmd_dim - 1``).
+            phase: Which phase counter to advance.
+
+        Returns:
+            The microbatch index for this action; counter is
+            incremented for the next call.
         """
         key = (stage_id, phase)
         mb = stage_counts.get(key, 0)
@@ -176,27 +245,57 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
     def fwd(stage_id: int) -> Action:
         """Build a forward :class:`Action` for ``stage_id`` at its next microbatch.
 
-        Virtual stage 0 for stages < ``mpmd_dim`` (the lower half of
-        the V-shape), virtual stage 1 for the upper half — matching
-        the DualPipeV layout where each rank owns two virtual stages.
+        Virtual stage 0 for stages ``< mpmd_dim`` (the forward leg of
+        the V), virtual stage 1 for the rest (the reverse leg) —
+        matching the DualPipe-V layout where each rank owns two
+        virtual stages.
+
+        Args:
+            stage_id: Logical-stage index.
+
+        Returns:
+            A FWD :class:`Action` with the right virtual-stage tag.
         """
         return Action(Phase.FWD, _next_mb(stage_id, Phase.FWD), 0 if stage_id < mpmd_dim else 1)
 
     def bwd_a(stage_id: int) -> Action:
-        """Build a BWD_I (input-grad) :class:`Action` for ``stage_id``."""
+        """Build a BWD_I (input-grad) :class:`Action` for ``stage_id``.
+
+        Args:
+            stage_id: Logical-stage index.
+
+        Returns:
+            A :attr:`Phase.BWD_I` :class:`Action` for the next
+            microbatch on this stage.
+        """
         return Action(Phase.BWD_I, _next_mb(stage_id, Phase.BWD_I), 0 if stage_id < mpmd_dim else 1)
 
     def bwd_w(stage_id: int) -> Action:
-        """Build a BWD_W (weight-grad) :class:`Action` for ``stage_id``."""
+        """Build a BWD_W (weight-grad) :class:`Action` for ``stage_id``.
+
+        Args:
+            stage_id: Logical-stage index.
+
+        Returns:
+            A :attr:`Phase.BWD_W` :class:`Action` for the next
+            microbatch on this stage.
+        """
         return Action(Phase.BWD_W, _next_mb(stage_id, Phase.BWD_W), 0 if stage_id < mpmd_dim else 1)
 
     def bwd(stage_id: int) -> FusedTask:
-        """Build a fused (BWD_I + BWD_W) task — same microbatch, both backward halves.
+        """Build a fused (BWD_I + BWD_W) task on the same microbatch.
 
         Returned as a :class:`FusedTask` whose ``fwd`` slot holds the
         BWD_I action and ``bwd`` slot holds the BWD_W action; this is
-        a slight repurposing of the field names for the
-        DualPipe-specific pairing convention.
+        a deliberate repurposing of the field names for the DualPipe
+        pairing convention (a single backward dispatched as one
+        kernel that produces both input- and weight-gradients).
+
+        Args:
+            stage_id: Logical-stage index.
+
+        Returns:
+            A :class:`FusedTask` packing the two backward halves.
         """
         a = bwd_a(stage_id)
         w = bwd_w(stage_id)
@@ -207,8 +306,19 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
 
         The BWD_W half is allocated by side-effect (advancing its
         microbatch counter) but not packed into the returned task —
-        DualPipeV emits the weight-grad later in the schedule, which
-        keeps it free to slot into bubble time.
+        DualPipe-V emits the weight-grad later in the schedule, which
+        keeps it free to slot into bubble time and is what makes the
+        schedule "near zero-bubble" in steady state.
+
+        Args:
+            fwd_stage: Logical stage to forward on.
+            bwd_stage: Logical stage to BWD_I on (typically the
+                mirror partner of ``fwd_stage``).
+
+        Returns:
+            A :class:`FusedTask` whose ``fwd`` is the forward action
+            and ``bwd`` is the BWD_I action; the deferred BWD_W is
+            counted but not emitted here.
         """
         f = fwd(fwd_stage)
         a = bwd_a(bwd_stage)

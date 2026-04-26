@@ -2,7 +2,16 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Dense (fully connected) matrix multiplication with optional bias."""
+"""Dense (fully connected) matrix multiplication with optional bias.
+
+Implemented via :func:`jax.lax.dot_general` rather than
+:func:`jax.numpy.matmul` so the contraction can be expressed without
+the extra dispatch and reshape overhead of the general matmul entry
+point. The dtype-promotion logic on :func:`linear` follows the
+convention used by mainstream training paths: the higher-precision
+operand is downcast to the lower-precision one to keep the accelerator
+on its native fast matmul path.
+"""
 
 from __future__ import annotations
 

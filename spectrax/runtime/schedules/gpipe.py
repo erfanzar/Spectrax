@@ -2,7 +2,14 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""GPipe schedule: all forwards then all backwards."""
+"""GPipe schedule (Huang et al., 2019): all forwards, then all backwards.
+
+The simplest pipeline schedule. Every microbatch's forward runs through
+every stage before any backward starts, so each stage holds ``M``
+saved activations at its memory peak. The bubble shape is the
+classic GPipe trapezoid: ``(n_stages - 1)`` empty slots at the start
+of forward and at the end of backward.
+"""
 
 from __future__ import annotations
 
@@ -73,5 +80,17 @@ class GPipe(Schedule):
         return grid
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak = ``microbatches`` per stage (all saved before any backward)."""
+        """Peak live activations per stage equals :attr:`microbatches`.
+
+        Every stage saves its activation for every microbatch's
+        forward, then releases them as the matching backwards run.
+        Memory is dominated by the all-fwd-first ordering.
+
+        Args:
+            n_stages: Number of physical pipeline ranks (unused for
+                GPipe; the peak is per-stage and ``M``-bound).
+
+        Returns:
+            ``self.microbatches``.
+        """
         return self.microbatches

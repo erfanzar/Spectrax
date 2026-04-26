@@ -78,12 +78,21 @@ class PipelineSequential(Module):
     def __init__(self, *stages: Module) -> None:
         """Construct a pipeline container with ``len(stages)`` stages.
 
+        The stages are stored on the private list attribute
+        ``_spx_items`` so the framework's container traversal
+        machinery (see :meth:`_spx_graph_children`) discovers them in
+        order. The list is set via :func:`object.__setattr__` to
+        bypass the standard module-field validation, which would
+        otherwise reject a heterogeneous list of children.
+
         Args:
-            *stages: Individual stage modules. Order is significant and
-                becomes the forward-execution order.
+            *stages: One :class:`Module` per pipeline stage, in
+                application order. At least one stage is required;
+                all entries must be :class:`Module` instances.
 
         Raises:
-            TypeError: If any argument is not a :class:`Module`.
+            TypeError: If any positional argument is not a
+                :class:`Module`.
             ValueError: If zero stages are passed.
         """
         super().__init__()
@@ -96,37 +105,65 @@ class PipelineSequential(Module):
 
     @property
     def num_stages(self) -> int:
-        """Number of pipeline stages."""
+        """Number of pipeline stages currently held by the container."""
         return len(self._spx_items)
 
     @property
     def stages(self) -> list[Module]:
-        """Live list of per-stage :class:`Module` instances."""
+        """Snapshot list of per-stage :class:`Module` instances.
+
+        The returned list is a fresh copy so callers can iterate or
+        reorder without mutating the container's internal state.
+        """
         return list(self._spx_items)
 
     def forward(self, x: Any) -> Any:
         """Apply every stage in order (eager / single-device path).
 
-        Under :func:`spectrax.pipeline.pipeline`, the orchestrator calls
+        Each stage is called as ``stage(x)`` and its return value
+        becomes the input of the next stage. Under
+        :func:`spectrax.pipeline.pipeline` the orchestrator calls
         each stage's ``forward`` on its assigned device instead of
-        invoking this method directly.
+        invoking this method directly — i.e. this code path is only
+        used in eager / single-device execution.
+
+        Args:
+            x: Input passed to the first stage; subsequent stages
+                receive the previous stage's output.
+
+        Returns:
+            The output of the final stage.
         """
         for stage in self._spx_items:
             x = stage(x)
         return x
 
     def _spx_graph_children(self) -> Iterator[tuple[int, Module | Variable]]:
-        """Yield ``(index, stage)`` pairs in stage order."""
+        """Yield ``(index, stage)`` pairs in stage order.
+
+        Used by :class:`~spectrax.Module`'s graph-traversal machinery
+        to discover sub-modules and their state. Indexing by integer
+        position keeps stage paths stable across pickling and
+        container surgery.
+        """
         yield from enumerate(self._spx_items)
 
     def __len__(self) -> int:
-        """Number of stages (same as :attr:`num_stages`)."""
+        """Return the number of stages (same as :attr:`num_stages`)."""
         return len(self._spx_items)
 
     def __getitem__(self, idx: int) -> Module:
-        """Get the stage at position ``idx``."""
+        """Return the stage at integer position ``idx``.
+
+        Args:
+            idx: Zero-based stage index. Negative indices are
+                resolved by Python's list semantics.
+
+        Returns:
+            The :class:`Module` registered at that position.
+        """
         return self._spx_items[idx]
 
     def __iter__(self) -> Iterator[Module]:
-        """Iterate over stages in order."""
+        """Iterate over stages in application order."""
         return iter(self._spx_items)

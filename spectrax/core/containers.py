@@ -242,7 +242,19 @@ _SCAN_SAFE_VALUE = ("spectrax", "scan-safe-field")
 
 @dataclass(frozen=True)
 class _ScanSegment:
-    """One consecutive run that can be lowered with one graph template."""
+    """One consecutive run that can be lowered with one graph template.
+
+    Attributes:
+        start: Inclusive starting layer index of the segment.
+        stop: Exclusive stopping layer index.
+        gdef: The shared :class:`GraphDef` template used for every
+            layer in the segment.
+        stacked: The per-segment :class:`State` whose leaves carry a
+            leading length-``length`` axis.
+        family_id: Numeric identifier of the segment's scan family
+            (segments with equal ``family_id`` could in principle
+            share a template).
+    """
 
     start: int
     stop: int
@@ -258,7 +270,17 @@ class _ScanSegment:
 
 @dataclass(frozen=True)
 class _ScanPlan:
-    """Internal lowering plan for repeated-layer scans."""
+    """Internal lowering plan for repeated-layer scans.
+
+    Attributes:
+        segments: Per-segment lowering descriptors in execution order.
+        graph_family_ids: Per-layer family ids in original layer order;
+            the segmentation is contiguous runs of equal ids.
+        lowering: One of ``"single_template"`` (a single segment
+            covering the whole list) or ``"segmented_templates"``.
+        fallback_reason: Optional human-readable reason recorded when
+            the plan had to fall back to a less-optimal lowering.
+    """
 
     segments: tuple[_ScanSegment, ...]
     graph_family_ids: tuple[int, ...]
@@ -347,7 +369,13 @@ def _stage_place_trace_carry(layer: Module, carry: Any) -> Any:
     stage_mesh = None
     for _path, var in iter_variables(layer):
         value = getattr(var, "value", None)
-        sharding = getattr(value, "sharding", None)
+        # Skip tracers — Tracer.sharding triggers ``find_progenitors`` over
+        # the entire jaxpr, which is O(jaxpr-size) per call (deadly here
+        # because we iterate every variable on the layer).
+        if isinstance(value, jax.core.Tracer):
+            sharding = None
+        else:
+            sharding = getattr(value, "sharding", None)
         if (
             getattr(var, "stage_assignment", None) is not None
             and isinstance(sharding, jax.sharding.NamedSharding)
@@ -719,7 +747,16 @@ class _ListContainer(Module):
         """Construct the container from an iterable of items.
 
         Items are validated one by one via :meth:`_validate_item` before
-        being stored.
+        being stored, so a malformed entry raises immediately rather
+        than during a later traversal.
+
+        Args:
+            items: Iterable of values to store. Concrete element-type
+                requirements are enforced by the subclass's
+                :meth:`_validate_item` override.
+
+        Raises:
+            TypeError: If any item fails subclass validation.
         """
         super().__init__()
         materialized = list(items)
@@ -823,6 +860,15 @@ class ModuleList(_ListContainer):
         which exports all child modules, stacks their states, and
         slices into the stack — letting layer code write
         ``self.blocks[i]`` inside a :func:`spectrax.fori_loop`.
+
+        Args:
+            idx: Python integer, slice, or a JAX tracer integer.
+
+        Returns:
+            For concrete ``int`` indices, the stored module. For
+            slices, a new :class:`ModuleList` over the sliced items.
+            For tracer indices, a freshly bound module assembled from
+            the stacked state.
         """
         if isinstance(idx, slice):
             return type(self)(self._spx_items[idx])
@@ -847,10 +893,35 @@ class ModuleList(_ListContainer):
     def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
         """Scan over modules: ``fn(module, carry) -> new_carry``.
 
-        When ``trace`` is true, executes a normal Python loop over live
-        modules. When ``trace`` is false, runs a real ``jax.lax.scan`` over the
-        repeated layer state. ``unroll=None`` selects SpectraX's default
-        unroll (``1``); pass an explicit value to override it.
+        Two execution modes:
+
+        * ``trace=True`` runs a plain Python loop over the live modules,
+          calling ``fn(layer, carry)`` for each. The trace path keeps
+          per-layer Python differences (helpful while debugging) and
+          additionally relocates the leading carry leaf onto each
+          layer's stage sub-mesh when running on an MPMD pipeline.
+        * ``trace=False`` (default) builds a segmented
+          :func:`jax.lax.scan` plan. Modules with the same scan
+          family-key (compatible structure plus only metadata-only
+          static differences) share a single template graphdef; runs of
+          incompatible modules are emitted as separate scan segments.
+          This is the high-throughput path used by transformer stacks.
+
+        Args:
+            fn: Body callable ``(module, carry) -> new_carry``. The
+                signature is identical in both modes; under the lowered
+                scan, ``module`` is reconstructed from the per-layer
+                state slice via :func:`~spectrax.bind`.
+            init_carry: Initial carry value. Must be a pytree
+                acceptable to :func:`jax.lax.scan` when ``trace=False``.
+            trace: ``True`` selects the Python-loop path; ``False``
+                lowers to ``lax.scan``.
+            unroll: Optional explicit unroll factor for
+                :func:`jax.lax.scan`. ``None`` selects SpectraX's
+                default of ``1``.
+
+        Returns:
+            The final carry after the last layer runs.
         """
         if trace:
             carry = init_carry
@@ -892,10 +963,22 @@ class ModuleList(_ListContainer):
         return self.stack()
 
     def fori_loop(self, fn, init_carry):
-        """fori_loop over modules: ``fn(i, module, carry) -> new_carry``.
+        """``fori_loop`` over modules: ``fn(i, module, carry) -> new_carry``.
 
-        Exports all modules, stacks their states, and runs
-        ``jax.lax.fori_loop`` with pytree-level slicing.
+        Exports every child module, stacks their states on a leading
+        layer axis, then runs :func:`jax.lax.fori_loop` from ``0`` to
+        ``len(self)``. The body slices the i-th layer's state out of
+        the stacked pytree and binds it to the shared graphdef before
+        calling ``fn``. Items must therefore share a compatible graph
+        structure; for heterogeneous layers use :meth:`scan` with
+        ``trace=True``.
+
+        Args:
+            fn: Body callable ``(i, module, carry) -> new_carry``.
+            init_carry: Initial carry passed to the first iteration.
+
+        Returns:
+            The carry returned by the final iteration.
         """
         from .graph import bind
 
@@ -958,15 +1041,30 @@ class StackedModuleList(Module):
     def __init__(self, items: Iterable[Module] = ()) -> None:
         """Eagerly stack the variable leaves of each item along a new layer axis.
 
-        On construction the container exports each child module, asserts
-        every export shares a compatible graph definition, and stacks
-        the per-layer leaves into a single state pytree. After this
-        the container holds *one* graphdef plus a state shaped
-        ``[L, ...]`` per leaf, eliminating the per-traced-call stack
-        cost paid by :class:`ModuleList`.
+        On construction the container exports each child module,
+        asserts every export shares a compatible graph topology, then
+        stacks the per-layer leaves into a single state pytree. After
+        this the container holds one template graphdef (plus per-item
+        graphdefs for fallback paths) plus state shaped ``[L, ...]``
+        per leaf, eliminating the per-traced-call stack cost paid by
+        :class:`ModuleList`. Each stacked leaf is wrapped in a fresh
+        :class:`~spectrax.Variable` whose metadata gains a leading
+        ``None`` entry on its ``axis_names``/``sharding`` so the layer
+        axis is replicated.
 
         Empty constructions defer the metadata until the first
         ``append``, so ``StackedModuleList()`` is cheap.
+
+        Args:
+            items: Iterable of :class:`~spectrax.Module` instances to
+                stack. Every item must produce a topology-compatible
+                graphdef; behavior-changing per-layer static
+                differences raise :class:`ValueError` here.
+
+        Raises:
+            TypeError: If any item is not a :class:`~spectrax.Module`.
+            ValueError: If the items have incompatible graph topology
+                or incompatible state structure.
         """
         super().__init__()
         materialized = list(items)
@@ -1115,7 +1213,26 @@ class StackedModuleList(Module):
         raise RuntimeError("StackedModuleList is not callable; iterate, index, or scan it.")
 
     def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
-        """Scan over pre-stacked modules: ``fn(module, carry) -> new_carry``."""
+        """Scan over pre-stacked modules: ``fn(module, carry) -> new_carry``.
+
+        Same semantics as :meth:`ModuleList.scan` but skips the
+        per-call stacking of layer leaves because the container has
+        already paid that cost at construction time. ``trace=True``
+        materializes one layer view per Python iteration; ``trace=False``
+        builds (or reuses) a segmented :func:`jax.lax.scan` plan over
+        the pre-stacked state.
+
+        Args:
+            fn: Body callable ``(module, carry) -> new_carry``.
+            init_carry: Initial carry.
+            trace: ``True`` to use the Python-loop path; ``False`` to
+                lower to ``lax.scan``.
+            unroll: Optional explicit ``lax.scan`` unroll factor.
+
+        Returns:
+            The final carry, or ``init_carry`` unchanged when the
+            container is empty.
+        """
         if trace:
             carry = init_carry
             for layer in self:
@@ -1137,7 +1254,25 @@ class StackedModuleList(Module):
         return carry
 
     def fori_loop(self, fn, init_carry):
-        """fori_loop over pre-stacked modules."""
+        """``fori_loop`` over pre-stacked modules: ``fn(i, module, carry) -> new_carry``.
+
+        Requires every layer to share a single scan-compatible
+        graphdef (the template stored at construction time). When that
+        is not the case (heterogeneous layers) :meth:`scan` with
+        per-segment templates is the only option.
+
+        Args:
+            fn: Body callable ``(i, module, carry) -> new_carry``.
+            init_carry: Initial carry passed to the first iteration.
+
+        Returns:
+            The final carry, or ``init_carry`` unchanged when the
+            container is empty.
+
+        Raises:
+            TypeError: If the container holds layers with multiple
+                distinct graph templates.
+        """
         from .graph import bind
 
         if not getattr(self, "_spx_item_gdefs", ()):
@@ -1176,7 +1311,21 @@ class Sequential(_ListContainer):
             raise TypeError(f"Sequential accepts Modules only, got {type(value).__name__}")
 
     def forward(self, x: Any, **kwargs: Any) -> Any:
-        """Thread ``x`` through the chain, passing ``**kwargs`` where accepted."""
+        """Thread ``x`` through the chain, passing ``**kwargs`` where accepted.
+
+        Each child is called with ``(x, **kwargs)``. A :class:`TypeError`
+        from a child (typically because it does not declare the keyword)
+        is treated as a signal to retry positionally as ``m(x)``; any
+        other exception propagates.
+
+        Args:
+            x: Initial input. Threaded through every child in order.
+            **kwargs: Keyword arguments forwarded to children that
+                accept them.
+
+        Returns:
+            The output of the final child in the chain.
+        """
         for m in self._spx_items:
             try:
                 x = m(x, **kwargs)
@@ -1216,7 +1365,19 @@ class ModuleDict(Module):
     _spx_items: dict[str, Module]
 
     def __init__(self, items: Mapping[str, Module] | None = None) -> None:
-        """Construct from an optional ``{name: module}`` mapping."""
+        """Construct from an optional ``{name: module}`` mapping.
+
+        Each entry is routed through :meth:`__setitem__` so type
+        checks fire on construction.
+
+        Args:
+            items: Optional mapping of string names to module
+                instances. ``None`` constructs an empty dict.
+
+        Raises:
+            TypeError: If a value is not a :class:`~spectrax.Module`
+                or a key is not a ``str``.
+        """
         super().__init__()
         object.__setattr__(self, "_spx_items", {})
         if items:

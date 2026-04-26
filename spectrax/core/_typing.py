@@ -16,6 +16,7 @@ accepted by layer initializers, module hooks, and variable observers.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import jax
@@ -80,12 +81,12 @@ class Initializer(Protocol):
         ...
 
 
-ModulePredicate: TypeAlias = "callable[[Any, str], bool]"
+ModulePredicate: TypeAlias = "Callable[[Any, str], bool]"
 """Callable ``(module, path) -> bool`` predicate used by
 :class:`~spectrax.Selector` to filter modules.
 """
 
-VariablePredicate: TypeAlias = "callable[[Any, str], bool]"
+VariablePredicate: TypeAlias = "Callable[[Any, str], bool]"
 """Callable ``(variable, path) -> bool`` predicate used by
 :class:`~spectrax.Selector` to filter variables.
 """

@@ -2,11 +2,23 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-""":class:`DenseGeneral` and :class:`Einsum`.
+"""Generalised dense layers — :class:`DenseGeneral` and :class:`Einsum`.
 
-Generalizations of :class:`~spectrax.nn.Linear` that allow contractions
-over arbitrary axes (``DenseGeneral``) or fully-custom einsum equations
-(``Einsum``).
+These two layers extend :class:`~spectrax.nn.Linear` along orthogonal
+axes:
+
+* :class:`DenseGeneral` keeps the implicit "input axes contract,
+  output axes broadcast" structure of a standard dense layer, but lets
+  callers pick *which* input axes to contract and *what shape* of new
+  trailing axes to produce. It is implemented with
+  :func:`jax.numpy.tensordot`.
+* :class:`Einsum` exposes an arbitrary :func:`jax.numpy.einsum`
+  equation between the input and a learnable weight tensor. It is the
+  most flexible primitive and the one used internally by attention
+  blocks that fold the per-head reshape into the matmul.
+
+Both layers attach the standard "axis name" sharding hints; both
+default to a Kaiming-uniform weight init and zero bias.
 """
 
 from __future__ import annotations
@@ -26,25 +38,52 @@ __all__ = ["DenseGeneral", "Einsum"]
 
 
 def _to_tuple(x: int | Sequence[int]) -> tuple[int, ...]:
-    """Return ``x`` as a tuple (wrapping ints)."""
+    """Coerce ``x`` to a tuple, wrapping a bare ``int`` in a length-1 tuple.
+
+    Args:
+        x: Either a single ``int`` or any sequence of ints.
+
+    Returns:
+        ``(x,)`` when ``x`` is an ``int``; ``tuple(x)`` otherwise.
+    """
     return (x,) if isinstance(x, int) else tuple(x)
 
 
 def _normalize_axes(axes: Sequence[int], ndim: int) -> tuple[int, ...]:
-    """Resolve negative axis indices against ``ndim``."""
+    """Resolve possibly-negative axis indices against ``ndim``.
+
+    Used to translate user-facing negative axis arguments (which are
+    ergonomic but not accepted by every JAX primitive) into canonical
+    non-negative positions.
+
+    Args:
+        axes: Axis indices, each in ``[-ndim, ndim)``.
+        ndim: Rank of the array against which the axes were specified.
+
+    Returns:
+        A tuple of non-negative axis indices, each in ``[0, ndim)``.
+    """
     return tuple(a % ndim for a in axes)
 
 
 class DenseGeneral(Module):
-    """Dense layer with contraction over arbitrary axes.
+    """Dense layer that contracts over arbitrary input axes.
 
-    ``axis`` selects which axes of the input are contracted; ``features``
-    is the shape of the trailing new axes. The weight has shape
-    ``(*contracted_shape, *features)``; the bias has shape ``features``.
+    ``axis`` selects which axes of the input ``x`` participate in the
+    contraction; ``features`` specifies the shape of the new trailing
+    axes appended to the result. The weight has shape
+    ``(*in_shape, *features)`` and the bias (when used) has shape
+    ``features``. Internally the contraction is computed via
+    :func:`jax.numpy.tensordot`.
+
+    Because the weight is allocated eagerly the contracted-axis sizes
+    must be supplied via ``in_shape=`` at construction — there is no
+    deferred-shape mode.
 
     Example::
 
-        >>> layer = DenseGeneral(features=(4, 8), axis=(-2, -1), rngs=Rngs(0))
+        >>> layer = DenseGeneral(features=(4, 8), axis=(-2, -1),
+        ...                      in_shape=(2, 6), rngs=Rngs(0))
         >>> y = layer(jnp.zeros((3, 5, 2, 6)))
         >>> y.shape
         (3, 5, 4, 8)
@@ -68,22 +107,41 @@ class DenseGeneral(Module):
         sharding: Sharding | AxisNames | None = None,
         bias_sharding: Sharding | AxisNames | None = None,
     ) -> None:
-        """Initialize.
+        """Initialize the layer.
 
         Args:
-            features: Output feature shape (one int or a tuple).
-            axis: Contraction axis / axes on the input (negatives ok).
-            use_bias: When ``True``, allocate a bias.
-            rngs: PRNG source.
-            w_init: Weight initializer (default: kaiming_uniform).
-            b_init: Bias initializer (default: zeros).
-            dtype: Parameter dtype.
-            param_dtype: Alias for *dtype*.
-            in_shape: Shape of the contracted axes on the input. Required
-                because the weight is allocated eagerly; pass the
-                contracted-axis sizes in the same order as ``axis``.
+            features: Shape of the new trailing axes appended by the
+                contraction. Either a single ``int`` (one new axis)
+                or a sequence of ints.
+            axis: Input axis (or axes) to contract against the weight.
+                Negative indices are accepted and resolved against the
+                input's ndim at call time. The order of ``axis``
+                determines the order in which the corresponding sizes
+                appear in ``in_shape`` and on the leading axes of the
+                weight.
+            use_bias: When ``True``, allocate a bias of shape
+                ``features``.
+            rngs: PRNG source for parameter initialization. Accepts
+                an :class:`Rngs`, an ``int`` seed, or ``None``.
+            w_init: Weight initializer; defaults to
+                :func:`~spectrax.init.kaiming_uniform` with the
+                ``"linear"`` gain.
+            b_init: Bias initializer; defaults to
+                :func:`~spectrax.init.zeros`.
+            dtype: Storage dtype for the parameters; defaults to
+                ``float32`` when both ``dtype`` and ``param_dtype``
+                are ``None``.
+            param_dtype: Alias for ``dtype``; takes precedence when
+                both are supplied.
+            in_shape: **Required.** Sizes of the contracted axes in
+                the same order as ``axis``. Used to allocate the
+                weight eagerly.
             sharding: Optional sharding for the weight.
             bias_sharding: Optional sharding for the bias.
+
+        Raises:
+            ValueError: If ``in_shape`` is ``None`` or its length
+                does not match ``axis``.
         """
         super().__init__()
         self.features = _to_tuple(features)
@@ -107,7 +165,20 @@ class DenseGeneral(Module):
             )
 
     def forward(self, x: ArrayLike, **_: object) -> Array:
-        """Contract ``x`` with ``weight`` along ``axis`` and add ``bias``."""
+        """Contract ``x`` with the weight along ``axis`` and add the bias.
+
+        Computes ``jnp.tensordot(x, weight, axes=(axis, leading_weight_axes))``
+        and broadcasts the bias along the result's non-feature axes.
+
+        Args:
+            x: Input tensor whose sizes along ``axis`` must match
+                ``in_shape`` (in the same order).
+            **_: Ignored; accepted for container interoperability.
+
+        Returns:
+            An array whose shape is ``x.shape`` with the contracted
+            axes removed and the ``features`` shape appended.
+        """
         xa = jnp.asarray(x)
         axes = _normalize_axes(self.axis, xa.ndim)
         contracting = list(axes)
@@ -121,10 +192,15 @@ class DenseGeneral(Module):
 
 
 class Einsum(Module):
-    """Learnable einsum.
+    """Learnable einsum: input combines with a learned weight via an equation.
 
-    The equation describes how the input ``x`` and the parameter
-    ``weight`` combine. ``shape`` is the parameter shape. For example::
+    The equation describes how the input ``x`` and the learnable
+    parameter ``weight`` combine; ``shape`` declares the weight's shape
+    so it can be allocated at construction time. The equation must
+    contain ``"->"`` (an explicit output specification); the operands
+    are passed in the order ``(x, weight)``.
+
+    Example::
 
         >>> e = Einsum("...ij,jk->...ik", shape=(4, 8), rngs=Rngs(0))
         >>> e(jnp.zeros((3, 2, 4))).shape
@@ -149,22 +225,40 @@ class Einsum(Module):
         sharding: Sharding | AxisNames | None = None,
         bias_sharding: Sharding | AxisNames | None = None,
     ) -> None:
-        """Initialize.
+        """Initialize the layer.
 
         Args:
-            equation: An :func:`jnp.einsum` equation where the first
-                operand is the input and the second is :attr:`weight`.
-            shape: Shape of :attr:`weight`.
-            use_bias: When ``True``, add a broadcasting bias.
-            bias_shape: Shape of the bias (defaults to the output
-                shape inferred from the equation; supply if ambiguous).
-            rngs: PRNG source.
-            w_init: Weight initializer (default: kaiming_uniform).
-            b_init: Bias initializer (default: zeros).
-            dtype: Parameter dtype.
-            param_dtype: Alias for *dtype*.
+            equation: An :func:`jax.numpy.einsum` equation in
+                explicit form (must contain ``"->"``). The first
+                operand is the input ``x`` and the second is the
+                learnable :attr:`weight`.
+            shape: Shape of :attr:`weight` — used to allocate it
+                eagerly via the chosen initializer.
+            use_bias: When ``True``, allocate a bias added (with
+                broadcasting) to the einsum output. Requires
+                ``bias_shape`` to be specified.
+            bias_shape: Shape of the bias. Required when
+                ``use_bias=True``; not auto-inferred from the
+                equation in this implementation.
+            rngs: PRNG source for initialization. Accepts an
+                :class:`Rngs`, an ``int`` seed, or ``None``.
+            w_init: Weight initializer; defaults to
+                :func:`~spectrax.init.kaiming_uniform` with the
+                ``"linear"`` gain.
+            b_init: Bias initializer; defaults to
+                :func:`~spectrax.init.zeros`.
+            dtype: Storage dtype for the parameters; defaults to
+                ``float32`` when both ``dtype`` and ``param_dtype``
+                are ``None``.
+            param_dtype: Alias for ``dtype``; takes precedence when
+                both are supplied.
             sharding: Optional sharding for the weight.
             bias_sharding: Optional sharding for the bias.
+
+        Raises:
+            ValueError: If ``equation`` does not contain ``"->"``,
+                or if ``use_bias=True`` is given without a
+                ``bias_shape``.
         """
         super().__init__()
         if "->" not in equation:
@@ -186,7 +280,17 @@ class Einsum(Module):
             )
 
     def forward(self, x: ArrayLike, **_: object) -> Array:
-        """Apply the einsum then optionally broadcast-add ``bias``."""
+        """Run ``jnp.einsum(equation, x, weight)`` and add the bias.
+
+        Args:
+            x: Input tensor whose shape must satisfy the input side
+                of :attr:`equation`.
+            **_: Ignored; accepted for container interoperability.
+
+        Returns:
+            The einsum result plus :attr:`bias` (broadcast) when
+            ``use_bias=True``, otherwise just the einsum result.
+        """
         y = jnp.einsum(self.equation, jnp.asarray(x), self.weight.value)
         if self.use_bias:
             y = y + self.bias.value

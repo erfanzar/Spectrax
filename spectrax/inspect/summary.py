@@ -2,7 +2,15 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Human-readable module summary."""
+"""Deterministic, text-only summary of a :class:`~spectrax.Module`.
+
+:func:`summary` walks the module's live :class:`~spectrax.Variable`
+leaves via :func:`spectrax.live_variables` and produces a tabular
+report suitable for logging or pasting into a bug report. When
+example inputs are provided, the output spec is computed via
+:func:`jax.eval_shape` with hooks suppressed so introspection cannot
+trigger forward / variable observers.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +19,7 @@ from typing import Any
 import jax
 
 from ..core.graph import live_variables
-from ..core.module import Module
+from ..core.module import Module, _inside_transform, _set_inside_transform
 
 __all__ = ["summary"]
 
@@ -19,15 +27,24 @@ __all__ = ["summary"]
 def summary(module: Module, *example_inputs: Any, **example_kwargs: Any) -> str:
     """Return a deterministic multi-line text summary of ``module``.
 
-    The report lists every live :class:`~spectrax.Variable` with its
-    canonical path, class, kind (collection), shape, and dtype. When
-    example inputs are supplied, :func:`jax.eval_shape` is used to
-    report the output spec without triggering computation.
+    The report lists every live :class:`~spectrax.Variable` (after
+    deduplication by ``ref_id`` — shared variables are reported once
+    under their canonical path) with five columns: ``path``, ``class``,
+    ``kind`` (collection), ``shape``, and ``dtype``. The footer prints
+    aggregate scalar counts split as ``parameters`` (from the
+    ``"parameters"`` collection) and ``other`` (everything else).
+
+    When example inputs are supplied, :func:`jax.eval_shape` is run
+    with hooks suppressed (via
+    :func:`~spectrax.core.module._set_inside_transform`) so the
+    summary does not trigger forward / variable hooks, and the output
+    spec is appended after the header. Any exception from ``eval_shape``
+    is caught and reported inline rather than propagated.
 
     Args:
         module: The module to summarize.
         *example_inputs: Optional positional example inputs forwarded
-            to :func:`jax.eval_shape`.
+            to ``module.__call__`` under :func:`jax.eval_shape`.
         **example_kwargs: Optional keyword example inputs.
 
     Returns:
@@ -55,7 +72,12 @@ def summary(module: Module, *example_inputs: Any, **example_kwargs: Any) -> str:
     lines = [f"{type(module).__name__} — {len(rows)} variables"]
     if example_inputs or example_kwargs:
         try:
-            out_spec = jax.eval_shape(lambda: module(*example_inputs, **example_kwargs))
+            prev = _inside_transform()
+            _set_inside_transform(True)
+            try:
+                out_spec = jax.eval_shape(lambda: module(*example_inputs, **example_kwargs))
+            finally:
+                _set_inside_transform(prev)
             lines.append(f"output: {out_spec}")
         except Exception as e:
             lines.append(f"output: (eval_shape failed: {e})")

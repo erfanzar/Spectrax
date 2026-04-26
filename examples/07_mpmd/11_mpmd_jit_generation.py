@@ -116,7 +116,6 @@ def main():
         model = spx.bind(gdef, state)
         print(f"  L={cfg.n_layers} d={cfg.d_model} PP={pp}")
 
-
         if pp == 2:
 
             @sxjit(mesh=mesh.mpmd_mesh)

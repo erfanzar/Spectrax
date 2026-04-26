@@ -41,6 +41,13 @@ AxisNames: TypeAlias = tuple[AxisNameEntry, ...]
 """Per-dimension logical axis annotations."""
 
 MeshAxisEntry: TypeAlias = str | None | tuple[str, ...]
+"""Pre-resolved per-dimension physical mesh axis specification.
+
+The same shape :data:`AxisNameEntry` carries for logical axes, but the
+strings are concrete mesh-axis names (e.g. ``"data"``, ``"model"``)
+rather than logical names that still need to be resolved through a
+``mesh_map``.
+"""
 
 
 @dataclass(frozen=True)
@@ -66,17 +73,27 @@ class Sharding:
     ) -> PartitionSpec | None:
         """Materialize a :class:`~jax.sharding.PartitionSpec`.
 
-        Behavior:
+        Resolution order:
 
-        * If ``mesh_axes`` is set, build a ``PartitionSpec`` from those.
-        * Else if ``axis_names`` is set and ``mesh_map`` is given, resolve
-          each logical name via ``mesh_map`` (missing keys -> replicated).
-        * Else if ``axis_names`` is set and ``mesh_map`` is ``None``,
-          return a fully-replicated spec.
-        * Else (no axis info) return an empty ``PartitionSpec()``.
+        * If :attr:`mesh_axes` is set, build the ``PartitionSpec``
+          directly from those pre-resolved mesh axes.
+        * Else if :attr:`axis_names` is set and ``mesh_map`` is given,
+          resolve each logical name via ``mesh_map`` (missing keys
+          collapse to replicated).
+        * Else if :attr:`axis_names` is set and ``mesh_map`` is
+          ``None``, return a fully-replicated spec of the same rank.
+        * Else (no axis info at all) return an empty
+          ``PartitionSpec()``.
 
-        Returns ``None`` only when ``jax.sharding`` cannot be imported
-        (e.g. in a reduced jax build).
+        Args:
+            mesh_map: Optional mapping from logical axis name to
+                physical mesh axis (or fused-tuple thereof, or
+                ``None`` for replicated).
+
+        Returns:
+            The materialized :class:`~jax.sharding.PartitionSpec`.
+            ``None`` is only returned in environments where
+            ``jax.sharding`` cannot be imported.
         """
 
         if self.mesh_axes is not None:
@@ -98,7 +115,14 @@ def normalize_sharding(s: Sharding | AxisNames | None) -> Sharding | None:
     * an :data:`AxisNames` tuple — wrapped as
       ``Sharding(axis_names=s)``.
 
-    Raises :class:`TypeError` on any other input.
+    Args:
+        s: The sharding spec to normalize.
+
+    Returns:
+        Either ``None`` or a :class:`Sharding` instance.
+
+    Raises:
+        TypeError: On any other input type.
     """
     if s is None:
         return None

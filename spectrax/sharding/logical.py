@@ -2,7 +2,17 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Logical axis-name -> mesh axis rules, managed as a thread-local stack."""
+"""Logical-to-mesh axis-name rules, managed as a thread-local stack.
+
+Logical axis rules let a layer declare its sharding intent in
+*semantic* terms (e.g. ``"embed"``, ``"heads"``, ``"vocab"``) and have
+the runtime translate those names into concrete physical mesh axes
+(``"tp"``, ``"fsdp"``, ``"sp"``, …) at constraint time. The mapping is
+pushed onto a thread-local stack by :func:`logical_axis_rules` so the
+same model code can run with different physical mappings depending on
+the active mesh — and so multiple worker threads can carry independent
+mappings without interference.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +27,14 @@ _STACK: threading.local = threading.local()
 
 
 def _get_stack() -> list[dict[str, str | None]]:
-    """Return the thread-local stack of axis-rule mappings."""
+    """Return the thread-local stack of axis-rule mappings.
+
+    Each frame is a ``dict[str, str | None]`` mapping a logical name to
+    a physical mesh-axis name (or ``None`` to drop the axis). The list
+    grows with each :func:`logical_axis_rules` ``with`` and shrinks on
+    exit; per-thread storage means worker threads do not see each
+    other's frames.
+    """
     s = getattr(_STACK, "stack", None)
     if s is None:
         s = []
@@ -27,11 +44,25 @@ def _get_stack() -> list[dict[str, str | None]]:
 
 @contextlib.contextmanager
 def logical_axis_rules(rules: Sequence[tuple[str, str | None]]) -> Iterator[None]:
-    """Push a logical -> mesh axis mapping onto the stack for the body.
+    """Push a logical-to-mesh axis mapping onto the stack for the ``with`` body.
 
-    Inside the ``with`` block, :func:`current_axis_rules` returns the
-    merged mapping (inner rules override outer). On exit the pushed
-    frame is popped.
+    The mapping is consulted by :func:`current_axis_rules` (and through
+    that by :func:`spectrax.sharding.with_sharding_constraint_by_name`,
+    :func:`get_partition_spec`, and friends) when translating logical
+    axis names declared on variable metadata into physical mesh axes.
+
+    Inside the block the rules are *merged* with any outer frames —
+    inner rules override outer entries with the same key, and
+    inheriting the rest. On exit the pushed frame is popped.
+
+    Args:
+        rules: Sequence of ``(logical_name, mesh_axis_name_or_None)``
+            pairs. ``None`` means "drop this logical axis", i.e.
+            replicate along it.
+
+    Yields:
+        ``None``. Use :func:`current_axis_rules` inside the block to
+        read the merged mapping.
     """
     mapping = dict(rules)
     stack = _get_stack()
@@ -43,7 +74,17 @@ def logical_axis_rules(rules: Sequence[tuple[str, str | None]]) -> Iterator[None
 
 
 def current_axis_rules() -> Mapping[str, str | None]:
-    """Return the merged logical -> mesh axis mapping currently in effect."""
+    """Return the merged logical-to-mesh axis mapping currently in effect.
+
+    Frames pushed by :func:`logical_axis_rules` are merged from the
+    bottom of the stack to the top, so inner ``with`` blocks override
+    outer ones for the same logical name. Returns an empty mapping when
+    no :func:`logical_axis_rules` context is active.
+
+    Returns:
+        A new ``dict`` (the caller may mutate it without affecting the
+        stack).
+    """
     merged: dict[str, str | None] = {}
     for frame in _get_stack():
         merged.update(frame)

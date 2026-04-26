@@ -46,7 +46,7 @@ def _median_p05_p95(xs: list[float]) -> tuple[float, float, float]:
 
     def pct(p: float) -> float:
         """Interpolate-free percentile — nearest-index of the sorted list."""
-        return s[min(n - 1, max(0, int(p * n)))]
+        return s[min(n - 1, max(0, int(p * (n - 1))))]
 
     return s[n // 2], pct(0.05), pct(0.95)
 
@@ -454,8 +454,9 @@ def main(argv: list[str] | None = None) -> int:
         nnx_med, _, _ = _median_p05_p95(results["nnx"]["all_steady"])
         ratio = spx_med / max(nnx_med, 1e-9)
         verdict = "FASTER" if ratio < 1.0 else "SLOWER"
+        magnitude = (1.0 / ratio) if ratio < 1.0 else ratio
         print(
-            f"\nspectrax is {1 / ratio:.2f}x {verdict} than nnx on this workload "
+            f"\nspectrax is {magnitude:.2f}x {verdict} than nnx on this workload "
             f"(median: {spx_med:.2f} ms vs {nnx_med:.2f} ms; ratio={ratio:.3f})"
         )
 

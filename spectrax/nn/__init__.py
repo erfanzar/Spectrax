@@ -2,13 +2,40 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Neural-network layers.
+"""Neural-network layers for the Spectrax framework.
 
-Every class here is a :class:`~spectrax.Module` subclass. Containers
-(:class:`~spectrax.nn.Sequential`, :class:`~spectrax.nn.ModuleList`,
-:class:`~spectrax.nn.StackedModuleList`, :class:`~spectrax.nn.ModuleDict`,
-:class:`~spectrax.nn.ParameterList`)
-re-export from :mod:`spectrax.core.containers` for convenience.
+Every public symbol exported here is either a :class:`~spectrax.Module`
+subclass (layer / container) or a free-standing factory (e.g.
+:func:`~spectrax.nn.wrap_lora`). Layers expose the standard
+``forward(...)`` entry-point and follow the conventions documented on
+each individual class — most notably the *channels-last* tensor layout
+for convolutional and pooling layers (``(N, *spatial, C)``) and the
+*sequence-second* layout for attention / RNN inputs (``(N, T, ...)``).
+
+Containers
+    The :class:`~spectrax.nn.Sequential`,
+    :class:`~spectrax.nn.ModuleList`,
+    :class:`~spectrax.nn.StackedModuleList`,
+    :class:`~spectrax.nn.ModuleDict`, and
+    :class:`~spectrax.nn.ParameterList` symbols are re-exported from
+    :mod:`spectrax.core.containers` so callers do not need to import
+    from two different paths.
+
+Mixed precision
+    Layers that perform matmuls (Linear, attention projections, MLP)
+    consult the active :func:`~spectrax.core.policy.current_policy` in
+    ``forward`` and downcast the parameters / activations to the
+    policy's ``compute_dtype`` before the dot. Storage dtype is
+    independent and controlled per-layer through ``dtype`` /
+    ``param_dtype`` constructor arguments.
+
+Sharding
+    Constructors that allocate parameters accept ``sharding`` /
+    ``bias_sharding`` keyword arguments and attach logical axis names
+    (``("in", "out")`` for dense weights, ``(*"k", "in", "out")`` for
+    convolution kernels, ``("vocab", "embed")`` for embeddings,
+    ``("features",)`` / ``("channels",)`` for normalization parameters)
+    so the surrounding mesh can resolve them automatically.
 """
 
 from ..core.containers import ModuleDict, ModuleList, ParameterList, Sequential, StackedModuleList

@@ -16,17 +16,15 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-import spectrax
-
 optax = pytest.importorskip("optax")
 
-from spectrax.contrib.optimizer import MultiOptimizer, Optimizer
-from spectrax.core.graph import export
-from spectrax.core.state import State
-from spectrax.nn.linear import Linear
-from spectrax.nn.lora import LoraParameter
-from spectrax.rng.rngs import Rngs
-from spectrax.transforms.grad import value_and_grad
+from spectrax.contrib.optimizer import MultiOptimizer, Optimizer  # noqa: E402
+from spectrax.core.graph import export  # noqa: E402
+from spectrax.core.state import State  # noqa: E402
+from spectrax.nn.linear import Linear  # noqa: E402
+from spectrax.nn.lora import LoraParameter  # noqa: E402
+from spectrax.rng.rngs import Rngs  # noqa: E402
+from spectrax.transforms.grad import value_and_grad  # noqa: E402
 
 
 def test_optimizer_create_constructs_with_adamw():

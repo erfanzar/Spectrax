@@ -4,13 +4,38 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Pipeline-parallel runtimes and schedules.
 
+This package gathers spectrax's two pipeline runtimes plus the
+schedule library and the types they share. The two runtimes are
+complementary: the SPMD path emits a single HLO program that XLA
+partitions across pipeline ranks via ``shard_map`` with the pipeline
+axis manual; the MPMD path emits one program per rank and orchestrates
+them in Python, supporting genuinely heterogeneous stage shapes.
+
 Subpackages
 -----------
-* :mod:`spectrax.runtime.mpmd` — True MPMD runtime (per-rank separate HLOs).
-* :mod:`spectrax.runtime.spmd` — SPMD runtime (single HLO via ``shard_map``).
-* :mod:`spectrax.runtime.schedules` — Pipeline schedules (GPipe, 1F1B, …).
-* :mod:`spectrax.runtime.types` — Shared types (``MpMdMesh``, ``PipelineStage``, …).
-* :mod:`spectrax.runtime.primitives` — Shared primitives (``boundary``, ``auto_split``).
+* :mod:`spectrax.runtime.mpmd` — True MPMD runtime (per-rank separate
+  HLOs). Use for heterogeneous pipelines or when you need explicit
+  per-rank dispatch control.
+* :mod:`spectrax.runtime.spmd` — SPMD runtime (single HLO via
+  :func:`jax.shard_map`). Faster compile and dispatch, requires
+  homogeneous stages.
+* :mod:`spectrax.runtime.schedules` — Pipeline schedules
+  (:class:`GPipe`, :class:`Std1F1B`, :class:`ZeroBubbleH1`,
+  :class:`InterleavedH1`, :class:`KimiK2`, :class:`DualPipeV`, ...).
+* :mod:`spectrax.runtime.types` — Shared types: :class:`MpMdMesh`,
+  :class:`PipelineStage`, :class:`StagesArray`.
+* :mod:`spectrax.runtime.primitives` — Shared primitives:
+  :func:`boundary` (inline split marker), :func:`auto_split`
+  (per-block stage assignment helper).
+
+Top-level re-exports
+--------------------
+This module re-exports the MPMD entry points (:func:`sxcall`,
+:func:`sxjit`, :func:`sxgrad`, :func:`sxvalue_and_grad`,
+:func:`sxloop`, :func:`sxenter_loop`, :func:`sxexit_loop`,
+:func:`sxstage_iter`) and every schedule class plus the fusion
+helpers, so users typically only need ``from spectrax.runtime import
+...``.
 """
 
 from __future__ import annotations

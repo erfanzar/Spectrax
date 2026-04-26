@@ -2,7 +2,26 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Base schedule primitives: Phase, Action, FusedTask, and the Schedule ABC."""
+"""Core schedule primitives shared by every concrete schedule.
+
+Defines the four building blocks every spectrax pipeline schedule
+emits or inherits:
+
+* :class:`Phase` — enum of action kinds (``FWD``, ``BWD``, ``BWD_I``,
+  ``BWD_W``).
+* :class:`Action` — one ``(phase, microbatch, virtual_stage)`` event
+  scheduled on one stage at one time step.
+* :class:`FusedTask` — a steady-state pair of actions a runtime can
+  dispatch as a single jitted call (1F1B's ``FWD/BWD`` pair, or
+  zero-bubble's ``BWD_I/BWD_W`` pair).
+* :class:`Schedule` — the ABC that concrete schedules subclass; it
+  holds ``microbatches`` and the optional ``lazy_bwd_batching`` flag,
+  plus default implementations of the virtual-stage hooks
+  (:meth:`Schedule.virtual_stages_per_rank`,
+  :meth:`Schedule.logical_at`, :meth:`Schedule.next_logical_loc`,
+  :meth:`Schedule.terminal_loc`) for flat (one-logical-per-rank)
+  schedules.
+"""
 
 from __future__ import annotations
 
@@ -58,7 +77,13 @@ class Action:
     latency: int | None = None
 
     def __post_init__(self) -> None:
-        """Populate latency from phase defaults if not provided."""
+        """Populate :attr:`latency` from the phase's default if not provided.
+
+        Frozen dataclasses can't assign to fields normally, so the
+        update is performed via :func:`object.__setattr__`. Callers
+        that pass an explicit ``latency`` keep their override; only
+        ``None`` triggers the lookup.
+        """
         if self.latency is None:
             object.__setattr__(self, "latency", _DEFAULT_LATENCIES.get(self.phase, 1))
 
@@ -85,7 +110,16 @@ class FusedTask:
     virtual_stage: int = 0
 
     def split(self) -> tuple[Action, Action]:
-        """Return the underlying ``(fwd, bwd)`` :class:`Action` pair."""
+        """Return the underlying ``(fwd, bwd)`` :class:`Action` pair.
+
+        Runtimes that don't implement kernel fusion treat a
+        :class:`FusedTask` as two sequential actions and call
+        :meth:`split` to recover the original pair.
+
+        Returns:
+            ``(self.fwd, self.bwd)`` — the two halves of the fused
+            task in the order they would have run unfused.
+        """
         return (self.fwd, self.bwd)
 
 
@@ -129,7 +163,15 @@ class Schedule(ABC):
     lazy_bwd_batching: bool = False
 
     def __post_init__(self) -> None:
-        """Validate ``microbatches >= 1``."""
+        """Validate that :attr:`microbatches` is at least 1.
+
+        Concrete subclasses are free to override and add more checks
+        (e.g. :class:`InterleavedH1` validates ``virtual_stages``);
+        they should call ``super().__post_init__()`` first.
+
+        Raises:
+            ValueError: If :attr:`microbatches` is less than 1.
+        """
         if self.microbatches < 1:
             raise ValueError(f"Schedule.microbatches must be >= 1, got {self.microbatches}.")
 
@@ -150,25 +192,68 @@ class Schedule(ABC):
         """
 
     def virtual_stages_per_rank(self) -> int:
-        """Number of logical stages per physical rank (1 for flat schedules)."""
+        """Number of logical stages each physical rank hosts.
+
+        Flat schedules return ``1``; virtual-stage schedules
+        (:class:`InterleavedH1`, :class:`KimiK2`, :class:`DualPipeV`,
+        ...) override.
+        """
         return 1
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
-        """Return the logical-stage index hosted at ``(rank, virt)``."""
+        """Return the logical-stage index hosted at ``(rank, virt)``.
+
+        For flat schedules ``virt`` is always ``0`` and the logical
+        stage equals the physical rank. Virtual-stage schedules
+        override to express layouts like contiguous chunks
+        (``rank * V + virt``) or strided interleaving
+        (``virt * n_stages + rank``).
+
+        Args:
+            rank: Physical rank index in ``[0, n_stages)``.
+            virt: Virtual-stage index in
+                ``[0, virtual_stages_per_rank())``.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            The logical-stage index in ``[0, n_logical)``.
+        """
         return rank
 
     def next_logical_loc(self, rank: int, virt: int, n_stages: int) -> tuple[int, int] | None:
         """Return the ``(rank, virt)`` of the downstream logical stage.
 
-        ``None`` means the current position is terminal — its output
-        feeds ``loss_fn`` directly.
+        Used by the runtime to know where to ``ppermute`` an
+        activation after this stage produces it. Flat schedules send
+        to ``(rank + 1, 0)`` and stop at ``rank == n_stages - 1``.
+
+        Args:
+            rank: This action's physical rank.
+            virt: This action's virtual-stage index.
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            The downstream ``(rank, virt)`` location, or ``None`` if
+            this position is terminal — its output feeds ``loss_fn``
+            directly.
         """
         if rank + 1 < n_stages:
             return (rank + 1, 0)
         return None
 
     def terminal_loc(self, n_stages: int) -> tuple[int, int]:
-        """Where the model's final output is produced (loss goes here)."""
+        """Return the ``(rank, virt)`` hosting the final logical stage.
+
+        The runtime uses this to know which stage runs ``loss_fn``
+        and seeds the backward cotangent. For flat schedules this is
+        ``(n_stages - 1, 0)``; virtual schedules override.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``(rank, virt)`` location of the terminal logical stage.
+        """
         return (n_stages - 1, 0)
 
     @abstractmethod
@@ -188,15 +273,35 @@ class Schedule(ABC):
         """
 
     def total_steps(self, n_stages: int) -> int:
-        """Total number of time steps in the schedule."""
+        """Total number of time steps the schedule occupies.
+
+        Calls :meth:`build` and returns the number of rows. Useful
+        for sizing buffers and for runtimes that want to compare
+        schedules without inspecting the full grid.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            The number of time-step rows in the schedule.
+        """
         return len(self.build(n_stages))
 
     def bubble_ratio(self, n_stages: int) -> float:
-        """Fraction of (stage x time) slots that are idle.
+        """Fraction of ``(stage x time)`` slots that are idle.
 
         ``0.0`` means perfectly packed; ``1.0`` means nothing runs.
-        Useful for comparing schedules at the same ``(n_stages,
-        microbatches)``.
+        Useful for comparing schedules at the same
+        ``(n_stages, microbatches)`` — e.g. seeing that
+        :class:`ZeroBubbleH1` shrinks the bubble of :class:`Std1F1B`,
+        or that :class:`InterleavedH1` shrinks both with virtual
+        stages.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            Idle fraction in ``[0.0, 1.0]``.
         """
         grid = self.build(n_stages)
         total = len(grid) * n_stages

@@ -4,13 +4,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """spectrax — a JAX-only neural-network library.
 
-Top-level public API. The library combines a PyTorch-shaped eager
-surface (subclass :class:`Module`, override :meth:`~Module.forward`,
-call ``model(x)``) with an explicit graph/state seam
-(:func:`export`, :func:`bind`, :class:`GraphDef`, :class:`State`,
-:class:`Selector`) and module-aware JAX transforms
+This is the top-level public API. spectrax combines a PyTorch-shaped
+eager surface (subclass :class:`Module`, override
+:meth:`~Module.forward`, call ``model(x)``) with an explicit
+graph/state seam (:func:`export`, :func:`bind`, :class:`GraphDef`,
+:class:`State`, :class:`Selector`) and module-aware JAX transforms
 (:func:`eval_shape`, :func:`jit`, :func:`grad`,
 :func:`value_and_grad`, :func:`vmap`, :func:`scan`, :func:`remat`).
+
+The same model object can be executed with one entry point —
+:func:`spectrax.run` — under either pure SPMD (:func:`jax.jit` /
+``pjit``) or MPMD (per-rank stages dispatched via
+:func:`spectrax.runtime.sxcall`); the choice is driven by the
+:class:`SpxMesh` passed in.
 
 Submodules imported here for qualified access:
 
@@ -26,11 +32,28 @@ Submodules imported here for qualified access:
   (:class:`GPipe`, :class:`Std1F1B`, :class:`ZeroBubbleH1`, …),
   :func:`sxcall` / :func:`sxjit`, :class:`MpMdMesh`,
   :class:`PipelineSequential`.
+
+Most names re-exported from this package are documented on their
+defining module; this file only adds them to :data:`__all__`.
 """
 
 
 def _patch_removed_jax_config_flags() -> None:
-    """Ignore removed JAX config flags still set by older dependencies."""
+    """Silently drop assignments to JAX config flags that newer JAX has removed.
+
+    Older third-party packages occasionally call
+    ``jax.config.update("jax_pmap_shmap_merge", ...)`` (and similar
+    legacy flag names) on import. Newer JAX versions raise on those
+    names because the flags no longer exist, breaking any process that
+    transitively imports such a package together with spectrax.
+
+    To keep import-time errors from leaking out of unrelated
+    dependencies, this function monkeypatches :func:`jax.config.update`
+    so that updates targeting a known-removed flag are no-ops while
+    every other update is forwarded unchanged. The patch is idempotent
+    (it sets a sentinel attribute on the wrapper) and is a no-op when
+    JAX is not importable.
+    """
     try:
         import jax as _jax
     except Exception:
@@ -43,7 +66,12 @@ def _patch_removed_jax_config_flags() -> None:
     removed_flags = {"jax_pmap_shmap_merge"}
 
     def _patched_update(name, value):
-        """Drop-in replacement for :func:`jax.config.update` that ignores removed flags."""
+        """Drop-in replacement for :func:`jax.config.update`.
+
+        Returns ``None`` (without calling the underlying ``update``)
+        when ``name`` is a known-removed flag; otherwise delegates to
+        the original ``jax.config.update`` and returns its result.
+        """
         if name in removed_flags:
             return None
         return update(name, value)

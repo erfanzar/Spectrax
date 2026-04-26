@@ -81,11 +81,11 @@ def build():
     jax.block_until_ready(spx_fp8_fwd(spx_fp8_mdl, x_fp8))
     jax.block_until_ready(jax.tree.leaves(spx_fp8_step(spx_fp8_mdl, x_fp8))[0])
 
-    cases["xfmr_1b_fp8/forward"] = (
+    cases["xfmr_1b_spx_fp8_vs_nnx_bf16/forward"] = (
         lambda: jax.block_until_ready(spx_fp8_fwd(spx_fp8_mdl, x_fp8)),
         lambda: jax.block_until_ready(nnx_fwd(nnx_mdl, x)),
     )
-    cases["xfmr_1b_fp8/train_step"] = (
+    cases["xfmr_1b_spx_fp8_vs_nnx_bf16/train_step"] = (
         (lambda m=spx_fp8_mdl, x=x_fp8, f=spx_fp8_step: jax.block_until_ready(jax.tree.leaves(f(m, x))[0])),
         (lambda m=nnx_mdl, x=x, f=nnx_step: jax.block_until_ready(jax.tree.leaves(f(m, x))[0])),
     )

@@ -49,7 +49,7 @@ def _time_fn(fn: Callable, n_warmup: int, n_iters: int) -> dict:
     n = len(times)
 
     def pct(p):
-        idx = min(n - 1, max(0, int(p * n)))
+        idx = min(n - 1, max(0, int(p * (n - 1))))
         return times[idx] / 1e6
 
     return {

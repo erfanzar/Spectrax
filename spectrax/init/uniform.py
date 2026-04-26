@@ -2,7 +2,13 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Symmetric uniform initializer."""
+"""Symmetric uniform initializer.
+
+The returned values are drawn from ``U(-scale, +scale)``. This is
+*unscaled* by fan; for fan-aware uniform initializers see
+:func:`spectrax.init.xavier_uniform` and
+:func:`spectrax.init.kaiming_uniform`.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,16 @@ from ..core._typing import Array, DType, Initializer, PRNGKey, Shape
 
 
 def uniform(scale: float = 1.0) -> Initializer:
-    """Return an initializer drawing from ``U(-scale, +scale)``."""
+    """Return a symmetric uniform initializer over ``[-scale, +scale]``.
+
+    Args:
+        scale: Half-width of the uniform support. Defaults to ``1.0``,
+            i.e. samples in ``[-1, 1]``.
+
+    Returns:
+        An :class:`~spectrax.typing.Initializer` returning
+        ``jax.random.uniform(key, shape, minval=-scale, maxval=scale)``.
+    """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
         """Draw ``jax.random.uniform(key, shape, minval=-scale, maxval=scale)``."""

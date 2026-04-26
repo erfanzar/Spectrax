@@ -2,7 +2,22 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Module-aware :func:`jax.checkpoint` (gradient checkpointing) wrapper."""
+"""Module-aware :func:`jax.checkpoint` (gradient checkpointing) wrapper.
+
+Two usage modes are supported by the public :func:`remat` entry point:
+applied to a function it returns a wrapper that runs the call under
+:func:`jax.checkpoint`; applied to a :class:`~spectrax.Module` subclass
+it returns a cached subclass whose ``forward`` method is permanently
+wrapped, which is the recommended pattern for transformer blocks where
+every layer should be rematted identically.
+
+Internally the wrapper uses the standard split/merge shim from
+:mod:`spectrax.transforms.split_merge` to convert module arguments to
+``(GraphDef, State)``; some keyword arguments (strings, booleans, and
+nested containers thereof) are filtered out of the
+:func:`jax.checkpoint`-traced payload and closed over as Python
+constants because :func:`jax.checkpoint` cannot trace them.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +56,23 @@ call: avoids re-registering the pytree and lets
 
 
 def _hashable_cache_key(value: Any) -> Any:
-    """Convert selector-like containers into deterministic cache-key values."""
+    """Convert selector-like containers into deterministic, hashable cache-key values.
+
+    The :data:`_REMAT_CLASS_CACHE` is keyed on a tuple that includes
+    arbitrary user input (the ``mutable`` selector sugar can be a list,
+    tuple, dict, set, …). Python's built-in :func:`hash` rejects mutable
+    containers, so this helper canonicalizes dicts to sorted item
+    tuples, list/tuple/set/frozenset to recursively-canonicalized
+    tuples, and falls back to ``repr`` for any leaf value that is not
+    natively hashable.
+
+    Args:
+        value: Arbitrary user-facing argument.
+
+    Returns:
+        A value with the same equality semantics that is safe to use
+        inside a :class:`dict` key.
+    """
     if isinstance(value, dict):
         return tuple(sorted((_hashable_cache_key(k), _hashable_cache_key(v)) for k, v in value.items()))
     if isinstance(value, list | tuple | set | frozenset):
@@ -114,12 +145,27 @@ def remat(
     mutable_sel = resolve_mutable(mutable)
 
     def _should_be_static_kwarg(x: Any) -> bool:
-        """Return True if x should not flow through jax.checkpoint as a traced arg.
+        """Return whether ``x`` must be closed over rather than traced by :func:`jax.checkpoint`.
 
-        Strings and booleans cannot be traced by jax.checkpoint (strings raise
-        TypeError, booleans raise TracerBoolConversionError when used in Python
-        control flow).  We close over them instead so they become Python constants
-        inside the checkpointed function.
+        :func:`jax.checkpoint` traces every input through a fresh JAX
+        sub-trace. Strings raise :class:`TypeError` and Python ``bool``
+        values raise :class:`jax.errors.TracerBoolConversionError` the
+        moment they reach Python-level control flow inside the
+        checkpointed body. The wrapper sidesteps both by partitioning
+        such kwargs out of the dynamic dict before calling
+        :func:`jax.checkpoint` and re-injecting them through a closure
+        when the pure body runs.
+
+        The check recurses into tuples, lists, and dicts so a
+        ``dict(deterministic=True)`` kwarg is also recognized as
+        non-traceable.
+
+        Args:
+            x: A keyword-argument value to inspect.
+
+        Returns:
+            ``True`` if ``x`` (or any element nested inside it) cannot
+            survive a :func:`jax.checkpoint` trace.
         """
         if isinstance(x, (str, bool)):
             return True
@@ -131,7 +177,18 @@ def remat(
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        """Dispatch through :func:`jax.checkpoint` wrapped around the pure fn."""
+        """Dispatch the call through :func:`jax.checkpoint` wrapped around a pure body.
+
+        Locates module arguments via
+        :func:`~spectrax.transforms.split_merge.locate_and_strip`,
+        partitions kwargs into traced/static halves via
+        :func:`_should_be_static_kwarg`, picks the appropriate pure-body
+        factory based on whether the call has the single-positional
+        Module fast-path shape, and wraps the result in
+        :func:`jax.checkpoint`. After the checkpointed call returns,
+        captured mutations are written back to the live module via
+        :func:`~spectrax.transforms.split_merge.apply_mutations`.
+        """
         refs, stripped_args, stripped_kwargs = locate_and_strip(args, kwargs)
 
         static_kwargs = {k: v for k, v in stripped_kwargs.items() if _should_be_static_kwarg(v)}
@@ -220,13 +277,36 @@ def _remat_module_class(
     policy: Callable[..., bool] | None,
     static_argnums: int | tuple[int, ...],
 ) -> type:
-    """Build (and cache) a ``Remat<Cls>`` subclass whose ``forward`` is
-    permanently wrapped in :func:`jax.checkpoint`. The new class is
-    injected into ``cls``'s defining module under the name
-    ``Remat<Qualname>`` so ``importlib`` / ``resolve_class`` finds it.
+    """Build (and cache) a checkpointed subclass of ``cls``.
 
-    On ``ImportError`` during parent-module registration, resolved
-    class identity falls back to in-process use.
+    Creates a subclass whose ``forward`` is permanently wrapped in
+    :func:`remat`, names it ``Remat<Qualname>`` (with dotted qualnames
+    flattened to underscores), and injects it into the parent module's
+    namespace under the same name so :func:`importlib.import_module` /
+    ``resolve_class`` can round-trip it through
+    :func:`~spectrax.export` and :func:`~spectrax.bind`.
+
+    The cache key is the tuple ``(cls, hashable(mutable), prevent_cse,
+    policy, static_argnums)`` — calling :func:`remat` twice with the
+    same settings on the same class returns the *same* subclass, which
+    matters for pytree-registration identity and class-equality checks
+    inside the graph layer.
+
+    On :class:`ImportError` during parent-module registration (e.g. the
+    class was defined in a script that is no longer importable as a
+    module), the helper silently swallows the error and the new class
+    is only usable in-process.
+
+    Args:
+        cls: The :class:`~spectrax.Module` subclass to checkpoint.
+        mutable: Selector controlling writable collections.
+        prevent_cse: Forwarded to :func:`jax.checkpoint`.
+        policy: Forwarded to :func:`jax.checkpoint`.
+        static_argnums: Forwarded to :func:`jax.checkpoint`.
+
+    Returns:
+        A subclass of ``cls`` whose ``forward`` is wrapped in
+        :func:`remat`. Cached so repeated calls return the same class.
     """
     cache_key = (cls, _hashable_cache_key(mutable), prevent_cse, policy, static_argnums)
     cached = _REMAT_CLASS_CACHE.get(cache_key)
@@ -236,22 +316,33 @@ def _remat_module_class(
     parent_forward = cls.forward
     new_qualname = f"Remat{cls.__qualname__.replace('.', '_')}"
 
+    cached_remat = remat(
+        parent_forward,
+        mutable=mutable,
+        prevent_cse=prevent_cse,
+        policy=policy,
+        static_argnums=static_argnums,
+    )
+
     class RematSubclass(cls):
-        """Subclass of ``cls`` whose ``forward`` is wrapped in :func:`jax.checkpoint`."""
+        """Subclass of ``cls`` whose ``forward`` is permanently wrapped in :func:`jax.checkpoint`.
+
+        Constructed once per ``(cls, settings)`` combination by
+        :func:`_remat_module_class` and reused on every subsequent call.
+        Behaves exactly like ``cls`` except that ``forward`` runs under
+        gradient checkpointing.
+        """
 
         def forward(self, *args: Any, **kwargs: Any) -> Any:
-            """Run the parent ``forward`` under :func:`remat`."""
-            cached = getattr(self, "_spx_remat_forward", None)
-            if cached is None:
-                cached = remat(
-                    parent_forward.__get__(self),
-                    mutable=mutable,
-                    prevent_cse=prevent_cse,
-                    policy=policy,
-                    static_argnums=static_argnums,
-                )
-                object.__setattr__(self, "_spx_remat_forward", cached)
-            return cached(*args, **kwargs)
+            """Invoke the parent ``forward`` under the cached :func:`remat` wrapper.
+
+            ``self`` is passed as the first positional argument so the
+            wrapper's
+            :func:`~spectrax.transforms.split_merge.locate_and_strip`
+            can discover the module instance and thread its
+            declared-mutable collections through :func:`jax.checkpoint`.
+            """
+            return cached_remat(self, *args, **kwargs)
 
     RematSubclass.__name__ = new_qualname
     RematSubclass.__qualname__ = new_qualname

@@ -146,7 +146,27 @@ def compile_per_rank_fwd(
 
     @jax.jit
     def fwd_step(params, rest, mb_inputs):
-        """Run every FWD for this rank back-to-back."""
+        """Run every FWD action for this rank inside a single jitted HLO.
+
+        Iterates through ``fwd_order`` (the rank's FWD actions in
+        schedule order) and indexes ``mb_inputs`` per microbatch. Each
+        call's output is placed back into the matching microbatch slot
+        and the resulting per-microbatch outputs are stacked into a
+        single ``(M, ...)`` array so the next rank can transport one
+        contiguous activation buffer instead of M individual arrays.
+
+        Args:
+            params: This rank's stage parameters (placed on the
+                rank-local sub-mesh).
+            rest: This rank's non-parameter state.
+            mb_inputs: Microbatched inputs of shape ``(M, *mb_shape)``.
+
+        Returns:
+            ``(mb_outputs, mb_inputs)`` where ``mb_outputs`` is a
+            ``(M, *out_shape)`` stack and ``mb_inputs`` is returned
+            unchanged so the matching backward sweep can consume the
+            exact inputs observed here without recomputation.
+        """
         mb_outputs = [None] * microbatches
         for mb in fwd_order:
             y = fwd_fn(params, rest, mb_inputs[mb])

@@ -79,7 +79,19 @@ def has_pscan(jaxpr: Jaxpr) -> list[JaxprEqn]:
 
 
 def _eqn_params(eqn: JaxprEqn) -> dict[str, Any]:
-    """Return primitive parameters across JAX versions."""
+    """Return a JAX equation's primitive parameter dict.
+
+    Older JAX exposed the parameters dict as ``eqn.params``; some newer
+    snapshots renamed it to ``eqn.parameters``. This helper falls back
+    so the rest of the compiler does not have to branch.
+
+    Args:
+        eqn: Any :class:`JaxprEqn`.
+
+    Returns:
+        The equation's parameter mapping (empty if neither attribute
+        exists, which should not happen with supported JAX versions).
+    """
     return getattr(eqn, "params", getattr(eqn, "parameters", {}))
 
 
@@ -209,7 +221,17 @@ def _make_fwd_jit(cluster_jaxpr: Jaxpr, donate_argnums: tuple[int, ...] = ()) ->
     """
 
     def fwd(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, ...]:
-        """Evaluate the cluster sub-jaxpr with explicit const tuple."""
+        """Evaluate the cluster sub-jaxpr with an explicit const tuple.
+
+        Args:
+            consts: Concrete values aligned with the cluster's
+                ``constvars`` (placed beforehand on the rank's
+                sub-mesh).
+            *invars: Stage input activations as positional arrays.
+
+        Returns:
+            Tuple of cluster outputs matching the sub-jaxpr's outvars.
+        """
         return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
 
     if donate_argnums:
@@ -229,12 +251,28 @@ def _make_bwd_jit(
     """
 
     def bwd(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, tuple[Any, ...]]:
-        """Compute ``(g_consts, g_invars)`` via :func:`jax.vjp` on the cluster."""
+        """Run ``jax.vjp`` on the cluster and return ``(g_consts, g_invars)``.
+
+        ``invars_and_cotangents`` is the concatenation of the cluster's
+        positional inputs (first ``n_invars`` entries) and the per-output
+        cotangents seeded by the downstream stage.
+
+        Args:
+            consts: Cluster constants placed on this rank.
+            *invars_and_cotangents: ``(*invars, *cotangents)`` packed as
+                a single positional list — flattened so :func:`jax.jit`
+                can infer donate positions cleanly.
+
+        Returns:
+            ``(g_consts, g_invars)`` where ``g_consts`` mirrors
+            ``consts`` and ``g_invars`` is a tuple aligned with the
+            cluster's invars.
+        """
         invars = invars_and_cotangents[:n_invars]
         cotangents = invars_and_cotangents[n_invars:]
 
         def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Pure cluster evaluator used as the VJP target."""
+            """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument."""
             return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
         _, vjp_fn = jax.vjp(pure, consts, *invars)
@@ -251,21 +289,34 @@ def _make_bwd_jit(
 def _make_bwd_i_jit(
     cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[int, ...] = ()
 ) -> Callable[..., tuple[Any, ...]]:
-    """Return ``@jax.jit`` VJP callable for input gradients only."""
+    """Return a ``@jax.jit`` VJP callable that yields only input cotangents.
+
+    Companion of :func:`_make_bwd_w_jit`. Together the pair lets
+    ZeroBubble-style schedules send activation cotangents upstream as
+    soon as input grads are ready while deferring the costlier
+    weight-grad computation into pipeline bubble slots.
+    """
 
     def bwd_i(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, ...]:
-        """VJP that returns only ``grad(invars)`` (input cotangents).
+        """Compute ``grad(invars)`` only, dropping the const grads.
 
-        ``args`` is the concatenation of ``(invars, cotangents)``.
-        Used by ZeroBubble-style schedules that decouple input
-        gradients from weight gradients so weight grads can be
-        deferred into bubble time.
+        ``invars_and_cotangents`` packs ``(*invars, *cotangents)`` as a
+        single positional sequence for clean :func:`jax.jit` donation
+        bookkeeping.
+
+        Args:
+            consts: Cluster constants placed on this rank.
+            *invars_and_cotangents: ``invars`` followed by per-output
+                cotangents from the downstream stage.
+
+        Returns:
+            ``g_invars`` aligned with the cluster's invars.
         """
         invars = invars_and_cotangents[:n_invars]
         cotangents = invars_and_cotangents[n_invars:]
 
         def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Pure consts+invars -> outs interpreter for ``jax.vjp``."""
+            """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
             return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
         _, vjp_fn = jax.vjp(pure, consts, *invars)
@@ -281,17 +332,26 @@ def _make_bwd_w_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[i
     """Return ``@jax.jit`` VJP callable for weight/const gradients only."""
 
     def bwd_w(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> Any:
-        """VJP that returns only ``grad(consts)`` (weight cotangents).
+        """Compute ``grad(consts)`` only, dropping invar cotangents.
 
-        Companion to :func:`_make_bwd_i_jit`. Together the pair
-        replaces a single full backward, letting a schedule defer
-        weight-grad work to fill pipeline bubbles.
+        Companion to :func:`_make_bwd_i_jit`. Splitting the backward
+        into ``BWD_I`` then ``BWD_W`` is the core trick of ZeroBubble:
+        the ``BWD_W`` half can run later, in the bubble that would
+        otherwise idle the rank waiting for downstream cotangents.
+
+        Args:
+            consts: Cluster constants placed on this rank.
+            *invars_and_cotangents: ``invars`` followed by per-output
+                cotangents from the downstream stage.
+
+        Returns:
+            ``g_consts`` matching the structure of ``consts``.
         """
         invars = invars_and_cotangents[:n_invars]
         cotangents = invars_and_cotangents[n_invars:]
 
         def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Pure consts+invars -> outs interpreter for ``jax.vjp``."""
+            """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
             return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
         _, vjp_fn = jax.vjp(pure, consts, *invars)
@@ -314,10 +374,26 @@ def _make_terminal_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tupl
     """
 
     def term(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, tuple[Any, tuple[Any, ...]]]:
-        """Forward + ``value_and_grad`` over consts and invars in a single jit."""
+        """Compute the loss and its gradients w.r.t. ``(consts, *invars)`` in one jit.
+
+        Wraps the cluster's scalar-loss evaluator in
+        :func:`jax.value_and_grad` over every positional argument so a
+        single compiled program produces both the per-microbatch loss
+        value and the seed cotangents the upstream backward sweep
+        needs.
+
+        Args:
+            consts: Terminal cluster's placed constants.
+            *invars: Positional inputs to the cluster (typically the
+                activations entering the loss layer).
+
+        Returns:
+            ``(loss, (g_consts, g_invars))`` — the scalar loss plus
+            its gradients.
+        """
 
         def pure(c: tuple[Any, ...], *xs: Any) -> Any:
-            """Scalar-loss evaluator for the terminal cluster."""
+            """Scalar-loss evaluator, asserts a single cluster output."""
             outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
             if len(outs) != 1:
                 raise ValueError(
@@ -655,7 +731,20 @@ def _build_invar_sources(
 
 
 def _build_schedule_grid(schedule: Any, n: int) -> list[list[Any]]:
-    """Apply the same grid post-processing used by ``sxcall``."""
+    """Build a schedule grid with the same fusion passes used by :func:`sxcall`.
+
+    Calls :meth:`Schedule.build` then applies :func:`fuse_1f1b_steady_state`
+    for 1F1B-family schedules and :func:`fuse_zerobubble_bwd_pair` for
+    :class:`ZeroBubbleH1`. Schedules can opt out by exposing a
+    ``_skip_auto_fuse_1f1b`` attribute that returns truthy.
+
+    Args:
+        schedule: The active :class:`Schedule`.
+        n: Number of physical pipeline ranks.
+
+    Returns:
+        The post-processed grid as a list of mutable rows.
+    """
     grid = [list(row) for row in schedule.build(n)]
     skip_1f1b_fusion = getattr(schedule, "_skip_auto_fuse_1f1b", False)
     if callable(skip_1f1b_fusion):
@@ -668,7 +757,20 @@ def _build_schedule_grid(schedule: Any, n: int) -> list[list[Any]]:
 
 
 def _put_tree(tree: Any, sharding: Any) -> Any:
-    """Move every leaf of ``tree`` to ``sharding``."""
+    """Apply :func:`jax.device_put` to every array leaf of ``tree``.
+
+    Non-array leaves (e.g. Python scalars or ``None``) are passed through
+    unchanged so the function is safe to call on heterogeneous pytrees.
+
+    Args:
+        tree: A pytree of arrays / scalars.
+        sharding: Sharding (or device list) accepted by
+            :func:`jax.device_put`.
+
+    Returns:
+        The same pytree structure with array leaves moved to
+        ``sharding``.
+    """
     return jax.tree.map(
         lambda x: jax.device_put(x, sharding) if hasattr(x, "shape") else x,
         tree,
@@ -676,14 +778,48 @@ def _put_tree(tree: Any, sharding: Any) -> Any:
 
 
 def _transport_tuple(vals: tuple[Any, ...], src_rank: int, dst_rank: int, stage_shardings: list[Any]) -> tuple[Any, ...]:
-    """Move ``vals`` to ``dst_rank`` when the physical rank changes."""
+    """Move a tuple of arrays from ``src_rank`` onto ``dst_rank`` if they differ.
+
+    Skips the transport when source and destination physical ranks
+    coincide so ``(rank, virt0) -> (rank, virt1)`` cluster edges stay
+    in-rank without a redundant ``device_put``.
+
+    Args:
+        vals: Arrays to relocate.
+        src_rank: Source physical rank.
+        dst_rank: Destination physical rank.
+        stage_shardings: Per-rank replicated shardings.
+
+    Returns:
+        ``vals`` unchanged when ranks match, otherwise a new tuple of
+        arrays placed on ``stage_shardings[dst_rank]``.
+    """
     if src_rank == dst_rank:
         return vals
     return tuple(jax.device_put(v, stage_shardings[dst_rank]) for v in vals)
 
 
 def _edge_transfer_target(value: Any, plan: PscanPlan, producer_logical: int, dst_rank: int) -> Any:
-    """Resolve a marker edge sharding on a pscan destination rank."""
+    """Resolve a destination sharding for a marker-edge cross-rank transport.
+
+    When the producing logical stage's :func:`sxstage_iter` carried an
+    edge ``PartitionSpec``, that spec is sanitised against both the MPMD
+    mesh and the destination rank's sub-mesh (axes incompatible with
+    either are dropped) and wrapped in a :class:`NamedSharding`.
+    Otherwise the destination rank's default replicated sharding is
+    used.
+
+    Args:
+        value: The array (or pytree of arrays) being transported —
+            shape information is needed to sanitise the spec.
+        plan: The :class:`PscanPlan` holding edge metadata and meshes.
+        producer_logical: Logical stage index that produced ``value``.
+        dst_rank: Destination physical rank.
+
+    Returns:
+        A sharding (or pytree of shardings) usable with
+        :func:`jax.device_put`.
+    """
     if not (0 <= producer_logical < len(plan.edge_shardings)):
         return plan.stage_shardings[dst_rank]
     edge_sharding = plan.edge_shardings[producer_logical]
@@ -692,6 +828,7 @@ def _edge_transfer_target(value: Any, plan: PscanPlan, producer_logical: int, ds
     dst_mesh = plan.rank_submeshes[dst_rank]
 
     def leaf_target(leaf: Any) -> Any:
+        """Per-leaf NamedSharding on ``dst_mesh`` derived from the edge spec."""
         if not hasattr(leaf, "shape"):
             return plan.stage_shardings[dst_rank]
         spec = sanitize_partition_spec_for_mesh_and_shape(
@@ -715,7 +852,26 @@ def _materialize_cotangents(
     partial: list[Any | None] | None,
     outputs: tuple[Any, ...],
 ) -> tuple[Any, ...]:
-    """Fill missing cotangents with zeros matching ``outputs``."""
+    """Replace missing cotangent slots with zero arrays shaped like ``outputs``.
+
+    The dispatcher accumulates downstream cotangents lazily into a
+    ``[None, None, ...]`` slot list so an early backward call does not
+    have to allocate zero arrays it may never use. By the time the
+    upstream backward jit fires, any still-missing slot represents a
+    cluster output that no consumer needed; we substitute zero of the
+    correct shape so :func:`jax.vjp` sees a complete cotangent tuple.
+    Float0-typed slots and dtype-mismatched slots are passed through /
+    cast as needed to match XLA's expectations.
+
+    Args:
+        partial: Per-output slot list (``None`` means "not yet supplied").
+            ``None`` for the whole list means no consumer ever filled
+            anything, in which case all-zeros is returned.
+        outputs: Original forward outputs used as shape/dtype templates.
+
+    Returns:
+        A complete cotangent tuple aligned with ``outputs``.
+    """
     if partial is None:
         return tuple(jnp.zeros_like(out) for out in outputs)
     full: list[Any] = []
@@ -778,7 +934,26 @@ def _accumulate_const_grads(
     g_consts: tuple[Any, ...],
     n_total_consts: int,
 ) -> list[Any | None]:
-    """Scatter a cluster's const grads into full body-const slots."""
+    """Scatter a cluster's const-grad tuple back into the full body-const slot list.
+
+    A cluster only references a subset of the full body's constvars
+    (``const_indices`` are the body-const indices in order). When
+    backward fires, we add each per-cluster gradient into the matching
+    full-body slot, leaving untouched slots as ``None`` so callers can
+    distinguish "no contribution" from "contributed zero".
+
+    Args:
+        accum: Per-rank running accumulator (or ``None`` to allocate).
+        const_indices: Body-const indices owned by this cluster, in
+            cluster-local order.
+        g_consts: Per-cluster const grads from a backward jit (parallel
+            to ``const_indices``).
+        n_total_consts: Total number of body constvars — sets the
+            allocated accumulator length.
+
+    Returns:
+        Updated ``accum`` (newly allocated when ``accum`` was ``None``).
+    """
     if accum is None:
         accum = [None] * n_total_consts
     for local_idx, const_idx in enumerate(const_indices):
@@ -800,7 +975,9 @@ def _sum_rank_grads(grad_accums: list[list[Any | None] | None], output_sharding:
         if total is None:
             total = moved
         else:
-            total = tuple(b if a is None else a if b is None else _add_grad(a, b) for a, b in zip(total, moved, strict=True))
+            total = tuple(
+                b if a is None else a if b is None else _add_grad(a, b) for a, b in zip(total, moved, strict=True)
+            )
     return total
 
 

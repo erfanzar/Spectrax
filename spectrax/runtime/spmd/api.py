@@ -95,7 +95,23 @@ _SCHEDULED_STEP_CACHE: dict[Any, Callable[..., Any]] = {}
 def _stack_pytree_list(items: tuple[Any, ...]) -> Any:
     """Stack a tuple of identically-structured pytrees along a new leading axis.
 
-    Raises if leaves don't match shape / dtype.
+    Each leaf becomes a stacked array with leading dimension
+    ``len(items)``; the pytree structure is preserved. Used to build
+    the ``(pp, ...)``-leading pipeline parameter pytree from
+    per-stage parameters before sharding the leading axis along the
+    pipeline mesh axis.
+
+    Args:
+        items: Tuple of identically-structured pytrees.
+
+    Returns:
+        A single pytree with the same structure as ``items[0]`` but
+        with each leaf an :func:`jnp.stack` of the corresponding
+        leaves across ``items``.
+
+    Raises:
+        Any error :func:`jnp.stack` raises when leaves disagree on
+        shape or dtype.
     """
     if not items:
         return items
@@ -103,7 +119,14 @@ def _stack_pytree_list(items: tuple[Any, ...]) -> Any:
     leaves0, treedef = jax.tree.flatten(first)
 
     def stack_one(idx: int) -> jax.Array:
-        """Stack leaf ``idx`` across every item into a single array."""
+        """Stack leaf ``idx`` across every item into a single array.
+
+        Args:
+            idx: Index into the flattened leaf tuple.
+
+        Returns:
+            A new array with shape ``(len(items),) + leaf.shape``.
+        """
         leaves = [jax.tree.flatten(item)[0][idx] for item in items]
         return jnp.stack(leaves, axis=0)
 
@@ -113,22 +136,41 @@ def _stack_pytree_list(items: tuple[Any, ...]) -> Any:
 
 @_functools.partial(jax.jit, static_argnums=(1,))
 def _unstack_leaves_jit(flat_leaves: tuple[jax.Array, ...], n: int) -> tuple[tuple[jax.Array, ...], ...]:
-    """Jit-fused inverse of leaf stacking.
+    """Jit-fused inverse of leaf stacking — slice every leaf along axis 0.
 
     One compiled kernel slices every leaf by ``n`` along axis 0.
     Without this, iterating ``leaf[i]`` for each of N stages x ~200
     leaves costs ~400 eager dispatches and several ms of Python
     overhead per training step.
+
+    Args:
+        flat_leaves: Flattened leaf tuple from
+            :func:`jax.tree.flatten`.
+        n: Number of stages to slice into. Marked static so XLA can
+            fully unroll.
+
+    Returns:
+        A tuple of length ``n``, each element a tuple of ``n``-th
+        slices of every leaf along axis 0.
     """
     return tuple(tuple(leaf[i] for leaf in flat_leaves) for i in range(n))
 
 
 def _unstack_pytree(stacked: Any, n: int) -> tuple[Any, ...]:
-    """Inverse of :func:`_stack_pytree_list`.
+    """Split a stacked pytree back into ``n`` independent pytrees.
 
-    Splits along the leading axis into ``n`` independent pytrees.
-    Slicing is fused into one compiled kernel via
-    :func:`_unstack_leaves_jit`.
+    The inverse of :func:`_stack_pytree_list`. Slicing is delegated
+    to :func:`_unstack_leaves_jit` so the per-leaf ``[i]`` ops fuse
+    into a single compiled kernel.
+
+    Args:
+        stacked: A pytree whose leaves all have a leading dimension
+            of size ``n``.
+        n: Number of pytrees to recover.
+
+    Returns:
+        A tuple of ``n`` pytrees with the same structure as
+        ``stacked`` but leaves shorter by one axis.
     """
     leaves, treedef = jax.tree.flatten(stacked)
     sliced_tuples = _unstack_leaves_jit(tuple(leaves), n)
@@ -136,9 +178,19 @@ def _unstack_pytree(stacked: Any, n: int) -> tuple[Any, ...]:
 
 
 def _homogeneous(items: tuple[Any, ...]) -> bool:
-    """Return True iff every pytree in ``items`` matches structure and leaf avals.
+    """Return ``True`` iff every pytree in ``items`` matches structure and leaf avals.
 
-    Cheap pre-check before attempting to stack.
+    Cheap pre-check before attempting to stack: if any pytree differs
+    in pytree structure, leaf count, or per-leaf shape/dtype, the
+    fast SPMD ``shard_map`` path can't apply and the runtime falls
+    back to per-rank MPMD. Comparison is structural, not by value.
+
+    Args:
+        items: Tuple of pytrees (typically per-stage parameters).
+
+    Returns:
+        ``True`` if all items can be stacked (same structure, shapes
+        and dtypes); ``False`` otherwise.
     """
     if len(items) < 2:
         return True
@@ -172,22 +224,50 @@ def _make_body(
     and re-adds it on outputs that leave through a ``P(pp)`` spec.
 
     This runs one step of GPipe inside ``shard_map(pp-manual)``.
+
+    Args:
+        stage_fns: Per-stage forward callables. Length ``n``.
+        n: Number of pipeline stages (== mesh's ``pp_axis`` size).
+        m: Number of microbatches per step.
+        pp_axis: Manual pipeline-parallel mesh axis name.
+        mode: ``"forward"`` or ``"train"``.
+        loss_fn: Required for ``"train"`` mode; ``(y, *targets) ->
+            scalar``.
+
+    Returns:
+        A function suitable to pass to :func:`jax.shard_map` that
+        accepts ``(stacked_params, stacked_state, xs, *extras)`` and
+        returns ``(loss, grads)`` for train mode or ``(out, state)``
+        for forward mode.
     """
 
     def _drop0(t: Any) -> Any:
-        """Drop the size-1 leading pp axis from every leaf."""
+        """Drop the size-1 leading pp axis from every leaf in ``t``."""
         return jax.tree.map(lambda a: a[0], t)
 
     def _add0(t: Any) -> Any:
-        """Re-add a size-1 leading pp axis to every leaf."""
+        """Re-add a size-1 leading pp axis to every leaf in ``t``."""
         return jax.tree.map(lambda a: a[None, ...], t)
 
     def _dispatch_my_stage(local_params, local_state, x, rank, stage_extras=()):
         """Run this rank's own stage via ``lax.switch`` on the rank index.
 
         After XLA partitions on the manual ``pp`` axis, each device's
-        compiled HLO retains only its matching branch — genuine per-rank
-        different code.
+        compiled HLO retains only its matching branch — genuine
+        per-rank different code despite the single shared HLO.
+
+        Args:
+            local_params: Per-rank parameters (post-:func:`_drop0`).
+            local_state: Per-rank state (post-:func:`_drop0`) or
+                ``()``.
+            x: Activation flowing in.
+            rank: ``jax.lax.axis_index(pp_axis)``.
+            stage_extras: Optional extra positional args passed to
+                every stage_fn.
+
+        Returns:
+            ``stage_fn(local_params, local_state, x, *stage_extras)``
+            for the active rank.
         """
         branches = []
         for fn in stage_fns:
@@ -202,10 +282,27 @@ def _make_body(
     def _forward_chain(stacked_params, stacked_state, x, rank, stage_extras=()):
         """Run the linear pipeline: step ``i`` activates rank ``i`` then ppermutes.
 
-        Every rank iterates the loop; ``lax.cond`` gates compute to the
-        active rank only, so non-active ranks contribute no work.
-        ``ppermute`` moves the activation to rank ``i+1`` after each
-        step.
+        Every rank iterates the same Python loop; :func:`jax.lax.cond`
+        gates the actual compute to the rank whose ``axis_index``
+        matches the step, so non-active ranks contribute no work.
+        After each step :func:`jax.lax.ppermute` shifts the
+        activation to rank ``i + 1`` so it's in place for the next
+        step's compute.
+
+        Args:
+            stacked_params: Stacked params with leading pp axis.
+            stacked_state: Stacked state with leading pp axis or
+                ``()``.
+            x: Initial activation (flows in on rank 0).
+            rank: ``axis_index(pp_axis)``.
+            stage_extras: Extras forwarded to
+                :func:`_dispatch_my_stage`.
+
+        Returns:
+            ``(cur, st)`` — the final activation and the per-rank
+            updated state. After the loop ``cur`` is the activation
+            that rank ``n - 1`` produced; the caller broadcasts it
+            to every rank.
         """
         p = _drop0(stacked_params)
         st = _drop0(stacked_state) if not _is_empty_state(stacked_state) else ()
@@ -234,17 +331,32 @@ def _make_body(
     def body(stacked_params, stacked_state, xs, *extras):
         """Per-rank shard_map body: forward chain then optional loss/VJP.
 
-        In ``forward`` mode, rank n-1's final activation is
-        broadcast to all ranks via ``all_gather + index`` so out_specs
-        ``P()`` (replicated) is satisfied; XLA DCEs the unused ranks.
+        In ``forward`` mode, rank ``n - 1``'s final activation is
+        broadcast to all ranks via ``all_gather + index`` so
+        ``out_specs=P()`` (replicated) is satisfied; XLA DCEs the
+        unused ranks.
 
-        In ``train`` mode, only rank n-1 actually runs ``loss_fn``;
-        non-last ranks short-circuit to zero via ``lax.cond``. The psum
-        then broadcasts rank n-1's loss value to every rank so the VJP
-        flows correctly back through the ppermute chain. The loss value
-        is forced to float32 on both branches so cond's shape/dtype
-        match regardless of what dtype ``loss_fn`` returns on bf16
-        inputs (common source of lax.cond mismatches).
+        In ``train`` mode, only rank ``n - 1`` actually runs
+        ``loss_fn``; non-last ranks short-circuit to zero via
+        :func:`jax.lax.cond`. The :func:`jax.lax.psum` then
+        broadcasts rank ``n - 1``'s loss value to every rank so the
+        VJP flows correctly back through the ppermute chain. The loss
+        value is forced to ``float32`` on both branches so cond's
+        shape/dtype match regardless of what dtype ``loss_fn``
+        returns on bf16 inputs (common source of ``lax.cond``
+        mismatches).
+
+        Args:
+            stacked_params: Stacked parameters (leading ``pp`` axis,
+                size 1 inside the body).
+            stacked_state: Stacked state, or ``()``.
+            xs: Stacked microbatched inputs (leading mb axis).
+            *extras: Stacked extras forwarded to either each stage
+                (forward mode) or ``loss_fn`` (train mode).
+
+        Returns:
+            * forward: ``(final_stack, state_stack)``.
+            * train: ``(loss_scalar, stacked_params_grads)``.
         """
         rank = jax.lax.axis_index(pp_axis)
         last = n - 1
@@ -252,7 +364,16 @@ def _make_body(
         if mode == "forward":
 
             def per_mb(x, *t):
-                """Forward-only microbatch body with broadcast-to-replicated output."""
+                """Forward-only microbatch body with broadcast-to-replicated output.
+
+                Args:
+                    x: One microbatch's input.
+                    *t: One microbatch's extras (forwarded to stages).
+
+                Returns:
+                    ``(out, st)`` — output (broadcast across ranks)
+                    and per-rank updated state.
+                """
                 final, st = _forward_chain(stacked_params, stacked_state, x, rank, t)
                 gathered = jax.lax.all_gather(final, pp_axis)
                 out = gathered[last]
@@ -266,7 +387,21 @@ def _make_body(
         assert loss_fn is not None
 
         def per_mb_loss(params, x, *t):
-            """Per-microbatch scalar loss, broadcast to all ranks via psum."""
+            """Per-microbatch scalar loss, broadcast to all ranks via psum.
+
+            Only rank ``n - 1`` runs ``loss_fn``; other ranks
+            contribute zero. The :func:`jax.lax.psum` makes the
+            terminal-rank loss visible on every rank so backward
+            VJP through ppermute is correct.
+
+            Args:
+                params: Stacked parameters.
+                x: One microbatch's input.
+                *t: One microbatch's targets.
+
+            Returns:
+                The microbatch's loss as a ``float32`` scalar.
+            """
             final, _ = _forward_chain(params, stacked_state, x, rank)
             is_last = rank == last
             per_rank = jax.lax.cond(
@@ -277,7 +412,15 @@ def _make_body(
             return jax.lax.psum(per_rank, pp_axis)
 
         def mean_loss(params):
-            """Mean of per-microbatch losses (vmapped over the leading mb axis)."""
+            """Mean of per-microbatch losses (vmapped over the leading mb axis).
+
+            Args:
+                params: Stacked parameters (the variable being
+                    differentiated).
+
+            Returns:
+                Scalar mean loss across all microbatches.
+            """
             per_mb_losses = jax.vmap(per_mb_loss, in_axes=(None, 0, *([0] * len(extras))))(params, xs, *extras)
             return per_mb_losses.mean()
 
@@ -288,14 +431,41 @@ def _make_body(
 
 
 def _rank_submesh(mesh: Mesh, pp_axis: str, rank: int) -> Mesh:
-    """Return a sub-mesh containing only ``rank``'s slice along pp."""
+    """Return a sub-mesh containing only ``rank``'s slice along ``pp_axis``.
+
+    Used by the heterogeneous path to place each rank's parameters
+    onto its own per-stage device subset. The returned mesh keeps
+    every original axis (the ``pp_axis`` is just size 1 in the
+    slice).
+
+    Args:
+        mesh: Full pipeline mesh.
+        pp_axis: Name of the pipeline axis.
+        rank: Pipeline rank to slice out.
+
+    Returns:
+        A :class:`~jax.sharding.Mesh` of the same rank as ``mesh``
+        but with size 1 on ``pp_axis``.
+    """
     pp_idx = mesh.axis_names.index(pp_axis)
     devs = _np.take(mesh.devices, indices=[rank], axis=pp_idx)
     return Mesh(devs, mesh.axis_names)
 
 
 def _het_get_fwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Return the cached jitted forward for ``stage_fn``."""
+    """Return the cached jitted forward for ``stage_fn``.
+
+    Caches by the Python identity of ``stage_fn`` so repeated calls
+    for the same stage hit the cache; ``jax.jit`` itself keys on
+    function identity so this layering is consistent.
+
+    Args:
+        stage_fn: Per-stage forward callable
+            ``(params, state, x) -> (y, new_state)``.
+
+    Returns:
+        A jitted callable with the same signature as ``stage_fn``.
+    """
     key = (id(stage_fn), "fwd")
     cached = _HET_STAGE_JIT_CACHE.get(key)
     if cached is not None:
@@ -313,8 +483,17 @@ def _het_get_fwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
 def _het_get_bwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
     """Return the cached jitted backward for ``stage_fn``.
 
-    The backward returns ``(g_params, g_x)`` via ``jax.vjp`` against
-    an input-only forward.
+    The backward returns ``(g_params, g_x)`` via :func:`jax.vjp`
+    against a forward that only emits ``y`` (the ``new_state``
+    output is silently dropped because the heterogeneous training
+    path doesn't differentiate through the per-stage state).
+
+    Args:
+        stage_fn: Per-stage forward callable.
+
+    Returns:
+        A jitted callable
+        ``(params, state, x, g_y) -> (g_params, g_x)``.
     """
     key = (id(stage_fn), "bwd")
     cached = _HET_STAGE_JIT_CACHE.get(key)
@@ -345,15 +524,33 @@ def _build_per_rank_placements(
     params_list: tuple[Any, ...],
     params_intra_spec: Any,
 ) -> list[Any]:
-    """Build per-rank NamedSharding pytrees matching each rank's params structure.
+    """Build per-rank :class:`NamedSharding` pytrees for the heterogeneous path.
+
+    Each rank gets a sub-mesh (size 1 on ``pp_axis``) plus an
+    intra-stage spec describing how to shard the rank's parameters
+    across the remaining axes.
 
     ``params_intra_spec`` interpretation:
 
-    * ``None`` -> replicate every leaf on its rank's sub-mesh
-    * a single pytree matching params_list[0]'s structure -> apply
-      uniformly across ranks (homogeneous intra-stage sharding)
-    * a tuple of per-rank pytrees -> apply the rank's entry to that
-      rank's params (heterogeneous intra-stage sharding)
+    * ``None`` -> replicate every leaf on its rank's sub-mesh.
+    * A single pytree matching ``params_list[0]``'s structure ->
+      apply uniformly across ranks (homogeneous intra-stage
+      sharding).
+    * A tuple of per-rank pytrees of length ``n`` -> apply the
+      rank's entry to that rank's params (heterogeneous intra-stage
+      sharding).
+
+    Args:
+        mesh: Full pipeline mesh.
+        pp_axis: Name of the pipeline axis.
+        n: Number of ranks (and entries in ``params_list``).
+        params_list: Per-rank parameter pytrees.
+        params_intra_spec: Optional intra-stage sharding spec(s).
+
+    Returns:
+        A list of length ``n`` whose entries are pytrees of
+        :class:`NamedSharding` matching ``params_list[r]``'s
+        structure.
     """
     submeshes = [_rank_submesh(mesh, pp_axis, r) for r in range(n)]
 
@@ -379,7 +576,17 @@ def _build_per_rank_placements(
         else:
 
             def _to_ns(spec, _sm=sm):
-                """Convert a PartitionSpec (or tuple) to a NamedSharding on ``_sm``."""
+                """Convert a PartitionSpec (or tuple/None) to a NamedSharding on ``_sm``.
+
+                Args:
+                    spec: ``None`` for replicated, a
+                        :class:`PartitionSpec`, or a sequence of axis
+                        names to wrap in one.
+                    _sm: Captured per-rank sub-mesh.
+
+                Returns:
+                    A :class:`NamedSharding` on ``_sm``.
+                """
                 if spec is None:
                     return NamedSharding(_sm, PartitionSpec())
                 if isinstance(spec, PartitionSpec):
@@ -439,11 +646,36 @@ def _heterogeneous_call(
     ]
 
     def _vmap_fwd(stage_fn):
-        """Jitted vmap of the per-stage forward over the microbatch axis."""
+        """Jitted vmap of the per-stage forward over the microbatch axis.
+
+        Uses ``in_axes=(None, None, 0)`` so params and state are
+        broadcast across the microbatch axis while the input ``x`` is
+        sliced.
+
+        Args:
+            stage_fn: Per-stage forward callable.
+
+        Returns:
+            A jitted callable that processes a stack of microbatches
+            in one HLO call.
+        """
         return jax.jit(jax.vmap(_het_get_fwd(stage_fn), in_axes=(None, None, 0)))
 
     def _vmap_bwd(stage_fn):
-        """Jitted vmap of the per-stage backward over the microbatch axis."""
+        """Jitted vmap of the per-stage backward over the microbatch axis.
+
+        ``in_axes=(None, None, 0, 0)`` keeps params and state shared
+        and slices both the saved input and the per-microbatch
+        cotangent.
+
+        Args:
+            stage_fn: Per-stage forward callable.
+
+        Returns:
+            A jitted vmap'd backward returning ``(g_params_stack,
+            g_x_stack)``; ``g_params_stack`` is summed over the
+            microbatch axis by the caller.
+        """
         return jax.jit(jax.vmap(_het_get_bwd(stage_fn), in_axes=(None, None, 0, 0)))
 
     vfwds = [_vmap_fwd(fn) for fn in stage_fns]
@@ -498,9 +730,20 @@ def _heterogeneous_call(
 
 
 def _maybe_squeeze_mb(x: Any, m: int) -> Any:
-    """Strip the leading microbatch axis when ``m == 1``.
+    """Strip the leading microbatch axis from every leaf when ``m == 1``.
 
-    Keeps callers from having to squeeze a meaningless size-1 axis.
+    The runtime always reshapes the user's input into ``(M, ...)``
+    even when ``M == 1`` so the per-microbatch vmap works uniformly.
+    On the way out we strip the meaningless size-1 axis so
+    ``m == 1`` callers don't have to ``squeeze`` themselves.
+
+    Args:
+        x: Pytree of arrays (typically the final pipeline output).
+        m: Number of microbatches the runtime used.
+
+    Returns:
+        ``x`` with leaf leading axis dropped iff ``m == 1`` and the
+        leaf has a leading size-1 axis; otherwise ``x`` unchanged.
     """
     if m == 1:
         return jax.tree.map(lambda a: a[0] if hasattr(a, "shape") and a.shape and a.shape[0] == 1 else a, x)
@@ -590,7 +833,18 @@ def pipeline_call(
     m = microbatches
 
     def _mb(x: jax.Array) -> jax.Array:
-        """Reshape ``x`` (leading axis = batch) into ``(m, batch//m, ...)``."""
+        """Reshape ``x`` (leading axis = batch) into ``(m, batch // m, ...)``.
+
+        Args:
+            x: Array whose leading axis is the global batch.
+
+        Returns:
+            ``x`` reshaped to expose a microbatch axis as the new
+            leading dimension.
+
+        Raises:
+            ValueError: If the batch size isn't divisible by ``m``.
+        """
         b = x.shape[0]
         if b % m:
             raise ValueError(f"leading dim {b} not divisible by microbatches {m}.")
@@ -727,7 +981,19 @@ def pipeline_call(
         else:
 
             def _prepend(intra):
-                """Prepend the pp axis to a leaf's intra-stage spec."""
+                """Prepend the pp axis to a leaf's intra-stage spec.
+
+                Stacked params have a leading ``pp`` axis (one entry
+                per stage); intra-stage sharding axes follow.
+
+                Args:
+                    intra: Intra-stage :class:`PartitionSpec` (or
+                        ``None`` / sequence) for this leaf.
+
+                Returns:
+                    A :class:`PartitionSpec` whose first axis is
+                    ``pp_axis`` followed by the intra-stage spec.
+                """
                 if intra is None or intra == PartitionSpec():
                     return PartitionSpec(pp_axis)
                 if isinstance(intra, PartitionSpec):
@@ -816,12 +1082,36 @@ def _scheduled_call(
     stage_fn = stage_fns[0]
 
     def fwd_fn(params, x):
-        """Apply one stage's forward pass (stateless); drops any stage state output."""
+        """Apply one stage's forward pass (stateless); drops any stage state output.
+
+        Used by :func:`make_scheduled_body` as the per-microbatch
+        forward primitive. The ``init_state`` is hard-coded to ``()``
+        because scheduled SPMD pipelines treat stages as stateless
+        (state-carrying scheduled pipelines are not yet supported).
+
+        Args:
+            params: One stage's parameters.
+            x: Input activation.
+
+        Returns:
+            ``y`` only (the ``new_state`` half of ``stage_fn`` is
+            discarded).
+        """
         y, _ = stage_fn(params, (), x)
         return y
 
     def bwd_fn(params, x, g_y):
-        """VJP of :func:`fwd_fn` — returns ``(g_params, g_x)``."""
+        """VJP of :func:`fwd_fn` — returns ``(g_params, g_x)``.
+
+        Args:
+            params: One stage's parameters.
+            x: Saved forward input.
+            g_y: Cotangent at the stage's output.
+
+        Returns:
+            ``(g_params, g_x)`` — gradients flowing back to params
+            and to the upstream activation.
+        """
 
         def _only_y(p, xi):
             """Stage forward returning only the primary output ``y`` (drops stage state)."""
@@ -833,7 +1123,18 @@ def _scheduled_call(
         return g_p, g_x
 
     def loss_and_g_y(y, *t):
-        """Return ``(loss_scalar, g_y)`` via :func:`jax.value_and_grad` on ``loss_fn``."""
+        """Return ``(loss_scalar, g_y)`` via :func:`jax.value_and_grad` on ``loss_fn``.
+
+        Used at the terminal stage to seed the backward chain with
+        the loss's cotangent ``dloss/dy``.
+
+        Args:
+            y: Final-stage output for one microbatch.
+            *t: Targets / auxiliary args forwarded to ``loss_fn``.
+
+        Returns:
+            ``(loss_scalar, g_y)``.
+        """
 
         def _loss(yy):
             """Closure: ``loss_fn(yy, *targets)`` for ``jax.value_and_grad``."""

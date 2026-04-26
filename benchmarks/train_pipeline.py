@@ -205,7 +205,7 @@ def run_spmd(cfg: ModelConfig, schedule_name: str, microbatches: int, iters: int
     devices = jax.devices()[: cfg.n_stages]
     mpmd_mesh = MpMdMesh(Mesh(devices, axis_names=("pp",)), "pp")
 
-    model = build_model(cfg)
+    model = build_model(cfg, virtual_stages=schedule.virtual_stages_per_rank())
 
     def loss_fn(out, y):
         """MSE loss for the final stage output."""

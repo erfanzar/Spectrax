@@ -276,9 +276,28 @@ class Selector:
     def apply(self, module: Module) -> list[tuple[str, Variable]]:
         """Walk ``module`` and return every ``(path, variable)`` this selector matches.
 
-        When the selector has a module filter, a variable is kept only
-        if some ancestor satisfies that filter. Variables reached by
-        multiple paths (tied weights) are reported once.
+        Module-level filters (``module_types``, ``exclude_module_types``,
+        ``module_where``) prune the traversal: a variable is admitted
+        only when some ancestor module satisfies the filter. Variables
+        reached by multiple paths (tied / shared weights) are reported
+        exactly once, under their first-seen canonical path. Compound
+        selectors (``a | b``, ``a & b``) recurse into their
+        sub-selectors and combine results respecting :attr:`invert`.
+
+        When no module-level filter is active, the implementation
+        consults the :func:`spectrax.export` cache (variable list)
+        instead of re-walking, which keeps repeated selector
+        application cheap on the dispatch hot path.
+
+        Args:
+            module: Live module to scan.
+
+        Returns:
+            A list of ``(canonical_path, variable)`` pairs.
+
+        Raises:
+            TypeError: If ``module`` is not a :class:`Module`.
+            SelectorError: If a user-supplied predicate raises.
         """
         if not isinstance(module, Module):
             raise TypeError(f"apply() expects a Module, got {type(module).__name__}")
@@ -342,11 +361,22 @@ class Selector:
         return out
 
     def partition_state(self, module: Module, state: State) -> tuple[State, State]:
-        """Split ``state`` into ``(matched, rest)`` using the live module's
-        paths as the reference.
+        """Split ``state`` into ``(matched, rest)`` using the live module's paths as reference.
 
-        A leaf ends up in ``matched`` iff its ``(collection, path)`` pair
-        corresponds to a variable this selector picks out of ``module``.
+        For every variable picked by :meth:`apply` on ``module`` the
+        ``(collection, path)`` pair is collected into a match-set;
+        leaves of ``state`` are then routed into ``matched`` if their
+        key is in that set and into ``rest`` otherwise. Live writer
+        callbacks attached to ``state`` (typically by
+        :func:`spectrax.export`) are partitioned alongside the leaves
+        so write-through still works on either half.
+
+        Args:
+            module: Live module supplying the path ground truth.
+            state: :class:`State` to split.
+
+        Returns:
+            A pair ``(matched, rest)`` of fresh :class:`State` instances.
         """
         matched_paths: set[tuple[str, str]] = set()
         for p, v in self.apply(module):
@@ -371,7 +401,18 @@ class Selector:
         )
 
     def set(self, module: Module, fn: Callable[[Variable], Any]) -> None:
-        """In-place update: write ``fn(var)`` to ``var.value`` for every match."""
+        """In-place update: write ``fn(var)`` to ``var.value`` for every match.
+
+        Walks ``module`` via :meth:`apply` and assigns ``var.value =
+        fn(var)`` to each picked variable. Writes go through
+        :attr:`Variable.value`, so any installed write hook (from a
+        spectrax transform) fires.
+
+        Args:
+            module: Live module to mutate.
+            fn: Callback receiving the matched :class:`Variable` and
+                returning its new value.
+        """
         for _, var in self.apply(module):
             var.value = fn(var)
 

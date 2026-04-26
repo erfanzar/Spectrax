@@ -2,7 +2,15 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Inverted-dropout primitive."""
+"""Inverted-dropout primitive.
+
+Implements training-time dropout where the kept activations are scaled
+by ``1 / (1 - rate)`` so that the expectation matches the no-dropout
+case. The "deterministic" toggle (used by inference paths) returns the
+input unchanged. The PRNG key is required at the call site rather than
+being implicitly drawn from a default stream — :class:`spectrax.nn.Dropout`
+wraps this primitive and pulls a key from the active :class:`Rngs`.
+"""
 
 from __future__ import annotations
 

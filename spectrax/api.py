@@ -6,8 +6,10 @@
 
 Write the model once as a normal :class:`spectrax.Module`. Pass it
 to ``spx.run(model, inputs=..., mesh=mesh, mode=...)`` along with a
-mesh; the mesh decides whether to run pure SPMD (``pjit``) or MPMD
-(``sxcall`` with auto-split into per-rank stages).
+:class:`SpxMesh`; ``mesh.is_mpmd`` decides whether the model is
+executed under pure SPMD (a single :func:`jax.jit` call running
+across the whole mesh) or MPMD (auto-split into per-rank pipeline
+stages dispatched via :func:`spectrax.runtime.sxcall`).
 
 Examples::
 
@@ -31,6 +33,13 @@ So ``inputs=ids`` calls ``model.forward(ids)``;
 ``inputs=(ids, mask)`` calls ``model.forward(ids, mask)``;
 ``inputs=dict(ids=ids, mask=mask)`` calls ``model.forward(ids=ids, mask=mask)``.
 Same shape rules for ``targets`` against ``loss_fn``.
+
+The SPMD path keeps a small per-``GraphDef`` cache for the placed
+state and the jitted forward / train step, so repeated calls
+(notably autoregressive decode loops) reuse the compiled program.
+The MPMD path requires exactly one positional input (microbatched
+along its leading axis) and routes everything through
+:func:`spectrax.runtime.sxcall`.
 """
 
 from __future__ import annotations
@@ -58,12 +67,22 @@ _SPMD_STATE_CACHE: dict[tuple, Any] = {}
 
 
 def _as_call(payload: Any) -> tuple[tuple, dict]:
-    """Normalize an inputs/targets payload into ``(args, kwargs)`` for call.
+    """Normalize an ``inputs`` / ``targets`` payload into ``(args, kwargs)``.
+
+    Implements the three accepted call shapes documented on
+    :func:`run` (Option C):
 
     * ``None``                -> ``((), {})``
     * single array            -> ``((array,), {})``
     * tuple / list of values  -> ``(tuple(...), {})``
     * dict                    -> ``((), dict(...))``
+
+    Args:
+        payload: The raw value passed as ``inputs=`` or ``targets=``.
+
+    Returns:
+        A ``(args, kwargs)`` pair ready to splat into ``model(...)``
+        or ``loss_fn(out, ...)``.
     """
     if payload is None:
         return (), {}
@@ -75,9 +94,25 @@ def _as_call(payload: Any) -> tuple[tuple, dict]:
 
 
 def _place_state(state, model: Module, mesh):
-    """Apply per-leaf shardings derived from the model's logical
-    axis-name annotations (resolved against the active
-    :func:`logical_axis_rules` context) to a State pytree."""
+    """Place every leaf of a :class:`State` onto its target device sharding.
+
+    Asks the model for a ``{collection: {path: NamedSharding}}`` map
+    via :func:`spectrax.sharding.partition.get_named_sharding`, then
+    walks the state and calls :func:`jax.device_put` on each leaf for
+    which a sharding is registered. Leaves with no registered sharding
+    pass through untouched.
+
+    Args:
+        state: The :class:`State` returned by :func:`spectrax.export`.
+        model: The live module used to resolve logical axis-name
+            annotations against the active logical-axis rules context.
+        mesh: A :class:`jax.sharding.Mesh` to bind the per-leaf
+            ``NamedSharding`` s to.
+
+    Returns:
+        A new :class:`State` of the same type and shape as ``state``,
+        with each leaf placed onto its requested sharding.
+    """
     shards = get_named_sharding(model, mesh)
     out: dict[str, dict[str, Any]] = {}
     for col, path, leaf in state.items():
@@ -88,7 +123,21 @@ def _place_state(state, model: Module, mesh):
 
 
 def _mpmd_dummy_loss(y, *_a):
-    """Stable dummy loss for forward-only MPMD (module-level so ``id()`` is constant)."""
+    """Stable dummy loss used when MPMD ``mode='forward'`` needs a loss arg.
+
+    :func:`spectrax.runtime.sxcall` always takes a ``loss_fn`` parameter;
+    in forward mode we pass this fixed zero-returning function so that
+    the cache key for the compiled program stays constant across
+    repeated forward calls (it is defined at module scope so ``id()``
+    does not vary between calls).
+
+    Args:
+        y: The model output (ignored).
+        *_a: Any additional positional args (ignored).
+
+    Returns:
+        A scalar ``float32`` zero.
+    """
     return jax.numpy.zeros((), dtype=jax.numpy.float32)
 
 
@@ -103,11 +152,37 @@ def _run_spmd(
     loss_kwargs: dict,
     loss_fn: Callable | None,
 ):
-    """Run ``model`` under pjit: forward-only or train (value_and_grad).
+    """Run ``model`` under pure SPMD (``pjit``) — forward-only or train.
 
-    Jit-wrapped functions and placed state are cached so repeated
-    calls (e.g. decode loop) reuse the compiled program and skip
-    redundant ``_place_state`` walks.
+    Exports the model, places the resulting :class:`State` onto the
+    mesh, and dispatches either a jitted forward or a jitted
+    :func:`jax.value_and_grad` ``(loss, grads)`` step. Jit-compiled
+    functions and the placed state are cached per-``GraphDef`` so
+    repeat callers (e.g. an autoregressive decode loop or a training
+    step in a Python ``for`` loop) reuse the compiled program and
+    avoid redundant :func:`_place_state` walks. Cache entries are
+    weakly invalidated when the underlying ``GraphDef``, mesh, or
+    ``loss_fn`` go out of scope.
+
+    Args:
+        model: The :class:`Module` to run.
+        args: Positional arguments for ``model.forward``.
+        kwargs: Keyword arguments for ``model.forward``.
+        mesh: The :class:`SpxMesh` whose JAX mesh to enter for
+            execution.
+        mode: ``"forward"`` or ``"train"``.
+        loss_args: Positional arguments forwarded to ``loss_fn``
+            after the model output.
+        loss_kwargs: Keyword arguments forwarded to ``loss_fn``.
+        loss_fn: Required for ``mode='train'``; called as
+            ``loss_fn(out, *loss_args, **loss_kwargs)``.
+
+    Returns:
+        The model output (forward) or ``(loss, grads)`` (train).
+
+    Raises:
+        ValueError: ``mode='train'`` was requested but no ``loss_fn``
+            was provided.
     """
     gdef, state = export(model)
     jax_mesh = mesh.jax_mesh
@@ -129,7 +204,11 @@ def _run_spmd(
 
             @jax.jit
             def _fwd(state, *a, **kw):
-                """Bind ``gdef`` to ``state`` and call the resulting module."""
+                """Jitted forward: rebind ``gdef`` to ``state`` and call the module.
+
+                Cached per-``GraphDef`` so the same compiled program is
+                reused across calls.
+                """
                 return bind(gdef, state)(*a, **kw)
 
             _SPMD_FWD_CACHE[cache_key] = _fwd
@@ -147,10 +226,20 @@ def _run_spmd(
 
         @jax.jit
         def _step(state, args, kwargs, l_args, l_kwargs):
-            """Compute ``(loss, grads)`` via :func:`jax.value_and_grad` on ``state``."""
+            """One jitted train step: ``(loss, grads)`` via :func:`jax.value_and_grad`.
+
+            Differentiates with respect to the full :class:`State`
+            tree; partition out trainable subsets at the call site if
+            you want narrower gradients.
+            """
 
             def loss(state):
-                """Forward pass + loss closure over captured args/kwargs."""
+                """Forward + loss closure used as the differentiation target.
+
+                Captures ``gdef``, the model call args, and the
+                supplied ``loss_fn`` from the enclosing scope so the
+                resulting function depends only on ``state``.
+                """
                 out = bind(gdef, state)(*args, **kwargs)
                 return loss_fn(out, *l_args, **l_kwargs)
 
@@ -181,17 +270,48 @@ def _run_mpmd(
     fuse_zb: bool | None = None,
     has_aux: bool = False,
 ):
-    """Auto-split ``model`` into per-rank stages and dispatch.
+    """Auto-split ``model`` into per-rank stages and dispatch via :func:`sxcall`.
 
-    When ``schedule`` is provided, routes through :func:`sxcall`
-    which handles all 9 schedules (flat + virtual-stage) at any model
-    scale. When ``schedule`` is ``None``, uses the default GPipe path
-    via :func:`sxcall`.
+    Whether or not ``schedule`` is supplied the call routes through
+    :func:`spectrax.runtime.sxcall`, which handles all bundled
+    schedules (flat and virtual-stage) at any model scale. When
+    ``schedule`` is ``None``, a default :class:`GPipe` schedule with
+    ``microbatches`` microbatches is used.
 
-    ``fuse_1f1b`` and ``fuse_zb`` enable :class:`FusedTask` steady-state
-    fusion on :func:`sxcall` (dispatch-count reduction for 1F1B and
-    ZeroBubble families). When ``None`` (default), fusion is enabled
-    automatically for compatible schedules.
+    ``fuse_1f1b`` / ``fuse_zb`` toggle :class:`FusedTask` steady-state
+    fusion (dispatch-count reduction for 1F1B and ZeroBubble families);
+    ``None`` enables fusion automatically when the schedule supports it.
+
+    For ``mode='train'`` with keyword loss targets, the ``loss_fn`` is
+    rewrapped to take its target arguments positionally so they can
+    flow through the pipeline batch tuple.
+
+    Args:
+        model: The :class:`Module` to split and run.
+        args: Positional inputs; exactly one positional input is
+            required (microbatched along its leading axis).
+        kwargs: Keyword inputs (currently unused under MPMD).
+        mesh: An MPMD-flavoured :class:`SpxMesh`.
+        mode: ``"forward"`` or ``"train"``.
+        loss_args: Positional loss-target arguments.
+        loss_kwargs: Keyword loss-target arguments.
+        loss_fn: Required for ``mode='train'``.
+        microbatches: Microbatch count for the default :class:`GPipe`
+            schedule when ``schedule`` is ``None``. Forced to be at
+            least 1.
+        schedule: Optional pipeline-parallel schedule.
+        fuse_1f1b: Override for 1F1B steady-state fusion.
+        fuse_zb: Override for ZeroBubble steady-state fusion.
+        has_aux: Whether ``loss_fn`` returns ``(loss, aux)``; forwarded
+            to :func:`sxcall`.
+
+    Returns:
+        Whatever :func:`sxcall` returns for the chosen mode.
+
+    Raises:
+        ValueError: ``mode`` is not ``"forward"`` or ``"train"``,
+            ``loss_fn`` is missing in train mode, or no positional
+            input was supplied.
     """
     if mode not in {"forward", "train"}:
         raise ValueError(f"mode must be 'forward' or 'train', got {mode!r}.")
@@ -206,7 +326,13 @@ def _run_mpmd(
         original_loss = loss_fn
 
         def _wrapped_loss(out, *vals):
-            """Call ``original_loss`` with positional ``vals`` re-keyed to ``target_keys``."""
+            """Re-key positional pipeline targets back to keyword args for ``loss_fn``.
+
+            Pairs each value in ``vals`` with the corresponding key in
+            the captured ``target_keys`` and calls the original
+            ``loss_fn`` with keyword targets, preserving its kwargs
+            interface even though the pipeline batch is positional.
+            """
             return original_loss(out, **dict(zip(target_keys, vals, strict=True)))
 
         loss_fn = _wrapped_loss
@@ -278,7 +404,8 @@ def run(
             * dict            -> ``forward(**payload)``
 
         targets: Loss targets passed to ``loss_fn`` after the output.
-            Same shape rules as ``inputs``. Required for ``mode="train"``.
+            Same shape rules as ``inputs``. Required for ``mode="train"``;
+            forbidden in ``mode="forward"``.
         mesh: An :class:`SpxMesh` (built via :func:`spectrax.create_mesh`).
             ``mesh.is_mpmd`` decides the path:
 
@@ -291,11 +418,24 @@ def run(
         loss_fn: Required for ``mode="train"``. Called as
             ``loss_fn(output, *target_args, **target_kwargs)``.
         microbatches: Pipeline microbatch count. Ignored for SPMD.
+        schedule: Pipeline schedule for MPMD execution. Pass ``None``
+            to use a default :class:`GPipe`. Must be ``None`` under
+            an SPMD mesh.
+        fuse_1f1b: Override for 1F1B steady-state fusion (MPMD only).
+        fuse_zb: Override for ZeroBubble steady-state fusion (MPMD only).
+        has_aux: Whether ``loss_fn`` returns ``(loss, aux)`` (MPMD only).
 
     Returns:
         * ``mode="forward"``  -> ``output`` (same shape under SPMD and MPMD).
         * ``mode="train"``    -> ``(loss_scalar, grads)``. Under SPMD ``grads``
           is a single State; under MPMD it's a ``tuple[per_rank_State]``.
+
+    Raises:
+        TypeError: ``mesh`` is not an :class:`SpxMesh`.
+        ValueError: ``mode`` is invalid; ``targets`` was supplied with
+            ``mode="forward"``; an MPMD mesh was given more than one
+            positional input or any keyword inputs; or ``schedule=`` was
+            supplied alongside an SPMD mesh.
 
     Note:
         For MPMD decode that needs the per-rank stage state out (KV cache

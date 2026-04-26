@@ -314,13 +314,48 @@ def in_qdq(compute_dtype: DType, q_dtype: DType, x: ArrayLike, scale: Array, ama
 
 
 def _in_qdq_fwd(compute_dtype, q_dtype, x, scale, amax_history):
-    """VJP forward rule for :func:`in_qdq`: stash refreshed metas as residuals."""
+    """Custom-VJP forward rule for :func:`in_qdq`.
+
+    Runs :func:`quantize_dequantize` and stashes the refreshed
+    ``(scale, history)`` pair as residuals so the backward rule can
+    return them as the gradient for the scale / history arguments.
+
+    Args:
+        compute_dtype: Math dtype passed through from :func:`in_qdq`.
+        q_dtype: Target fp8 dtype.
+        x: Tensor to fake-quantize.
+        scale: Current scale.
+        amax_history: Current amax history.
+
+    Returns:
+        ``(qdq_x, (new_scale, new_history))`` — the fake-quantized
+        primal and the residual carried into the backward pass.
+    """
     qx, new_scale, new_history = quantize_dequantize(x, q_dtype, scale, amax_history, compute_dtype)
     return qx, (new_scale, new_history)
 
 
 def _in_qdq_bwd(compute_dtype, q_dtype, res, g):
-    """VJP backward rule for :func:`in_qdq`: identity on ``x``, new metas for scale/history."""
+    """Custom-VJP backward rule for :func:`in_qdq`.
+
+    Implements a straight-through estimator on ``x`` (the cotangent
+    is passed through unchanged) while emitting the refreshed metas
+    as cotangents for ``scale`` / ``amax_history`` so a surrounding
+    :func:`spx.grad` can write them back to the live :class:`Fp8Meta`
+    cells.
+
+    Args:
+        compute_dtype: Forwarded from the primal call (unused).
+        q_dtype: Forwarded from the primal call (unused).
+        res: ``(new_scale, new_history)`` residual from
+            :func:`_in_qdq_fwd`.
+        g: Upstream cotangent on the fake-quantized tensor.
+
+    Returns:
+        ``(g, new_scale, new_history)`` — gradient for ``x`` (STE),
+        and refreshed metas as the gradients for ``scale`` and
+        ``amax_history``.
+    """
     new_scale, new_history = res
     return g, new_scale, new_history
 
@@ -354,12 +389,43 @@ def out_qdq(compute_dtype: DType, q_dtype: DType, y: ArrayLike, scale: Array, am
 
 
 def _out_qdq_fwd(compute_dtype, q_dtype, y, scale, amax_history):
-    """VJP forward rule for :func:`out_qdq`: carry ``(scale, history)`` into the backward."""
+    """Custom-VJP forward rule for :func:`out_qdq`.
+
+    Identity on the primal — ``y`` flows through unchanged. The
+    current ``(scale, amax_history)`` is stashed as the residual so
+    the backward rule can fold the cotangent's amax into them.
+
+    Args:
+        compute_dtype: Forwarded; unused at forward time.
+        q_dtype: Forwarded; unused at forward time.
+        y: Forward output tensor.
+        scale: Current output-gradient scale.
+        amax_history: Current output-gradient amax history.
+
+    Returns:
+        ``(y, (scale, amax_history))``.
+    """
     return y, (scale, amax_history)
 
 
 def _out_qdq_bwd(compute_dtype, q_dtype, res, g):
-    """VJP backward rule for :func:`out_qdq`: qdq the cotangent, return refreshed metas."""
+    """Custom-VJP backward rule for :func:`out_qdq`.
+
+    Runs :func:`quantize_dequantize` on the incoming cotangent
+    (typically using the wide-range E5M2 dtype) and returns the
+    refreshed meta pair as the gradient for ``scale`` / ``history``.
+
+    Args:
+        compute_dtype: Math dtype for the qdq arithmetic.
+        q_dtype: Target fp8 dtype for the cotangent.
+        res: ``(scale, amax_history)`` from :func:`_out_qdq_fwd`.
+        g: Upstream cotangent.
+
+    Returns:
+        ``(qg, new_scale, new_history)`` — the qdq'd cotangent, plus
+        refreshed metas to back-propagate into the
+        :class:`Fp8Meta` cells.
+    """
     scale, amax_history = res
     qg, new_scale, new_history = quantize_dequantize(g, q_dtype, scale, amax_history, compute_dtype)
     return qg, new_scale, new_history
@@ -419,14 +485,34 @@ class Fp8DotGeneral(Module):
         e4m3_dtype: DType = jnp.float8_e4m3fn,
         e5m2_dtype: DType = jnp.float8_e5m2,
     ) -> None:
-        """Allocate the six fp8 meta cells and remember the two dtype choices.
+        """Allocate the six fp8 meta cells and stash the dtype choices.
+
+        Initializes:
+
+        * ``input_scale`` / ``kernel_scale`` / ``output_grad_scale``
+          — shape ``(1,)``, dtype ``float32``, value ``1.0`` (no
+          rescaling on the first call).
+        * ``input_amax_history`` / ``kernel_amax_history`` /
+          ``output_grad_amax_history`` — shape
+          ``(amax_history_length,)``, dtype ``float32``, value ``0``
+          (the rolling FIFO grows in over the first calls).
 
         The fp8 dtypes are stashed as their :func:`jax.numpy.dtype`
         *names* (strings like ``"float8_e4m3fn"``) rather than the raw
-        dtype objects — dtype classes are hashable but are not accepted
-        by :class:`~spectrax.Module`'s static-scalar rule, whereas
-        strings are first-class static fields that survive
+        dtype objects — dtype classes are hashable but are not
+        accepted by :class:`~spectrax.Module`'s static-scalar rule,
+        whereas strings are first-class static fields that survive
         :func:`~spectrax.export` / :func:`~spectrax.bind` round-trips.
+
+        Args:
+            amax_history_length: Length of the rolling amax history
+                kept per tensor. Larger values smooth the scale
+                updates; smaller values react faster to distribution
+                shifts. Default ``1024``.
+            e4m3_dtype: FP8 dtype for the forward path (activations
+                / weights). Default :data:`jax.numpy.float8_e4m3fn`.
+            e5m2_dtype: FP8 dtype for the backward path (cotangents).
+                Default :data:`jax.numpy.float8_e5m2`.
         """
         super().__init__()
         self.amax_history_length = int(amax_history_length)
@@ -552,7 +638,27 @@ class Fp8Linear(Module):
         sharding: Sharding | AxisNames | None = None,
         bias_sharding: Sharding | AxisNames | None = None,
     ) -> None:
-        """Allocate the weight, the optional bias, and the embedded qdot."""
+        """Allocate the weight, optional bias, and embedded :class:`Fp8DotGeneral`.
+
+        Args:
+            in_features: Trailing input feature count.
+            out_features: Output feature count.
+            use_bias: When ``True`` (default), allocate the bias.
+            rngs: PRNG source for parameter initialization.
+            w_init: Weight initializer; defaults to Kaiming-uniform
+                with ``"linear"`` gain.
+            b_init: Bias initializer; defaults to zeros.
+            dtype: Storage dtype for the parameters; defaults to
+                ``float32``.
+            param_dtype: Alias for ``dtype``.
+            amax_history_length: Forwarded to
+                :class:`Fp8DotGeneral`; controls the rolling amax
+                history length.
+            sharding: Optional sharding for the weight (axis names
+                ``("in", "out")``).
+            bias_sharding: Optional sharding for the bias (axis
+                names ``("out",)``).
+        """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -653,7 +759,34 @@ class Fp8Einsum(Module):
         sharding: Sharding | AxisNames | None = None,
         bias_sharding: Sharding | AxisNames | None = None,
     ) -> None:
-        """Allocate the weight, optional bias, and embedded :class:`Fp8DotGeneral`."""
+        """Allocate the weight, optional bias, and embedded :class:`Fp8DotGeneral`.
+
+        Args:
+            equation: An :func:`jax.numpy.einsum` equation in
+                explicit form (must contain ``"->"``). The first
+                operand is the input ``x``; the second is the
+                learnable :attr:`weight`.
+            shape: Shape of :attr:`weight`; allocated eagerly.
+            use_bias: When ``True``, allocate a broadcast-add bias
+                of shape ``bias_shape``.
+            bias_shape: Shape of the bias; required when
+                ``use_bias=True``.
+            rngs: PRNG source for parameter initialization.
+            w_init: Weight initializer; defaults to Kaiming-uniform
+                with ``"linear"`` gain.
+            b_init: Bias initializer; defaults to zeros.
+            dtype: Storage dtype; defaults to ``float32``.
+            param_dtype: Alias for ``dtype``.
+            amax_history_length: Forwarded to
+                :class:`Fp8DotGeneral`.
+            sharding: Optional sharding for the weight.
+            bias_sharding: Optional sharding for the bias.
+
+        Raises:
+            ValueError: If ``equation`` does not contain ``"->"``,
+                or if ``use_bias=True`` is set without
+                ``bias_shape``.
+        """
         super().__init__()
         if "->" not in equation:
             raise ValueError("Fp8Einsum equation must contain '->'")

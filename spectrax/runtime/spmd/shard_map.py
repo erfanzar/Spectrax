@@ -50,17 +50,50 @@ _PHASE_MAP = {
 
 
 def _drop0(tree: Any) -> Any:
-    """Strip a leading size-1 axis from every leaf."""
+    """Strip the leading size-1 pp axis from every leaf in ``tree``.
+
+    Args:
+        tree: Any pytree of arrays.
+
+    Returns:
+        Same pytree with each leaf indexed at ``[0]``.
+    """
     return jax.tree.map(lambda a: a[0], tree)
 
 
 def _add0(tree: Any) -> Any:
-    """Add a leading size-1 axis to every leaf (inverse of :func:`_drop0`)."""
+    """Add a leading size-1 pp axis to every leaf in ``tree``.
+
+    Inverse of :func:`_drop0`; used on out-bound carries that need
+    to satisfy a ``PartitionSpec(pp_axis)`` ``out_specs`` entry.
+
+    Args:
+        tree: Any pytree of arrays.
+
+    Returns:
+        Same pytree with each leaf gaining a leading axis of size 1.
+    """
     return jax.tree.map(lambda a: a[None, ...], tree)
 
 
 def _prev_logical_loc(schedule: Schedule, rank: int, virt: int, n_stages: int) -> tuple[int, int] | None:
-    """Return the ``(rank, virt)`` hosting logical stage ``logical - 1``."""
+    """Return the ``(rank, virt)`` hosting logical stage ``logical - 1``.
+
+    The schedule's :meth:`Schedule.next_logical_loc` answers the
+    forward direction; this helper inverse-searches it so the runtime
+    knows where to ``ppermute`` a backward cotangent. Search is
+    O(n_stages * V) but only runs at trace time, not per step.
+
+    Args:
+        schedule: The active :class:`Schedule`.
+        rank: Current physical rank.
+        virt: Current virtual-stage index.
+        n_stages: Number of physical pipeline ranks.
+
+    Returns:
+        ``(rank, virt)`` of the upstream logical stage, or ``None``
+        if this is the first logical stage (no upstream).
+    """
     logical = schedule.logical_at(rank, virt, n_stages)
     if logical == 0:
         return None
@@ -77,15 +110,28 @@ def _encode_grid(
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, int]:
     """Encode the schedule grid as integer arrays for :func:`lax.scan`.
 
-    Returns ``(phase_grid, mb_grid, virt_grid, logical_grid,
-    fwd_dest_grid, bwd_dest_grid, T)`` where each array has shape
-    ``(T, n_stages)``.
+    The scan-based body cannot iterate Python objects, so the schedule
+    grid (a list of :class:`Action` cells) is flattened into integer
+    arrays of shape ``(T, n_stages)`` indexed by time step. The body
+    then reads its rank's column at each scan step and dispatches via
+    :func:`jax.lax.switch`.
 
-    ``fwd_dest_grid[t, r]`` is the physical rank that this rank's FWD
-    output should be transported to (``-1`` if no transport, i.e. the
-    action is terminal or non-FWD). ``bwd_dest_grid[t, r]`` is where
-    the BWD cotangent goes (the upstream rank, ``-1`` if first logical
-    stage or non-BWD).
+    ``fwd_dest_grid[t, r]`` is the physical rank that rank ``r``'s
+    FWD output should be transported to at time ``t`` (``-1`` if no
+    transport, i.e. the action is terminal or non-FWD).
+    ``bwd_dest_grid[t, r]`` is where the BWD cotangent goes (the
+    upstream rank, ``-1`` if first logical stage or non-BWD).
+    ``fwd_dv_grid`` / ``bwd_dv_grid`` carry the virtual-stage index
+    of the destination (used to write into the right slot of the
+    receiver's per-virt buffer).
+
+    Args:
+        schedule: The schedule to encode.
+        n_stages: Number of physical pipeline ranks.
+
+    Returns:
+        ``(phase_grid, mb_grid, virt_grid, logical_grid,
+        fwd_dest_grid, fwd_dv_grid, bwd_dest_grid, bwd_dv_grid, T)``.
     """
     grid_raw = schedule.build(n_stages)
     T = len(grid_raw)
@@ -170,21 +216,42 @@ def make_scheduled_body(
         _raw_fwd, _raw_bwd = fwd_fn, bwd_fn
 
         def fwd_fn(params, x):
-            """Checkpointed forward."""
+            """Forward wrapped in :func:`jax.checkpoint` for activation rematerialisation.
+
+            Trades compute for memory: the forward's intermediate
+            activations are recomputed during backward instead of
+            saved.
+
+            Args:
+                params: Stage parameters.
+                x: Stage input.
+
+            Returns:
+                Stage output ``y``.
+            """
 
             @jax.checkpoint
             def _ckpt(p, xi):
-                """Checkpoint boundary: ``_raw_fwd`` recomputed during backward instead of saved."""
+                """Inner checkpoint boundary marking ``_raw_fwd`` for rematerialisation."""
                 return _raw_fwd(p, xi)
 
             return _ckpt(params, x)
 
         def bwd_fn(params, x, g_y):
-            """Checkpointed backward."""
+            """Backward wrapped in :func:`jax.checkpoint` for higher-order remat.
+
+            Args:
+                params: Stage parameters.
+                x: Saved input.
+                g_y: Output cotangent.
+
+            Returns:
+                ``(g_params, g_x)``.
+            """
 
             @jax.checkpoint
             def _ckpt(p, xi, g):
-                """Checkpoint boundary: ``_raw_bwd`` recomputed during higher-order autodiff."""
+                """Inner checkpoint boundary for ``_raw_bwd`` under higher-order autodiff."""
                 return _raw_bwd(p, xi, g)
 
             return _ckpt(params, x, g_y)
@@ -226,12 +293,31 @@ def _make_scan_body(
     V,
     n_logical,
 ):
-    """Scan-based body: ``lax.scan`` over time steps with dynamic dispatch.
+    """Scan-based body: :func:`jax.lax.scan` over time steps with dynamic dispatch.
 
-    ONE copy of the step body in HLO. Schedule encoded as integer
-    arrays. Phase dispatch via ``lax.switch``. Transport via
-    ``lax.ppermute`` with all-pairs swap (covers both forward and
-    backward transport directions for any ``n_stages``).
+    Compiles to ONE copy of the step body in HLO regardless of how
+    many time steps the schedule has. The schedule is encoded into
+    integer arrays by :func:`_encode_grid`; the body reads its rank's
+    column at each scan iteration, dispatches via
+    :func:`jax.lax.switch` over the action's phase, and routes
+    activations / cotangents via :func:`jax.lax.ppermute` over all
+    rank-to-rank pairs (only the matching pair carries non-junk data,
+    selected via ``where``).
+
+    Args:
+        schedule: A :class:`Schedule`.
+        n_stages: Number of physical pipeline ranks.
+        microbatches: ``M``.
+        pp_axis: Manual pipeline-parallel mesh axis name.
+        fwd_fn: ``(params, x) -> y``.
+        bwd_fn: ``(params, x, g_y) -> (g_params, g_x)``.
+        loss_and_g_y: ``(y, *targets) -> (loss, g_y)`` for the
+            terminal stage.
+        V: Virtual stages per rank.
+        n_logical: Total logical stages (``n_stages * V``).
+
+    Returns:
+        A ``shard_map`` body function.
     """
     (
         phase_grid,
@@ -246,18 +332,35 @@ def _make_scan_body(
     ) = _encode_grid(schedule, n_stages)
     m = microbatches
 
-    [*list(range(1, n_stages)), 0]
-    [n_stages - 1, *list(range(n_stages - 1))]
-
     def body(stacked_params, xs, *targets):
-        """Shard-map body: scan over schedule time steps."""
+        """Shard-map body: scan over schedule time steps.
+
+        Args:
+            stacked_params: Per-rank stacked parameters.
+            xs: Microbatched input ``(M, ...)``.
+            *targets: Microbatched targets.
+
+        Returns:
+            ``(mean_loss, stacked_params_grads)``.
+        """
         rank = jax.lax.axis_index(pp_axis)
         p_per_rank = _drop0(stacked_params)
         mb_shape = xs.shape[1:]
         mb_dtype = xs.dtype
 
         def pick_virt(tree, v):
-            """Select virt ``v`` from per-rank params."""
+            """Select the virtual-stage slice ``v`` from per-rank parameters.
+
+            For flat schedules (``V == 1``) the params have no virt
+            axis and the tree is returned as-is.
+
+            Args:
+                tree: Per-rank parameter pytree.
+                v: Virtual-stage index.
+
+            Returns:
+                The virt slice of every leaf.
+            """
             if V == 1:
                 return tree
             return jax.tree.map(lambda a: a[v], tree)
@@ -284,15 +387,43 @@ def _make_scan_body(
         my_bwd_dests = bwd_dest_grid[:, rank]
 
         def si_get(arr, v, mb_idx):
-            """Read saved[v, mb] or saved[mb]."""
+            """Read ``arr[v, mb_idx]`` or ``arr[mb_idx]`` depending on ``V``.
+
+            Args:
+                arr: Saved-input / saved-output / incoming buffer.
+                v: Virtual-stage index (ignored when ``V == 1``).
+                mb_idx: Microbatch index.
+
+            Returns:
+                The buffered value for this ``(v, mb)`` slot.
+            """
             return arr[mb_idx] if V == 1 else arr[v, mb_idx]
 
         def si_set(arr, v, mb_idx, val):
-            """Write saved[v, mb] = val or saved[mb] = val."""
+            """Functional write of ``val`` into ``arr[v, mb_idx]`` (or ``arr[mb_idx]``).
+
+            Args:
+                arr: Buffer to write into.
+                v: Virtual-stage index (ignored when ``V == 1``).
+                mb_idx: Microbatch index.
+                val: Value to store.
+
+            Returns:
+                The updated buffer.
+            """
             return arr.at[mb_idx].set(val) if V == 1 else arr.at[v, mb_idx].set(val)
 
         def g_add(acc, v, upd):
-            """Accumulate grad update at virt ``v``."""
+            """Accumulate ``upd`` into the grad accumulator at virt ``v``.
+
+            Args:
+                acc: Grad accumulator pytree.
+                v: Virtual-stage index (ignored when ``V == 1``).
+                upd: Per-leaf gradient update.
+
+            Returns:
+                Updated accumulator pytree.
+            """
             if V == 1:
                 return jax.tree.map(lambda a, b: a + b, acc, upd)
             return jax.tree.map(lambda a, b: a.at[v].add(b), acc, upd)
@@ -302,7 +433,27 @@ def _make_scan_body(
         transfer_edges = tuple((src, dst) for src in range(n_stages) for dst in range(n_stages) if src != dst)
 
         def route_value(buffer, value, dest, dest_virt, mb_idx):
-            """Route ``value`` to ``dest`` and write it into ``buffer[dest_virt, mb]``."""
+            """Route ``value`` from this rank to ``dest`` and store it in ``buffer[dest_virt, mb_idx]``.
+
+            Same-rank routing is a direct buffer write. Cross-rank
+            routing fires :func:`jax.lax.ppermute` for every possible
+            ``(src, dst)`` pair (collectives must run on every device
+            every scan step) and uses the ``mb`` tag to select which
+            transfer actually carries data — the rest are masked out
+            by the ``has_value`` predicate.
+
+            Args:
+                buffer: Receiver-side buffer to write into.
+                value: Value being sent.
+                dest: Destination physical rank.
+                dest_virt: Destination virtual-stage index.
+                mb_idx: Microbatch index for both buffer slot and
+                    routing tag.
+
+            Returns:
+                The updated buffer (logically a no-op on ranks that
+                are neither sender nor receiver for this transfer).
+            """
             same_rank = dest == rank
             buffer = jnp.where(same_rank, si_set(buffer, dest_virt, mb_idx, value), buffer)
             for src, dst in transfer_edges:
@@ -317,12 +468,25 @@ def _make_scan_body(
             return buffer
 
         def scan_step(carry, t_idx):
-            """One time step: compute via lax.switch, then transport via ppermute OUTSIDE switch.
+            """One scan iteration: dispatch the action then transport its outputs.
 
-            Collectives (ppermute) must fire on every device every step —
-            they can't live inside lax.switch branches (which only execute
-            one branch per device). So the switch returns the value to
-            transport, and ppermute runs unconditionally after.
+            Each iteration reads its rank's slice of the integer
+            grids at ``t_idx``, picks the matching virtual stage's
+            params, and dispatches to one of the do_* phase branches
+            via :func:`jax.lax.switch`. The branch returns the
+            forward / backward value to transport (zeros for skip /
+            non-applicable phases); transport via :func:`route_value`
+            then runs unconditionally because collectives can't live
+            inside ``lax.switch`` branches (only one branch executes
+            per device, but collectives need every device).
+
+            Args:
+                carry: Tuple ``(saved_inputs, saved_outputs,
+                    incoming_fwd, incoming_bwd, g_params, loss_acc)``.
+                t_idx: Scan time-step index.
+
+            Returns:
+                ``(new_carry, None)`` — scan emits no per-step output.
             """
             si, so, ifwd, ibwd, gp, la = carry
             phase = my_phases[t_idx]
@@ -339,7 +503,16 @@ def _make_scan_body(
             x_in = jnp.where(is_first_logical, x_from_xs, x_from_incoming)
 
             def do_fwd(args):
-                """Forward: compute y, save input/output. Return y for transport."""
+                """FWD branch: compute ``y``, save ``x_in`` (and ``y`` if terminal), emit ``y`` for transport.
+
+                Args:
+                    args: ``(saved_inputs, saved_outputs, g_params, loss_acc)``.
+
+                Returns:
+                    Updated ``(si, so, gp, la)`` plus ``(fwd_val,
+                    bwd_val)`` where ``fwd_val == y`` and
+                    ``bwd_val == 0`` (no backward transport).
+                """
                 si_, so_, gp_, la_ = args
                 y = fwd_fn(p_v, x_in)
                 si_ = si_set(si_, v, mb_idx, x_in)
@@ -347,18 +520,27 @@ def _make_scan_body(
                 return si_, so_, gp_, la_, y, jnp.zeros_like(y)
 
             def do_bwd(args):
-                """Full backward: accumulate parameter grads and return g_x."""
+                """Full BWD branch: accumulate ``g_params``, emit ``g_x`` for transport upstream.
+
+                Args:
+                    args: ``(saved_inputs, saved_outputs, g_params, loss_acc)``.
+
+                Returns:
+                    Updated ``(si, so, gp, la)`` plus ``(0, g_x)`` —
+                    nothing flows downstream, ``g_x`` flows
+                    upstream.
+                """
                 si_, so_, gp_, la_ = args
                 x_saved = si_get(si_, v, mb_idx)
 
                 def _get_gy():
-                    """Terminal-stage branch: compute ``loss`` and ``g_y`` from saved output + targets."""
+                    """Terminal-stage branch: compute ``(loss, g_y)`` from saved output and targets."""
                     y_out = si_get(so_, v, mb_idx)
                     loss_mb, g_y_mb = loss_and_g_y(y_out, *(t_arr[mb_idx] for t_arr in targets))
                     return loss_mb.astype(jnp.float32), g_y_mb
 
                 def _get_gy_incoming():
-                    """Non-terminal branch: ``loss=0``, ``g_y`` = previously received cotangent buffer entry."""
+                    """Non-terminal branch: ``loss = 0``, ``g_y`` = previously received cotangent buffer entry."""
                     return jnp.zeros((), dtype=jnp.float32), si_get(ibwd, v, mb_idx)
 
                 loss_mb, g_y = jax.lax.cond(is_terminal, _get_gy, _get_gy_incoming)
@@ -368,16 +550,30 @@ def _make_scan_body(
                 return si_, so_, gp_, la_, jnp.zeros_like(x_saved), g_x
 
             def do_bwd_i(args):
-                """Input-gradient half of ZeroBubble: send g_x, do not add g_params."""
+                """Input-gradient half of zero-bubble: emit ``g_x`` upstream, do not accumulate ``g_p``.
+
+                Used by :class:`ZeroBubbleH1` so the critical-path
+                input-grad fires immediately while the weight-grad is
+                deferred.
+
+                Args:
+                    args: ``(saved_inputs, saved_outputs, g_params, loss_acc)``.
+
+                Returns:
+                    Updated carry plus ``(0, g_x)`` — only upstream
+                    transport.
+                """
                 si_, so_, gp_, la_ = args
                 x_saved = si_get(si_, v, mb_idx)
 
                 def _get_gy():
+                    """Terminal-stage branch: ``(loss, g_y)`` from saved output and targets."""
                     y_out = si_get(so_, v, mb_idx)
                     loss_mb, g_y_mb = loss_and_g_y(y_out, *(t_arr[mb_idx] for t_arr in targets))
                     return loss_mb.astype(jnp.float32), g_y_mb
 
                 def _get_gy_incoming():
+                    """Non-terminal branch: ``loss = 0``, ``g_y`` from incoming cotangent buffer."""
                     return jnp.zeros((), dtype=jnp.float32), si_get(ibwd, v, mb_idx)
 
                 loss_mb, g_y = jax.lax.cond(is_terminal, _get_gy, _get_gy_incoming)
@@ -386,16 +582,26 @@ def _make_scan_body(
                 return si_, so_, gp_, la_, jnp.zeros_like(x_saved), g_x
 
             def do_bwd_w(args):
-                """Weight-gradient half of ZeroBubble: add g_params, no upstream send."""
+                """Weight-gradient half of zero-bubble: accumulate ``g_p``, no upstream send.
+
+                Args:
+                    args: ``(saved_inputs, saved_outputs, g_params, loss_acc)``.
+
+                Returns:
+                    Updated carry plus ``(0, 0)`` — nothing
+                    transports out of a weight-grad action.
+                """
                 si_, so_, gp_, la_ = args
                 x_saved = si_get(si_, v, mb_idx)
 
                 def _get_gy():
+                    """Terminal-stage branch: pull ``g_y`` from loss; loss is intentionally not added (BWD_I already did)."""
                     y_out = si_get(so_, v, mb_idx)
                     _loss_mb, g_y_mb = loss_and_g_y(y_out, *(t_arr[mb_idx] for t_arr in targets))
                     return g_y_mb
 
                 def _get_gy_incoming():
+                    """Non-terminal branch: pull ``g_y`` from the incoming cotangent buffer."""
                     return si_get(ibwd, v, mb_idx)
 
                 g_y = jax.lax.cond(is_terminal, _get_gy, _get_gy_incoming)
@@ -404,7 +610,14 @@ def _make_scan_body(
                 return si_, so_, gp_, la_, jnp.zeros_like(x_saved), jnp.zeros_like(x_saved)
 
             def do_skip(args):
-                """Idle: zeros for transport, carry unchanged."""
+                """Idle branch: carry unchanged, transport zeros (masked out by ``has_value``).
+
+                Args:
+                    args: ``(saved_inputs, saved_outputs, g_params, loss_acc)``.
+
+                Returns:
+                    Carry unchanged plus ``(0, 0)`` for transport.
+                """
                 si_, so_, gp_, la_ = args
                 z = jnp.zeros(mb_shape, dtype=mb_dtype)
                 return si_, so_, gp_, la_, z, z
@@ -447,7 +660,30 @@ def _make_unrolled_body(
     V,
     n_logical,
 ):
-    """Python-unrolled body: original implementation for small-scale configs."""
+    """Python-unrolled ``shard_map`` body: one HLO block per schedule cell.
+
+    The classic implementation: walk the schedule grid in Python and
+    emit one block of XLA ops per ``(t, rank)`` cell, using
+    :func:`jax.lax.cond` to gate the active rank and
+    :func:`jax.lax.ppermute` for cross-rank transport. Compiles fast
+    at small scale and is straightforward to debug, but the HLO
+    graph grows as ``T * n_actions`` so OOMs on 8B+ pipelines with
+    virtual stages — use ``use_scan=True`` for those.
+
+    Args:
+        schedule: A :class:`Schedule`.
+        n_stages: Number of physical pipeline ranks.
+        microbatches: ``M``.
+        pp_axis: Manual pipeline-parallel mesh axis name.
+        fwd_fn: ``(params, x) -> y``.
+        bwd_fn: ``(params, x, g_y) -> (g_params, g_x)``.
+        loss_and_g_y: Terminal ``(y, *targets) -> (loss, g_y)``.
+        V: Virtual stages per rank.
+        n_logical: Total logical stages.
+
+    Returns:
+        A ``shard_map`` body function.
+    """
     m = microbatches
 
     grid_raw = schedule.build(n_stages)
@@ -465,14 +701,32 @@ def _make_unrolled_body(
         grid.append(new_row[:n_stages])
 
     def body(stacked_params, xs, *targets):
-        """Shard-map body: Python-unrolled time steps."""
+        """Shard-map body: walk the schedule grid as Python-unrolled time steps.
+
+        Args:
+            stacked_params: Per-rank stacked params.
+            xs: Microbatched inputs ``(M, ...)``.
+            *targets: Microbatched targets.
+
+        Returns:
+            ``(mean_loss, stacked_params_grads)``.
+        """
         rank = jax.lax.axis_index(pp_axis)
         p_per_rank = _drop0(stacked_params)
         mb_shape = xs.shape[1:]
         mb_dtype = xs.dtype
 
         def pick_virt(tree, v):
-            """Select virt."""
+            """Select the virtual-stage slice ``v`` from per-rank parameters.
+
+            Args:
+                tree: Per-rank parameter pytree.
+                v: Virtual-stage index (ignored when ``V == 1``).
+
+            Returns:
+                The virt slice of every leaf, or ``tree`` unchanged
+                for flat schedules.
+            """
             if V == 1:
                 return tree
             return jax.tree.map(lambda a: a[v], tree)
@@ -492,15 +746,15 @@ def _make_unrolled_body(
         loss_acc = jnp.zeros((), dtype=jnp.float32)
 
         def si_get(arr, v, mb_idx):
-            """Read."""
+            """Read ``arr[v, mb_idx]`` (or ``arr[mb_idx]`` when ``V == 1``)."""
             return arr[mb_idx] if V == 1 else arr[v, mb_idx]
 
         def si_set(arr, v, mb_idx, val):
-            """Write."""
+            """Functional write of ``val`` into ``arr[v, mb_idx]`` (or ``arr[mb_idx]``)."""
             return arr.at[mb_idx].set(val) if V == 1 else arr.at[v, mb_idx].set(val)
 
         def g_add(acc, v, upd):
-            """Accumulate."""
+            """Accumulate ``upd`` into the grad accumulator at virt ``v``."""
             if V == 1:
                 return jax.tree.map(lambda a, b: a + b, acc, upd)
             return jax.tree.map(lambda a, b: a.at[v].add(b), acc, upd)

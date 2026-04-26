@@ -167,7 +167,36 @@ _FWD_ONLY_VMAP_CACHE: dict[int, Callable[..., Any]] = {}
 
 @dataclass(frozen=True)
 class _ScheduleUnit:
-    """One executable unit in a schedule-driven MPMD dispatch."""
+    """One executable unit in a schedule-driven MPMD dispatch.
+
+    A unit is the smallest granularity the schedule dispatcher fires:
+    either a single :class:`Action` (``kind == "action"``) or a fused
+    forward+backward pair (``kind == "fused"``) on the same physical
+    rank. Units are produced by walking ``schedule.build(n)`` and form
+    the nodes of the dependency DAG used by the async dispatcher.
+
+    Attributes:
+        index: Stable global ordering key (insertion order in the unit
+            list). Used as the dependency-graph node id.
+        row: Source row in the schedule grid; mostly diagnostic.
+        kind: Either ``"action"`` (a single :class:`Action`) or
+            ``"fused"`` (a :class:`FusedTask`).
+        rank: Physical pipeline rank that owns this unit.
+        virt: Virtual sub-stage on ``rank`` (always 0 for flat
+            schedules with ``V == 1``).
+        payload: The underlying :class:`Action` or :class:`FusedTask`.
+        fwd_logical: Logical stage index of the forward half (None for
+            pure-backward units).
+        fwd_mb: Microbatch index of the forward half (None for
+            pure-backward units).
+        bwd_logical: Logical stage index of the backward half (None
+            for pure-forward units).
+        bwd_mb: Microbatch index of the backward half (None for
+            pure-forward units).
+        bwd_phase: Specific backward phase (``Phase.BWD``,
+            ``Phase.BWD_I``, or ``Phase.BWD_W``) or ``None`` for
+            forward-only units.
+    """
 
     index: int
     row: int
@@ -323,7 +352,14 @@ class _ScheduleStatsCollector:
             memo: dict[int, float] = {}
 
             def cp(idx: int) -> float:
-                """Memoized longest-path-to-finish time for unit ``idx``."""
+                """Memoised critical-path (longest-finish) time for unit ``idx``.
+
+                The critical path of any unit is the maximum critical
+                path of its predecessors plus the unit's own enqueue
+                time. Walking the DAG with memoisation collapses the
+                recursion to ``O(|edges|)`` even when the graph has
+                wide fan-in.
+                """
                 if idx in memo:
                     return memo[idx]
                 dep_best = max((cp(dep) for dep in deps.get(idx, ())), default=0.0)
@@ -354,7 +390,16 @@ class _ScheduleStatsCollector:
                 return "unknown"
 
             def unit_label(unit: _ScheduleUnit) -> str:
-                """Render a unit as a short ``rank/virt phase Lk:mbm`` label."""
+                """Render a short human-readable label for one schedule unit.
+
+                Format examples:
+
+                * ``r1/v0 fwd L2:mb3`` — forward of microbatch 3 on
+                  logical stage 2 at rank 1, virtual 0.
+                * ``r0/v0 bwd_w L0:mb1`` — weight-grad backward.
+                * ``r2/v0 fused L4:fwd_mb0+bwd_mb2`` — paired fused
+                  task.
+                """
                 phase = unit_phase(unit)
                 loc = f"r{unit.rank}/v{unit.virt}"
                 if unit.kind == "fused":
@@ -415,7 +460,20 @@ class _ScheduleStatsCollector:
 
 
 def _arg_leaf_ranges(args: tuple[Any, ...]) -> list[tuple[int, int]]:
-    """Return flat-leaf ``[start, end)`` ranges for each positional argument."""
+    """Return ``[start, end)`` flat-leaf index ranges for each positional argument.
+
+    Used when a downstream pass needs to map an outer-jaxpr flat-arg
+    index back to which user-supplied positional argument it came from
+    (e.g. to decide which leaves belong to the captured Module).
+
+    Args:
+        args: The user-facing positional arguments before flattening.
+
+    Returns:
+        A list parallel to ``args``; entry ``i`` is the half-open
+        leaf-index range that ``args[i]`` occupies in the flat-leaf
+        tuple.
+    """
     ranges: list[tuple[int, int]] = []
     start = 0
     for arg in args:
@@ -426,7 +484,23 @@ def _arg_leaf_ranges(args: tuple[Any, ...]) -> list[tuple[int, int]]:
 
 
 def _normalize_argnums(argnums: int | tuple[int, ...] | None, total: int) -> tuple[int, ...]:
-    """Normalize argnums to a tuple and validate bounds."""
+    """Coerce ``argnums`` to a validated tuple of non-negative indices.
+
+    Accepts ``None`` (returns empty tuple), a single int, or any
+    iterable of ints. Negative values are interpreted Python-style
+    relative to ``total``. Raises if any resolved index falls outside
+    ``[0, total)``.
+
+    Args:
+        argnums: User-supplied gradient argnum spec.
+        total: Total number of positional arguments to ``fn``.
+
+    Returns:
+        Normalised tuple of indices in ``[0, total)``.
+
+    Raises:
+        ValueError: If a normalised index is out of range.
+    """
     if argnums is None:
         return ()
     if isinstance(argnums, int):
@@ -464,7 +538,27 @@ def _result_treedef_for_call(
     static_argnums: int | tuple[int, ...] | None,
     static_argnames: str | tuple[str, ...] | None,
 ) -> Any | None:
-    """Best-effort output pytree structure for sxjit's flat runtime results."""
+    """Trace ``fn`` symbolically to capture its output pytree structure.
+
+    The MPMD runtime returns flat tuples of arrays from per-rank
+    dispatch; this helper runs :func:`jax.eval_shape` once with the
+    same static/dynamic argument split sxjit will use, so the wrapper
+    can later re-pack flat tuples into the user's nested return
+    pytree. Failures (e.g. ``fn`` cannot be eval-shaped because it
+    requires concrete data) return ``None`` and the wrapper passes
+    flat tuples through unchanged.
+
+    Args:
+        fn: The user-decorated function.
+        args: Positional arguments at the current call.
+        kwargs: Keyword arguments at the current call.
+        static_argnums: Argnums treated as static.
+        static_argnames: Argnames treated as static.
+
+    Returns:
+        A :func:`jax.tree_util.PyTreeDef` describing ``fn``'s output
+        structure, or ``None`` when tracing failed.
+    """
     static_nums = set(_normalize_argnums(static_argnums, len(args)))
     static_names = set(_normalize_argnames(static_argnames))
     dynamic_nums = tuple(i for i in range(len(args)) if i not in static_nums)
@@ -505,7 +599,20 @@ def _restore_result_treedef(result: Any, treedef: Any | None) -> Any:
 
 
 def _has_array_leaf(x: Any) -> bool:
-    """Return whether a pytree carries dynamic array data."""
+    """Return ``True`` iff ``x`` flattens to at least one array-like leaf.
+
+    Used to distinguish "real" runtime data (which should stay dynamic)
+    from pure metadata such as ints, dataclasses, or schedule objects
+    (which sxjit can safely treat as static argnum candidates).
+
+    Args:
+        x: A pytree to inspect.
+
+    Returns:
+        ``True`` when at least one leaf is a :class:`jax.Array`,
+        carries a ``__jax_array__`` protocol, or has both ``shape``
+        and ``dtype`` attributes.
+    """
     leaves = jax.tree.leaves(x, is_leaf=_is_leaf)
     return any(
         isinstance(leaf, jax.Array)
@@ -534,7 +641,35 @@ def _compute_donation(
     static_nums: set[int],
     n: int,
 ) -> list[tuple[int, ...]]:
-    """Compute per-stage donate_argnums from original donate_argnums."""
+    """Translate user-facing ``donate_argnums`` into per-stage jit donate-argnum tuples.
+
+    Each top-level argument may flatten to many leaves, and each leaf
+    may flow into one or more cluster sub-jaxprs. Donation is only
+    safe when a leaf is consumed by exactly one cluster (otherwise XLA
+    would invalidate the buffer mid-pipeline). For each donated
+    argument we walk its flat leaves, find which ``(rank, invar_pos)``
+    pairs they end up at, and only record the donation when the leaf
+    is single-use.
+
+    Args:
+        clusters: Per-stage marker-clustered sub-jaxprs.
+        original_id_to_idx: ``id(jaxpr_invar) -> dynamic-flat index``
+            mapping from the outer jaxpr.
+        orig_flat_to_dynamic_flat: Mapping from the user-flat index
+            (no static args removed) to the dynamic-flat index used
+            inside the outer jaxpr.
+        args: The original positional arguments.
+        donate_nums: User's donate-argnum spec.
+        static_nums: Argnums that are treated as static.
+        n: Number of physical pipeline ranks.
+
+    Returns:
+        ``donate_per_stage[rank]`` is the sorted tuple of cluster
+        invar positions safe to donate at that rank.
+
+    Raises:
+        ValueError: If a donated arg is also marked static.
+    """
     donate_per_stage: list[set[int]] = [set() for _ in range(n)]
     for donate_num in donate_nums:
         if donate_num in static_nums:
@@ -561,7 +696,19 @@ def _compute_donation(
 
 
 def _array_device_set(value: Any) -> set[Any] | None:
-    """Return the devices backing a JAX array-like value, when available."""
+    """Return the device set holding ``value``'s shards, or ``None`` when unknown.
+
+    Tries the ``.devices`` attribute on the array (callable on newer
+    JAX, plain attribute on older). Returns ``None`` whenever the
+    object is not a JAX array (Python scalars, ``None``, etc.) or
+    when the attribute access raises.
+
+    Args:
+        value: Any value (array or otherwise).
+
+    Returns:
+        A set of :class:`jax.Device` objects or ``None``.
+    """
     devices = getattr(value, "devices", None)
     if devices is None:
         return None
@@ -607,7 +754,19 @@ def _sharding_device_set(sharding: Any) -> set[Any] | None:
 
 
 def _tree_nbytes(x: Any) -> int:
-    """Best-effort pytree byte size without synchronizing device buffers."""
+    """Sum the byte sizes of every array leaf in ``x`` without touching devices.
+
+    Computes ``size * dtype.itemsize`` per leaf, ignoring leaves that
+    are not arrays. The result is reported to the schedule stats
+    collector as a transfer-size estimate. No :func:`block_until_ready`
+    is issued so the cost is purely metadata access.
+
+    Args:
+        x: A pytree whose array leaves should be measured.
+
+    Returns:
+        Total bytes across all array leaves.
+    """
     total = 0
     for leaf in jax.tree.leaves(x, is_leaf=_is_leaf):
         size = getattr(leaf, "size", None)
@@ -669,7 +828,25 @@ def _partition_spec_axes(spec: Any) -> set[str]:
 
 
 def _retarget_transfer_sharding(value: Any, fallback_sharding: Any) -> Any:
-    """Preserve a leaf's partition spec when moving it to another PP rank."""
+    """Re-bind each leaf's intra-stage partition spec to the destination mesh.
+
+    When transporting an activation across pipeline ranks, the leaf
+    may already have a non-trivial partition spec (e.g. for tensor
+    parallelism inside the source rank). If the destination mesh has
+    matching axis names, we re-wrap the same spec on the destination
+    mesh so the TP layout survives the transport — otherwise we fall
+    back to ``fallback_sharding`` (the destination rank's default).
+
+    Args:
+        value: The array (or pytree of arrays) about to be moved.
+        fallback_sharding: The default destination sharding, typically
+            the destination rank's replicated sharding.
+
+    Returns:
+        Either ``fallback_sharding`` directly (when no leaf benefits
+        from re-binding) or a pytree of per-leaf shardings matching
+        ``value``'s structure.
+    """
     fallback_mesh = getattr(fallback_sharding, "mesh", None)
     if fallback_mesh is None:
         return fallback_sharding
@@ -707,7 +884,23 @@ def _retarget_transfer_sharding(value: Any, fallback_sharding: Any) -> Any:
 
 
 def _can_skip_device_put(value: Any, dest_sharding: Any) -> tuple[bool, bool]:
-    """Return ``(skip, cache_hit)`` for a transfer sharding decision."""
+    """Decide whether ``jax.device_put(value, dest_sharding)`` would be a no-op.
+
+    Memoised in :data:`_TRANSFER_SHARDING_DECISION_CACHE` keyed by the
+    Python ids of the source sharding, destination sharding, and the
+    value's device set, so repeated transfers of similarly-placed
+    arrays skip the comparison after the first time.
+
+    Args:
+        value: The candidate array to transport.
+        dest_sharding: Target sharding (or ``None`` to skip the check).
+
+    Returns:
+        ``(skip, cache_hit)`` — ``skip`` is ``True`` when the
+        transport can be elided (matching shardings or matching device
+        sets); ``cache_hit`` is ``True`` when the answer came from the
+        memo rather than a fresh comparison.
+    """
     current = getattr(value, "sharding", None)
     value_devices = _array_device_set(value)
     dest_devices = _sharding_device_set(dest_sharding)
@@ -729,7 +922,21 @@ def _can_skip_device_put(value: Any, dest_sharding: Any) -> tuple[bool, bool]:
 
 
 def _is_replicated_sharding(sharding: Any) -> bool:
-    """Best-effort check for a fully replicated sharding spec."""
+    """Return ``True`` when ``sharding``'s spec replicates over every dimension.
+
+    Detects shardings where every entry of the underlying
+    :class:`PartitionSpec` is ``None`` (no axis sharded). Falls back to
+    ``False`` if the object exposes no ``.spec`` attribute or fails
+    iteration — it is a best-effort fast path for the placement
+    decision in :func:`_place_schedule_const_value`.
+
+    Args:
+        sharding: Any sharding-like object (typically
+            :class:`NamedSharding`).
+
+    Returns:
+        ``True`` only when every dimension is replicated.
+    """
     spec = getattr(sharding, "spec", None)
     if spec is None:
         return False
@@ -799,7 +1006,38 @@ def _build_schedule_plan(
     static_argnums: tuple[int, ...] | None,
     donate_argnums: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    """Build a dispatch plan for schedule-driven ``sxjit``."""
+    """Build the per-call dispatch plan for schedule-driven :func:`sxjit`.
+
+    Trace ``fn`` once with the schedule context in scope to produce the
+    body jaxpr, cluster it by :func:`sxstage_iter` markers, map every
+    logical stage onto its ``(rank, virt)`` location via
+    ``schedule.logical_at``/``next_logical_loc``, build per-location
+    forward / backward / terminal jits, place all const tensors on
+    their owning rank's sub-mesh, and pre-compute the schedule grid +
+    invar-source table consumed at dispatch time.
+
+    Args:
+        fn: User function being compiled by :func:`sxjit`.
+        args: Positional arguments captured at trace time.
+        kwargs: Keyword arguments captured at trace time.
+        schedule: Active :class:`Schedule`.
+        mpmd_mesh: The MPMD mesh whose ``mpmd_dim`` equals the number
+            of physical pipeline ranks.
+        stage_shardings: Per-rank replicated shardings (one per
+            physical rank).
+        rank_submeshes: Per-rank sub-meshes (one per physical rank).
+        static_argnums: Optional explicit static-argnum spec; ``None``
+            triggers heuristic inference via
+            :func:`_infer_schedule_static_argnums`.
+        donate_argnums: Optional argnums whose buffers may be donated
+            into the compiled stage jits.
+
+    Returns:
+        A plan dict consumed by the schedule dispatchers
+        (:func:`_dispatch_schedule_faithful`,
+        :func:`_dispatch_schedule_fused_async`, etc.) and the
+        forward/backward/terminal jits keyed by ``(rank, virt)``.
+    """
     n = mpmd_mesh.mpmd_dim
     v = schedule.virtual_stages_per_rank()
     n_logical = n * v
@@ -1710,7 +1948,25 @@ def _get_schedule_fused_fwd_bwd_jit(
     bwd_jit: Callable[..., Any],
     n_invars: int,
 ) -> Callable[..., Any]:
-    """Return a cached schedule-stage jit that runs FWD(A)+BWD(B)."""
+    """Return a cached jit that fuses FWD on microbatch A with BWD on microbatch B.
+
+    The 1F1B steady state alternates a forward on a fresh microbatch
+    with a backward on an in-flight one. Folding both into a single
+    :func:`jax.jit` cuts the per-step Python dispatch count in half and
+    lets XLA overlap the two computations on the same rank. The result
+    is memoised in :data:`_SCHEDULE_FUSED_FWDBWD_CACHE` so subsequent
+    fused units reuse the same compiled program.
+
+    Args:
+        fwd_jit: Per-cluster forward jit (from :func:`_make_fwd_jit`).
+        bwd_jit: Per-cluster backward jit (from :func:`_make_bwd_jit`).
+        n_invars: Number of cluster input variables (used to slice the
+            packed ``(fwd_invars, bwd_invars, cotangents)`` tuple).
+
+    Returns:
+        Jitted ``(consts, *args) -> (fwd_outs, g_consts, g_bwd_invars)``
+        callable.
+    """
     key = (id(fwd_jit), id(bwd_jit), n_invars)
     cached = _SCHEDULE_FUSED_FWDBWD_CACHE.get(key)
     if cached is not None:
@@ -1741,7 +1997,20 @@ def _get_schedule_fused_fwd_bwd_jit(
 
 
 def _eval_schedule_cluster_fwd(cluster_jaxpr: Any, consts: tuple[Any, ...], *invars: Any) -> tuple[Any, ...]:
-    """Evaluate one schedule cluster without nesting an already-jitted stage."""
+    """Evaluate a cluster sub-jaxpr without nesting a pre-compiled stage jit.
+
+    Used by direct-fused dispatch paths that compose multiple cluster
+    operations inside a single :func:`jax.jit`; calling the precompiled
+    forward jit instead would force a re-trace on every invocation.
+
+    Args:
+        cluster_jaxpr: The stage's sub-jaxpr.
+        consts: Placed constants for that cluster.
+        *invars: Stage input activations.
+
+    Returns:
+        Tuple of stage outputs (matching the cluster's outvars).
+    """
     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
 
 
@@ -1751,7 +2020,23 @@ def _eval_schedule_cluster_bwd(
     consts: tuple[Any, ...],
     *invars_and_cotangents: Any,
 ) -> tuple[Any, tuple[Any, ...]]:
-    """Differentiate one schedule cluster inside a larger rank-local jit."""
+    """Compute ``(g_consts, g_invars)`` for a cluster inside a fused jit.
+
+    Mirrors :func:`_make_bwd_jit` but calls the cluster jaxpr inline so
+    a fused fwd+bwd jit can carry both halves in one HLO graph.
+
+    Args:
+        cluster_jaxpr: The stage's sub-jaxpr.
+        n_invars: Number of cluster invars (used to slice
+            ``invars_and_cotangents``).
+        consts: Placed constants for the cluster.
+        *invars_and_cotangents: ``(*invars, *cotangents)`` packed as a
+            single positional sequence.
+
+    Returns:
+        ``(g_consts, g_invars)`` aligned with ``consts`` and the
+        cluster's invars respectively.
+    """
     invars = invars_and_cotangents[:n_invars]
     cotangents = invars_and_cotangents[n_invars:]
 
@@ -1770,7 +2055,25 @@ def _eval_schedule_cluster_terminal(
     consts: tuple[Any, ...],
     *invars: Any,
 ) -> tuple[Any, tuple[Any, tuple[Any, ...]]]:
-    """Run terminal loss + gradients inside a rank-local jit."""
+    """Run the terminal cluster's loss + gradient computation in-place.
+
+    Used as a building block for direct-fused jits that compose the
+    cluster jaxpr inline rather than calling a pre-compiled stage jit.
+    Wraps the cluster's scalar-loss evaluator in
+    :func:`jax.value_and_grad` over both ``consts`` and ``invars`` so a
+    single trace produces the loss value and the seed cotangents the
+    upstream backward sweep needs.
+
+    Args:
+        cluster_jaxpr: Terminal cluster sub-jaxpr.
+        n_invars: Cluster's invar count.
+        consts: Placed cluster constants.
+        *invars: Cluster's positional inputs.
+
+    Returns:
+        ``(loss, (g_consts, g_invars))`` mirroring
+        :func:`_make_terminal_jit`'s output.
+    """
 
     def pure(c: tuple[Any, ...], *xs: Any) -> Any:
         """Pure (consts, invars) -> scalar interpreter for the loss cluster.
@@ -1794,7 +2097,25 @@ def _get_schedule_direct_fused_fwd_bwd_jit(
     cluster_jaxpr: Any,
     n_invars: int,
 ) -> Callable[..., Any]:
-    """Return a fused FWD+BWD jit that composes the cluster directly."""
+    """Return a cached fused FWD(A)+BWD(B) jit built directly from the cluster jaxpr.
+
+    Variant of :func:`_get_schedule_fused_fwd_bwd_jit` that bypasses
+    the per-cluster pre-compiled forward/backward jits and re-evaluates
+    the cluster's jaxpr inside one outer :func:`jax.jit`. This lets
+    XLA see the entire fwd+bwd as a single graph (better fusion) at
+    the cost of recompiling the cluster body inside this jit.
+
+    Cached on ``(id(cluster_jaxpr), n_invars)`` in
+    :data:`_SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE`.
+
+    Args:
+        cluster_jaxpr: The stage's sub-jaxpr.
+        n_invars: Number of cluster input variables.
+
+    Returns:
+        Jitted ``(consts, *args) -> (fwd_outs, g_consts, g_bwd_invars)``
+        callable.
+    """
     key = (id(cluster_jaxpr), n_invars)
     cached = _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE.get(key)
     if cached is not None:
@@ -1834,7 +2155,24 @@ def _schedule_action_unit(
     action: Any,
     logical_for_loc: dict[tuple[int, int], int],
 ) -> _ScheduleUnit:
-    """Lower a schedule action into the shared dependency-unit form."""
+    """Wrap a single :class:`Action` cell as a :class:`_ScheduleUnit`.
+
+    Forward actions populate ``fwd_logical``/``fwd_mb``; backward
+    actions populate ``bwd_logical``/``bwd_mb``/``bwd_phase``. Used by
+    :func:`_build_schedule_units_from_plan` when expanding the
+    schedule grid into the dependency DAG.
+
+    Args:
+        index: Stable global ordering key.
+        row: Source row in the schedule grid.
+        rank: Physical pipeline rank.
+        action: The :class:`Action` cell.
+        logical_for_loc: Mapping from ``(rank, virt)`` to logical
+            stage index.
+
+    Returns:
+        A :class:`_ScheduleUnit` reflecting the action's phase.
+    """
     virt = action.virtual_stage
     logical = logical_for_loc[(rank, virt)]
     if action.phase is Phase.FWD:
@@ -1874,7 +2212,23 @@ def _schedule_fused_unit(
     fused: FusedTask,
     logical_for_loc: dict[tuple[int, int], int],
 ) -> _ScheduleUnit:
-    """Lower a true FWD+BWD fused schedule cell into one dependency unit."""
+    """Wrap a paired FWD+BWD :class:`FusedTask` as a single :class:`_ScheduleUnit`.
+
+    Both halves share the same physical ``(rank, virt)`` location so
+    the unit carries one logical-stage index but two microbatch
+    indices (one for the forward half, one for the backward half).
+
+    Args:
+        index: Stable global ordering key.
+        row: Source row in the schedule grid.
+        rank: Physical pipeline rank.
+        fused: The :class:`FusedTask` cell.
+        logical_for_loc: Mapping from ``(rank, virt)`` to logical
+            stage index.
+
+    Returns:
+        A :class:`_ScheduleUnit` with ``kind="fused"``.
+    """
     virt = fused.virtual_stage
     logical = logical_for_loc[(rank, virt)]
     return _ScheduleUnit(
@@ -1905,7 +2259,22 @@ def _fuse_cross_virtual_schedule_units(plan: dict[str, Any], units: list[_Schedu
 
 
 def _build_schedule_units_from_plan(plan: dict[str, Any]) -> list[_ScheduleUnit]:
-    """Build executable schedule units while preserving real ``FusedTask`` cells."""
+    """Walk the schedule grid and emit executable units in row-major order.
+
+    Genuine forward+backward :class:`FusedTask` cells stay folded into
+    a single fused unit; mixed-phase ``FusedTask`` (e.g. fwd+bwd_i)
+    is split into its component actions because the dispatcher
+    handles the halves separately. The terminal-rank backward action
+    is omitted when ``eager_terminal_bwd`` is set (the terminal
+    backward is fired eagerly inside the forward stub).
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+
+    Returns:
+        Ordered list of :class:`_ScheduleUnit` objects ready for
+        dependency analysis.
+    """
     units: list[_ScheduleUnit] = []
     next_index = 0
     logical_for_loc = plan["logical_for_loc"]
@@ -1965,7 +2334,29 @@ def _build_schedule_units_from_plan(plan: dict[str, Any]) -> list[_ScheduleUnit]
 
 
 def _build_schedule_unit_dependencies(plan: dict[str, Any], units: list[_ScheduleUnit]) -> dict[int, set[int]]:
-    """Build unit-level dependencies for fused async schedule dispatch."""
+    """Compute the predecessor-set for each schedule unit.
+
+    Three classes of edge are added:
+
+    * **Same-rank order**: each unit depends on the previous unit fired
+      on the same rank (preserves the schedule's intended sequencing).
+    * **Forward-data dependencies**: a forward unit depends on the
+      forward units that produced each of its cluster inputs (looked
+      up via ``invar_sources``).
+    * **Backward-cotangent dependencies**: a backward unit depends on
+      its own paired forward (so saved activations are available) and
+      on the backward of every downstream consumer that supplies a
+      cotangent. ``BWD_W`` units are excluded from
+      cotangent-supplier tracking because they only produce weight
+      grads.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        units: Units returned by :func:`_build_schedule_units_from_plan`.
+
+    Returns:
+        A mapping ``unit_index -> {predecessor unit indices}``.
+    """
     n_logical = plan["n_logical"]
     invar_sources = plan["invar_sources"]
     fwd_units: dict[tuple[int, int], int] = {}
@@ -1992,7 +2383,13 @@ def _build_schedule_unit_dependencies(plan: dict[str, Any], units: list[_Schedul
     previous_by_rank: dict[int, int] = {}
 
     def add_dep(unit: _ScheduleUnit, dep: int | None) -> None:
-        """Add ``dep`` as a predecessor of ``unit``, ignoring null/self-deps."""
+        """Insert ``dep`` into ``unit``'s predecessor set if it is real and distinct.
+
+        Skips ``None`` (no dependency) and self-references (a unit
+        cannot depend on itself). The caller may pass a missing
+        index from a dictionary lookup directly without an extra
+        ``if`` check.
+        """
         if dep is not None and dep != unit.index:
             deps[unit.index].add(dep)
 
@@ -2018,7 +2415,25 @@ def _dispatch_schedule_faithful(
     args: tuple,
     return_loss: bool = False,
 ) -> tuple[jax.Array | None, tuple[Any, ...]]:
-    """Default schedule-driven train dispatcher with fused stage units."""
+    """Run the schedule-driven training dispatch and return ``(loss, grads)``.
+
+    The default path lowers the schedule into dependency-tracked units
+    and fires them through :func:`_dispatch_schedule_fused_async`.
+    Schedules that opt into ``lazy_bwd_batching`` (currently the
+    research-style serial path) instead delegate to
+    :func:`_dispatch_schedule_faithful_serial` and bypass the async
+    DAG entirely. The choice is recorded in
+    ``plan["last_schedule_runtime_stats"]`` for diagnostics.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        args: Flat positional call arguments.
+        return_loss: When ``True``, also return the scalar loss
+            (``False`` is used by ``sxgrad`` which wants only grads).
+
+    Returns:
+        ``(loss_or_None, flat_grads_tuple)``.
+    """
     if getattr(plan["schedule"], "lazy_bwd_batching", False):
         plan["last_schedule_runtime_stats"] = {
             "dispatcher": "serial",
@@ -2799,19 +3214,57 @@ def _dispatch_schedule_fused_async(
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
 def _schedule_forward(plan: dict[str, Any], *args: Any) -> jax.Array:
-    """Forward-only dispatch for schedule-driven ``sxjit``."""
+    """Forward-only entry point used to wire ``sxjit`` into JAX autodiff.
+
+    Wrapped with :func:`jax.custom_vjp` so that gradients of
+    schedule-driven functions are taken by replaying the same MPMD
+    pipeline rather than by retracing the cluster jaxprs through JAX's
+    standard transpose. The plan is non-differentiable
+    (``nondiff_argnums=(0,)``) so changes to the plan do not propagate
+    cotangents.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        *args: Flattened user arguments.
+
+    Returns:
+        The forward-pass scalar loss as a :class:`jax.Array`.
+    """
     loss, _ = _dispatch_gpipe_fwd(plan, args)
     return loss
 
 
 def _schedule_forward_fwd(plan: dict[str, Any], *args: Any) -> tuple[jax.Array, dict[str, Any]]:
-    """Forward pass returning loss and saved activations."""
+    """Custom-VJP forward rule: returns ``(loss, residuals)``.
+
+    The residuals dict captures every per-microbatch activation needed
+    by :func:`_schedule_forward_bwd` so the backward pass can run the
+    pipeline cotangent sweep without re-tracing.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        *args: Flattened user arguments.
+
+    Returns:
+        ``(loss, saved)`` — the forward output plus the residuals
+        consumed by the backward rule.
+    """
     loss, saved = _dispatch_gpipe_fwd(plan, args)
     return loss, saved
 
 
 def _schedule_forward_bwd(plan: dict[str, Any], saved: dict[str, Any], g: Any) -> tuple[Any, ...]:
-    """Backward pass using saved activations."""
+    """Custom-VJP backward rule: replay the schedule and return arg cotangents.
+
+    Args:
+        plan: Dispatch plan (non-differentiable).
+        saved: Residuals from :func:`_schedule_forward_fwd`.
+        g: Cotangent of the scalar loss output (typically ``1.0``).
+
+    Returns:
+        Tuple of cotangents aligned with the differentiable
+        positional arguments of :func:`_schedule_forward`.
+    """
     grads = _dispatch_gpipe_bwd(plan, saved, g)
     return grads
 
@@ -2898,7 +3351,27 @@ def sxvalue_and_grad(fn: Callable, argnums: int | tuple[int, ...] = 0) -> Callab
 
 
 def _ensure_schedule_plan(fn: Callable, args: tuple[Any, ...]) -> dict[str, Any]:
-    """Build a schedule-driven ``sxjit`` plan on first gradient call."""
+    """Return ``fn``'s cached schedule plan, building it on the first call.
+
+    :func:`sxgrad` and :func:`sxvalue_and_grad` may be invoked before
+    the wrapped function ever ran (so its on-demand build never
+    fired). This helper triggers ``fn._mpmd_build`` once with the
+    user's arguments and returns the resulting plan from
+    ``fn._mpmd_state``.
+
+    Args:
+        fn: A function decorated by ``@sxjit(..., schedule=...)``.
+        args: User-provided positional arguments (used to seed the
+            initial trace).
+
+    Returns:
+        The cached schedule plan dict.
+
+    Raises:
+        TypeError: If ``fn`` does not expose ``_mpmd_build`` or the
+            build never produced a schedule plan (i.e. ``schedule=...``
+            was not supplied).
+    """
     plan = fn._mpmd_state.get("schedule_plan")
     if plan is not None:
         return plan
@@ -3262,10 +3735,94 @@ def sxjit(
                 flat_args,
             )
 
+        # @erfanzar NOTE:
+        # Bug this fixes: the original ``wrapped(...)`` below traced once
+        # on the first call (``_build(args, kwargs)``) and then dispatched
+        # against any future inputs without re-checking shapes. Plain
+        # ``jax.jit`` re-traces automatically when leaf shapes change;
+        # this MPMD wrapper did not. So calling the same compiled
+        # function with a different input shape — e.g. eSurge's compile
+        # loop hitting ``[1/11]: 4 tokens`` then ``[2/11]: 8 tokens`` —
+        # silently reused the old jaxpr (which baked in shape ``(3, 4)``
+        # for ``expand_dims``) against the new ``(3, 8)`` input and blew
+        # up inside ``broadcast_in_dim``.
+        #
+        # Fix: key a per-shape cache of compiled-state snapshots by a
+        # signature derived from the input pytree treedef + leaf
+        # shape/dtype. ``_state`` itself remains the currently-active
+        # build (so closures captured by ``_build`` / ``_dispatch``
+        # continue to see the dict they always did) — we just swap its
+        # contents in/out from ``_state_cache`` as the input signature
+        # changes. Same shape repeated → cache hit, no rebuild.
+        # Alternating shapes → both cached, no rebuild on either side.
+
+        def _shape_signature(args: tuple, kwargs: dict) -> tuple:
+            """Build a hashable signature capturing pytree structure and leaf shape/dtype.
+
+            Two calls share a signature exactly when their flattened
+            inputs share both treedef and per-leaf ``(shape, dtype)``.
+            Used as the cache key for swappable plan snapshots so that
+            the wrapper retraces only when the input layout actually
+            changes.
+
+            Args:
+                args: Positional call arguments.
+                kwargs: Keyword call arguments.
+
+            Returns:
+                ``(treedef, ((shape0, dtype0), (shape1, dtype1), ...))``.
+            """
+            leaves, treedef = jax.tree.flatten((args, kwargs))
+            leaf_sig = tuple((getattr(leaf, "shape", None), getattr(leaf, "dtype", None)) for leaf in leaves)
+            return (treedef, leaf_sig)
+
+        _SIG_KEY = "__shape_signature__"
+        _BUILT_KEYS = ("compiled", "schedule_plan", "pscan_plan")
+        _state_cache: dict = {}
+
+        def _swap_in(snapshot: dict | None) -> None:
+            """Replace ``_state``'s entries with those of ``snapshot`` in place.
+
+            Mutating ``_state`` keeps every closure that already captured
+            it (the ``_build`` and ``_dispatch`` inner functions) seeing
+            the new contents. Passing ``None`` clears ``_state`` so a
+            fresh ``_build`` can populate it.
+
+            Args:
+                snapshot: A previously-captured plan snapshot, or
+                    ``None`` to wipe ``_state``.
+            """
+            for k in list(_state.keys()):
+                del _state[k]
+            if snapshot is not None:
+                _state.update(snapshot)
+
         def wrapped(*args, **kwargs):
-            """Trace on first call, dispatch on every call."""
-            if "compiled" not in _state and "schedule_plan" not in _state and "pscan_plan" not in _state:
-                _build(args, kwargs)
+            """The user-visible callable returned by :func:`sxjit`.
+
+            On every call we compute the shape signature and look up
+            a matching cached plan; if none exists we run ``_build``
+            once. Once a plan is in scope, the call routes to the
+            schedule dispatcher, the pscan dispatcher, or the legacy
+            per-stage path depending on which key ``_build`` populated.
+            Output pytree structure (lost when the runtime returns
+            flat tuples) is restored via the captured ``result_treedef``.
+            """
+            sig = _shape_signature(args, kwargs)
+            cur_sig = _state.get(_SIG_KEY)
+            if cur_sig != sig:
+                # Save the current build under its signature so it is
+                # reusable if the shape comes back later.
+                if cur_sig is not None and any(k in _state for k in _BUILT_KEYS):
+                    _state_cache[cur_sig] = {k: v for k, v in _state.items()}
+                cached = _state_cache.get(sig)
+                if cached is not None:
+                    _swap_in(cached)
+                else:
+                    _swap_in(None)
+                    _build(args, kwargs)
+                    _state[_SIG_KEY] = sig
+                    _state_cache[sig] = {k: v for k, v in _state.items()}
 
             if "schedule_plan" in _state:
                 plan = _state["schedule_plan"]
@@ -3340,7 +3897,22 @@ def _build_outvar_map(
 
 
 def _marker_alias_resolver(body_jaxpr: Any) -> Callable[[Any], Any]:
-    """Return a resolver that maps ``sxstage_iter`` output vars to their inputs."""
+    """Return a closure that follows ``sxstage_iter`` outvar -> invar identity edges.
+
+    Marker primitives are identities, so two clusters that read the
+    "same" value really see distinct :class:`Var` objects: the first
+    sees the marker's input, the second its output. To match producers
+    and consumers we walk the chain back to the originating var
+    whenever we look up by id. The returned resolver is loop-safe via
+    a per-call ``seen`` set in case a malformed jaxpr cycles.
+
+    Args:
+        body_jaxpr: A jaxpr that may contain :data:`sxstage_iter_p`
+            equations.
+
+    Returns:
+        ``resolve_alias(var) -> Var`` walking through marker edges.
+    """
     alias_by_id = {
         id(outvar): invar
         for eqn in body_jaxpr.eqns
@@ -3451,14 +4023,38 @@ def _build_cluster_plans(
 
             @functools.partial(jax.jit, donate_argnums=donate)
             def stage_jit(*invars, _c=pc, _j=eval_jaxpr):
-                """Evaluate the cluster's sub-jaxpr with pre-placed constants."""
+                """Run the cluster sub-jaxpr with constants pre-placed on the rank.
+
+                ``_c`` and ``_j`` are bound at definition so each stage's
+                jit closes over its own placed constants and jaxpr (no
+                cross-stage closure leaks).
+
+                Args:
+                    *invars: Stage input activations.
+
+                Returns:
+                    Tuple of stage outputs aligned with the cluster's
+                    outvars.
+                """
                 return tuple(jax.core.eval_jaxpr(_j, list(_c), *invars))
 
         else:
 
             @jax.jit
             def stage_jit(*invars, _c=pc, _j=eval_jaxpr):
-                """Evaluate the cluster's sub-jaxpr with pre-placed constants."""
+                """Run the cluster sub-jaxpr with constants pre-placed on the rank.
+
+                ``_c`` and ``_j`` are bound at definition so each stage's
+                jit closes over its own placed constants and jaxpr (no
+                cross-stage closure leaks).
+
+                Args:
+                    *invars: Stage input activations.
+
+                Returns:
+                    Tuple of stage outputs aligned with the cluster's
+                    outvars.
+                """
                 return tuple(jax.core.eval_jaxpr(_j, list(_c), *invars))
 
         plans.append(
@@ -3740,14 +4336,36 @@ def _active_profiler() -> "_Profiler | None":
 
 
 class _Profiler:
-    """Per-task millisecond accumulator used by :func:`collect_task_times_ms`."""
+    """Per-task millisecond accumulator used by :func:`collect_task_times_ms`.
+
+    Holds a flat ``task_name -> list[float_ms]`` dict that the
+    :func:`_time_call` helper appends to whenever a labelled MPMD
+    sub-task completes. One :class:`_Profiler` is active per thread at
+    a time; nested ``collect_task_times_ms`` contexts share the outer
+    profiler's dict so timings remain comparable.
+    """
 
     def __init__(self) -> None:
-        """Initialise an empty per-task timing map."""
+        """Create a profiler with an empty ``task_name -> list[ms]`` map.
+
+        The map is populated by :meth:`record` as :func:`sxcall`'s
+        wrapped callables fire. A fresh profiler is constructed each
+        time :func:`collect_task_times_ms` enters a new (non-nested)
+        context.
+        """
         self.times_ms: dict[str, list[float]] = {}
 
     def record(self, task_name: str, dt_ms: float) -> None:
-        """Append ``dt_ms`` to the list for ``task_name``."""
+        """Append a millisecond duration to the bucket for ``task_name``.
+
+        The bucket is created on first use so callers do not need to
+        register names ahead of time.
+
+        Args:
+            task_name: Profiler label (e.g. ``"stage0_fwd_mb3"``).
+            dt_ms: Wall-clock duration of the task, including
+                :func:`jax.block_until_ready`.
+        """
         self.times_ms.setdefault(task_name, []).append(dt_ms)
 
 
@@ -3790,7 +4408,22 @@ def _time_call(
     fn: Callable[..., Any],
     *args: Any,
 ) -> Any:
-    """Call ``fn(*args)``; if a profiler is active, record its wall time."""
+    """Invoke ``fn(*args)`` and record its wall time when a profiler is active.
+
+    When no profiler is on the current thread the call is dispatched
+    directly with no overhead. When one is active we wrap the call in
+    :func:`time.perf_counter_ns` and :func:`jax.block_until_ready` so
+    the recorded time reflects device-side work rather than just
+    Python dispatch latency.
+
+    Args:
+        task_name: Profiler bucket label.
+        fn: Callable to invoke.
+        *args: Positional arguments for ``fn``.
+
+    Returns:
+        Whatever ``fn(*args)`` returned.
+    """
     prof = _active_profiler()
     if prof is None:
         return fn(*args)
@@ -3873,12 +4506,42 @@ def _edge_transfer_sharding(
     rank_submeshes: list[Any],
     mpmd_mesh: MpMdMesh,
 ) -> Any:
-    """Resolve a marker edge ``PartitionSpec`` on the destination stage mesh."""
+    """Resolve a marker edge ``PartitionSpec`` against the destination rank's sub-mesh.
+
+    Mirrors :func:`_edge_transfer_target` from :mod:`pscan_compiler` but
+    accepts the meshes as explicit parameters so the schedule
+    dispatcher can call it without a full :class:`PscanPlan`. When
+    ``edge_sharding`` is ``None`` the caller's ``fallback_sharding``
+    (the destination rank's replicated sharding) is returned.
+
+    Args:
+        value: The array (or pytree of arrays) being transported —
+            shape information is used to sanitise the spec.
+        edge_sharding: ``PartitionSpec`` declared on the producing
+            :func:`sxstage_iter` marker (or ``None``).
+        fallback_sharding: Sharding to use when ``edge_sharding`` does
+            not apply or the leaf is not array-like.
+        dst_rank: Destination physical rank index.
+        rank_submeshes: Per-rank sub-meshes.
+        mpmd_mesh: The full MPMD mesh (used as the first sanitisation
+            target).
+
+    Returns:
+        Either ``fallback_sharding`` or a (pytree of)
+        :class:`NamedSharding` derived from ``edge_sharding``.
+    """
     if edge_sharding is None:
         return fallback_sharding
     dst_mesh = rank_submeshes[dst_rank]
 
     def leaf_target(leaf: Any) -> Any:
+        """Per-leaf NamedSharding derived from ``edge_sharding`` on ``dst_mesh``.
+
+        Non-array leaves fall back to ``fallback_sharding``. The
+        :class:`PartitionSpec` is sanitised twice — once against the
+        global MPMD mesh (so axes outside the mesh are dropped) and
+        once against the rank-local sub-mesh.
+        """
         if not hasattr(leaf, "shape"):
             return fallback_sharding
         spec = sanitize_partition_spec_for_mesh_and_shape(
@@ -3905,7 +4568,21 @@ def _edge_sharding_for_logical(
     edge_shardings: list[Any] | tuple[Any, ...],
     producer_logical: int,
 ) -> Any:
-    """Return the sharding annotation for the edge leaving ``producer_logical``."""
+    """Look up the marker edge sharding declared by ``producer_logical``.
+
+    ``edge_shardings[i]`` is the ``PartitionSpec`` (or ``None``) carried
+    by the :func:`sxstage_iter` marker that ends logical stage ``i``.
+    Out-of-range indices return ``None`` so the caller can fall through
+    to the destination rank's default sharding.
+
+    Args:
+        edge_shardings: Per-logical-stage edge specs (ordered to match
+            logical stage indices).
+        producer_logical: Index of the producing logical stage.
+
+    Returns:
+        The marker's edge spec or ``None``.
+    """
     if 0 <= producer_logical < len(edge_shardings):
         return edge_shardings[producer_logical]
     return None
@@ -3921,7 +4598,28 @@ def _transfer_target_for_edge(
     rank_submeshes: list[Any],
     mpmd_mesh: MpMdMesh,
 ) -> Any:
-    """Return the destination sharding for a cross-stage activation/cotangent."""
+    """Compute the destination sharding for a cross-stage activation or cotangent.
+
+    Combines :func:`_edge_sharding_for_logical` with
+    :func:`_edge_transfer_sharding`: looks up the producing stage's
+    marker edge sharding and applies it on the destination rank's
+    sub-mesh, falling back to the replicated rank sharding when the
+    edge is unannotated.
+
+    Args:
+        value: The transported array / pytree (used to drive
+            per-leaf spec sanitisation).
+        producer_logical: Logical stage index that produced ``value``.
+        dst_rank: Destination physical rank.
+        edge_shardings: Per-logical-stage marker edge specs.
+        stage_shardings: Per-rank replicated shardings.
+        rank_submeshes: Per-rank sub-meshes.
+        mpmd_mesh: Global MPMD mesh.
+
+    Returns:
+        The sharding (or pytree of shardings) usable with
+        :func:`jax.device_put`.
+    """
     edge_sharding = _edge_sharding_for_logical(edge_shardings, producer_logical)
     return _edge_transfer_sharding(
         value,
@@ -3968,24 +4666,73 @@ def _delete_if_possible(x: Any) -> None:
 
 
 def _is_leaf(x: Any) -> bool:
-    """Treat JAX arrays / Variables as pytree leaves."""
+    """Stop pytree traversal at JAX arrays and Spectrax :class:`Variable` nodes.
+
+    Used as the ``is_leaf`` argument throughout the MPMD runtime so
+    that :class:`Variable` containers (which are themselves pytrees of
+    metadata + array) are kept whole — otherwise their internal
+    metadata leaks out as separate flat-leaf entries and breaks the
+    flat-arg <-> outer-jaxpr-invar correspondence.
+
+    Args:
+        x: Any pytree node.
+
+    Returns:
+        ``True`` when ``x`` is a :class:`jax.Array` or
+        :class:`Variable`.
+    """
     return isinstance(x, jax.Array | Variable)
 
 
 def _is_float0(x: Any) -> bool:
-    """Return true for integer-input cotangents created by ``allow_int=True``."""
+    """Return ``True`` when ``x`` carries the JAX ``float0`` zero-sized sentinel.
+
+    JAX uses ``float0`` to mark cotangents of integer-valued primals
+    (produced when ``allow_int=True`` is passed to autodiff). These
+    leaves cannot participate in arithmetic; the runtime must short
+    them out before scaling or addition.
+
+    Args:
+        x: Any pytree leaf.
+
+    Returns:
+        ``True`` iff ``x.dtype == jax.dtypes.float0``.
+    """
     return getattr(x, "dtype", None) == jax.dtypes.float0
 
 
 def _scale_grad(x: Any, scale: Any) -> Any:
-    """Scale a cotangent while preserving JAX ``float0`` sentinels."""
+    """Multiply ``x`` by ``scale`` unless ``x`` is a ``float0`` sentinel.
+
+    ``float0`` leaves are returned unchanged so the resulting pytree
+    can still be passed back through JAX's autodiff plumbing.
+
+    Args:
+        x: Cotangent leaf.
+        scale: Scalar multiplier.
+
+    Returns:
+        ``x * scale`` for normal arrays, ``x`` for ``float0``.
+    """
     if _is_float0(x):
         return x
     return x * scale
 
 
 def _add_grad(a: Any, b: Any) -> Any:
-    """Add cotangents while treating ``float0`` as an additive zero."""
+    """Add two cotangent leaves treating ``float0`` as the additive identity.
+
+    When either operand is ``float0`` the other is returned untouched.
+    Mirrors JAX's autodiff convention so accumulating grads from
+    integer-input branches does not raise.
+
+    Args:
+        a: First cotangent leaf.
+        b: Second cotangent leaf.
+
+    Returns:
+        ``a + b`` (or whichever operand is non-``float0``).
+    """
     if _is_float0(a):
         return b
     if _is_float0(b):
@@ -3994,7 +4741,22 @@ def _add_grad(a: Any, b: Any) -> Any:
 
 
 def _cast_cotangent_like(cotangent: Any, primal: Any) -> Any:
-    """Cast a cotangent to its primal output dtype before cross-rank transfer."""
+    """Cast ``cotangent`` to its matching ``primal`` dtype before transport.
+
+    Some XLA backends complain when a cotangent's dtype differs from
+    the producer's output dtype; casting here keeps the transport
+    well-typed without forcing the upstream backward jit to widen its
+    grads. ``float0`` cotangents are returned untouched.
+
+    Args:
+        cotangent: The incoming cotangent array.
+        primal: The forward output whose dtype defines the target.
+
+    Returns:
+        ``cotangent`` cast to ``primal.dtype`` (or unchanged when
+        already matching, when one side has no dtype, or when the
+        cotangent is ``float0``).
+    """
     if _is_float0(cotangent):
         return cotangent
     cot_dtype = getattr(cotangent, "dtype", None)
@@ -4005,7 +4767,21 @@ def _cast_cotangent_like(cotangent: Any, primal: Any) -> Any:
 
 
 def _microbatch(x: jax.Array, m: int) -> jax.Array:
-    """Reshape ``x`` (leading axis = batch) into ``(m, batch//m, ...)``."""
+    """Reshape a ``(B, ...)`` array into ``(m, B // m, ...)`` microbatches.
+
+    The leading batch axis is split into ``m`` microbatches of equal
+    size; ``B`` must be evenly divisible by ``m``.
+
+    Args:
+        x: Input array with leading batch dimension.
+        m: Number of microbatches.
+
+    Returns:
+        A new array shaped ``(m, B // m, *x.shape[1:])``.
+
+    Raises:
+        ValueError: If ``B`` is not a multiple of ``m``.
+    """
     b = x.shape[0]
     if b % m:
         raise ValueError(f"Batch size {b} not divisible by number of microbatches {m}.")
@@ -4013,7 +4789,21 @@ def _microbatch(x: jax.Array, m: int) -> jax.Array:
 
 
 def _split_params_rest(state: State) -> tuple[State, State]:
-    """Split ``state`` into ``(params, rest)``: only params differentiate."""
+    """Partition a :class:`State` into differentiable params and the remainder.
+
+    The MPMD runtime treats the ``"parameters"`` collection as the
+    grad-bearing portion and everything else (e.g. RNG state, batch
+    norm running stats) as ``rest``. Splitting up front lets each
+    stage's forward / backward jits accept ``params`` as the gradient
+    target without touching the rest.
+
+    Args:
+        state: The full module state.
+
+    Returns:
+        ``(params_state, rest_state)`` — each a :class:`State` with
+        the corresponding subset of collections.
+    """
     raw = state.raw()
     params_raw: dict[str, dict[str, Any]] = {}
     rest_raw: dict[str, dict[str, Any]] = {}
@@ -4066,7 +4856,21 @@ def _get_vmap_loss_and_g_y(
     loss_fn: Callable[..., jax.Array],
     donate_argnums: tuple[int, ...] = (),
 ) -> Callable[..., Any]:
-    """Return the cached vmap'd ``(y_stack, *t_stack) -> (loss_stack, g_y_stack)``."""
+    """Return a cached jit that vmaps ``loss_fn`` + ``d_loss/d_y`` over microbatches.
+
+    The wrapper takes ``y_stack`` of shape ``(M, ...)`` plus matching
+    target stacks and returns ``(loss_stack, g_y_stack)``. Used by the
+    GPipe vmap fast-path to compute every microbatch's loss/cotangent
+    in a single device-side launch. Cached on
+    ``(id(loss_fn), donate_argnums)`` in :data:`_VMAP_LOSS_CACHE`.
+
+    Args:
+        loss_fn: User loss callable ``(y, *targets) -> scalar``.
+        donate_argnums: Argnums whose buffers may be donated.
+
+    Returns:
+        Jitted ``(y_stack, *t_stack) -> (loss_stack, g_y_stack)``.
+    """
     key = (id(loss_fn), donate_argnums)
     cached = _VMAP_LOSS_CACHE.get(key)
     if cached is not None:
@@ -4076,10 +4880,21 @@ def _get_vmap_loss_and_g_y(
 
         @functools.partial(jax.jit, donate_argnums=donate_argnums)
         def vmap_loss(y_stack, *t_stack):
-            """Jitted vmap of ``(loss, d_loss/d_y)`` over the microbatch axis."""
+            """Vmap ``per_mb`` over the leading microbatch axis under one jit.
+
+            Returns ``(loss_stack, g_y_stack)`` with leading axis ``M``;
+            both per-mb losses and per-mb cotangents are produced in
+            one compiled program so the GPipe fast-path can fuse the
+            terminal forward, loss, and backward.
+            """
 
             def per_mb(y_, *t_):
-                """Per-microbatch ``(loss, g_y)`` via ``value_and_grad``."""
+                """Compute ``(loss, d_loss/d_y)`` for a single microbatch slice.
+
+                Wrapped in :func:`jax.vmap` upstream so this body sees
+                one microbatch at a time even though the input tensors
+                are the full ``(M, ...)`` stacks.
+                """
                 return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
             return jax.vmap(per_mb)(y_stack, *t_stack)
@@ -4088,10 +4903,21 @@ def _get_vmap_loss_and_g_y(
 
         @jax.jit
         def vmap_loss(y_stack, *t_stack):
-            """Jitted vmap of ``(loss, d_loss/d_y)`` over the microbatch axis."""
+            """Vmap ``per_mb`` over the leading microbatch axis under one jit.
+
+            Returns ``(loss_stack, g_y_stack)`` with leading axis ``M``;
+            both per-mb losses and per-mb cotangents are produced in
+            one compiled program so the GPipe fast-path can fuse the
+            terminal forward, loss, and backward.
+            """
 
             def per_mb(y_, *t_):
-                """Per-microbatch ``(loss, g_y)`` via ``value_and_grad``."""
+                """Compute ``(loss, d_loss/d_y)`` for a single microbatch slice.
+
+                Wrapped in :func:`jax.vmap` upstream so this body sees
+                one microbatch at a time even though the input tensors
+                are the full ``(M, ...)`` stacks.
+                """
                 return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
             return jax.vmap(per_mb)(y_stack, *t_stack)
@@ -4103,7 +4929,20 @@ def _get_vmap_loss_and_g_y(
 
 @jax.jit
 def _vmap_sum_grads(g_stack):
-    """Sum per-microbatch grads along the leading axis."""
+    """Sum a per-microbatch gradient stack along its leading axis.
+
+    The GPipe vmap fast-path produces gradients shaped
+    ``(M, *param_shape)`` because each microbatch contributes
+    independently. Summing along axis 0 collapses the stack into the
+    same parameter shape as a serial accumulation would yield.
+
+    Args:
+        g_stack: Pytree of arrays whose leading axis indexes
+            microbatches.
+
+    Returns:
+        Pytree of arrays with the leading axis summed away.
+    """
     return jax.tree.map(lambda x: x.sum(axis=0), g_stack, is_leaf=_is_leaf)
 
 
@@ -4121,13 +4960,37 @@ def _accumulate_state(acc, add):
 
 @jax.jit
 def _accumulate_grad_tree(acc, add):
-    """Compiled pytree gradient add that preserves ``float0`` sentinels."""
+    """Add two grad pytrees leaf-wise under a cached jit, preserving ``float0``.
+
+    Module-scope so JAX's trace cache reuses the compiled HLO across
+    every :func:`sxcall` invocation that handles the same param tree
+    shape.
+
+    Args:
+        acc: Running gradient accumulator pytree.
+        add: New gradient contribution to fold in.
+
+    Returns:
+        ``acc + add`` leaf-wise, with ``float0`` leaves treated as
+        additive zero.
+    """
     return jax.tree.map(_add_grad, acc, add, is_leaf=_is_leaf)
 
 
 @jax.jit
 def _scale_grad_tree(state, scalar):
-    """Compiled pytree gradient scale that preserves ``float0`` sentinels."""
+    """Scale every leaf of a grad pytree by ``scalar`` under a cached jit.
+
+    Companion to :func:`_accumulate_grad_tree`; ``float0`` leaves
+    pass through unchanged so integer-input branches stay valid.
+
+    Args:
+        state: Pytree of grad leaves.
+        scalar: Multiplier (typically ``1/M``).
+
+    Returns:
+        Grad pytree with each leaf scaled.
+    """
     return jax.tree.map(lambda x: _scale_grad(x, scalar), state, is_leaf=_is_leaf)
 
 
@@ -4144,7 +5007,20 @@ def _zeros_like_state(state):
 
 @jax.jit
 def _scale_state(state, scalar):
-    """Module-level cached ``state * scalar`` leaf-wise."""
+    """Multiply every array leaf of ``state`` by ``scalar`` under one jit.
+
+    Used to apply the ``1/M`` mean-loss / mean-grad scaling. Defined at
+    module scope so JAX's trace cache hits across every :func:`sxcall`
+    invocation with the same state pytree shape.
+
+    Args:
+        state: Pytree of arrays (or :class:`State` /
+            :class:`Variable`-leaved tree).
+        scalar: Multiplicative factor (typically ``1.0 / M``).
+
+    Returns:
+        Same pytree structure with every array leaf scaled.
+    """
     return jax.tree.map(lambda g: g * scalar, state, is_leaf=_is_leaf)
 
 
@@ -4171,10 +5047,15 @@ def _get_loss_and_g_y(
 
             @functools.partial(jax.jit, donate_argnums=donate_argnums)
             def loss_and_g_y(y, *targets):
-                """``(loss, d_loss/d_y, aux)`` with aux passthrough."""
+                """Return ``(loss, d_loss/d_y, aux)`` for an aux-returning loss.
+
+                The auxiliary pytree is passed through unchanged so the
+                caller can accumulate it across microbatches without
+                running a second pass through the loss.
+                """
 
                 def local_loss(y_):
-                    """Loss with aux: returns ``(scalar, aux)``."""
+                    """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``."""
                     return loss_fn(y_, *targets)
 
                 (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
@@ -4184,10 +5065,15 @@ def _get_loss_and_g_y(
 
             @jax.jit
             def loss_and_g_y(y, *targets):
-                """``(loss, d_loss/d_y, aux)`` with aux passthrough."""
+                """Return ``(loss, d_loss/d_y, aux)`` for an aux-returning loss.
+
+                The auxiliary pytree is passed through unchanged so the
+                caller can accumulate it across microbatches without
+                running a second pass through the loss.
+                """
 
                 def local_loss(y_):
-                    """Loss with aux: returns ``(scalar, aux)``."""
+                    """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``."""
                     return loss_fn(y_, *targets)
 
                 (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
@@ -4198,10 +5084,14 @@ def _get_loss_and_g_y(
 
             @functools.partial(jax.jit, donate_argnums=donate_argnums)
             def loss_and_g_y(y, *targets):
-                """Scalar ``(loss, d_loss/d_y)``."""
+                """Return ``(loss, d_loss/d_y)`` for a plain scalar-loss callable.
+
+                ``targets`` are bound at call time; the returned grad
+                is taken with respect to ``y`` only.
+                """
 
                 def local_loss(y_):
-                    """Scalar loss on ``y_``."""
+                    """Scalar loss closure passed to :func:`jax.value_and_grad`."""
                     return loss_fn(y_, *targets)
 
                 return jax.value_and_grad(local_loss)(y)
@@ -4210,10 +5100,14 @@ def _get_loss_and_g_y(
 
             @jax.jit
             def loss_and_g_y(y, *targets):
-                """Scalar ``(loss, d_loss/d_y)``."""
+                """Return ``(loss, d_loss/d_y)`` for a plain scalar-loss callable.
+
+                ``targets`` are bound at call time; the returned grad
+                is taken with respect to ``y`` only.
+                """
 
                 def local_loss(y_):
-                    """Scalar loss on ``y_``."""
+                    """Scalar loss closure passed to :func:`jax.value_and_grad`."""
                     return loss_fn(y_, *targets)
 
                 return jax.value_and_grad(local_loss)(y)
@@ -4278,7 +5172,17 @@ def _build_stage_callables(
 
         @functools.partial(jax.jit, donate_argnums=donate_fwd)
         def fwd_only(params, rest, x):
-            """Forward pass through the stage."""
+            """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
+
+            Args:
+                params: The differentiable parameter :class:`State`
+                    placed on this rank.
+                rest: Non-parameter state (overlaid on ``params``).
+                x: Stage input activation.
+
+            Returns:
+                The stage's output activation.
+            """
             module = bind(gdef, params.overlay(rest))
             return module(x)
 
@@ -4286,7 +5190,17 @@ def _build_stage_callables(
 
         @jax.jit
         def fwd_only(params, rest, x):
-            """Forward pass through the stage."""
+            """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
+
+            Args:
+                params: The differentiable parameter :class:`State`
+                    placed on this rank.
+                rest: Non-parameter state (overlaid on ``params``).
+                x: Stage input activation.
+
+            Returns:
+                The stage's output activation.
+            """
             module = bind(gdef, params.overlay(rest))
             return module(x)
 
@@ -4303,7 +5217,13 @@ def _build_stage_callables(
             """
 
             def stage_fn(p, r, xi):
-                """Stage forward parameterized by (p, r, xi) for vjp."""
+                """Pure forward closure used as the :func:`jax.vjp` target.
+
+                Re-binds the stage from ``gdef`` on every call so the
+                VJP can differentiate through fresh leaves rather than
+                the captured originals (necessary because :func:`vjp`
+                tracks the identity of its inputs).
+                """
                 return bind(gdef, p.overlay(r))(xi)
 
             _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
@@ -4323,7 +5243,13 @@ def _build_stage_callables(
             """
 
             def stage_fn(p, r, xi):
-                """Stage forward parameterized by (p, r, xi) for vjp."""
+                """Pure forward closure used as the :func:`jax.vjp` target.
+
+                Re-binds the stage from ``gdef`` on every call so the
+                VJP can differentiate through fresh leaves rather than
+                the captured originals (necessary because :func:`vjp`
+                tracks the identity of its inputs).
+                """
                 return bind(gdef, p.overlay(r))(xi)
 
             _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
@@ -4933,7 +5859,20 @@ def _forward_only_run(
     """
 
     def _get_vfwd(loc: tuple[int, int]) -> Callable[..., Any]:
-        """Return a cached vmapped forward jit for location ``loc``."""
+        """Return (and cache) a vmapped forward jit for stage ``loc``.
+
+        Wraps the location's ``fwd_jit`` in :func:`jax.vmap` over the
+        microbatch axis (axis 0 of the input activation; ``params`` and
+        ``rest`` are broadcast). The result is memoised in
+        :data:`_FWD_ONLY_VMAP_CACHE` keyed by the underlying jit's
+        ``id``.
+
+        Args:
+            loc: ``(rank, virt)`` location for the stage.
+
+        Returns:
+            A jitted ``(params, rest, x_stack) -> y_stack`` callable.
+        """
         key = id(fwd_jits[loc])
         cached = _FWD_ONLY_VMAP_CACHE.get(key)
         if cached is not None:
@@ -5044,7 +5983,15 @@ def _gpipe_run(
 
         @functools.partial(jax.jit, static_argnames=("inv_m_const",))
         def vbwd(p, r, x_stack, gy_stack, inv_m_const):
-            """Jitted vmapped backward with inline per-param 1/M scaling."""
+            """Vmapped backward that also folds the ``1/M`` mean-grad scaling in.
+
+            The per-microbatch param grads are summed along the
+            leading axis and scaled by ``inv_m_const`` (a Python float
+            so XLA can bake it into the HLO via ``static_argnames``).
+            Activation cotangents (``g_x_stack``) are returned per
+            microbatch so the next upstream stage can vmap straight on
+            them.
+            """
             g_params_stack, g_x_stack = base_vbwd(p, r, x_stack, gy_stack)
             g_params = jax.tree.map(
                 lambda a: (a.sum(axis=0) * inv_m_const).astype(a.dtype),
@@ -5076,11 +6023,21 @@ def _gpipe_run(
 
         @functools.partial(jax.jit, static_argnames=("inv_m_const",))
         def fwd_loss_bwd(p, r, x_in_stack, *t_stack, inv_m_const):
-            """Fused forward + loss + backward for the terminal stage."""
+            """Run forward, loss, and backward for the terminal stage in one HLO.
+
+            Operates on full ``(M, ...)`` microbatch stacks: the
+            forward and backward halves are vmapped, the loss runs per
+            microbatch via :func:`jax.value_and_grad`, and the per-mb
+            grads are summed + scaled by ``inv_m_const`` (baked-in
+            static value) before returning.
+
+            Returns:
+                ``(mean_loss, g_params, g_x_stack)``.
+            """
             y_stack = base_fwd_vmapped(p, r, x_in_stack)
 
             def per_mb_loss(y_, *t_):
-                """Per-microbatch ``(loss, g_y)`` via value_and_grad."""
+                """Compute ``(loss, d_loss/d_y)`` for one microbatch under vmap."""
                 return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
             loss_stack, gy_stack = jax.vmap(per_mb_loss)(y_stack, *t_stack)
@@ -5194,7 +6151,26 @@ def _gpipe_run(
 
 
 def _prev_loc(schedule: Schedule, rank: int, virt: int, n: int) -> tuple[int, int]:
-    """Inverse of :meth:`Schedule.next_logical_loc` — where is ``logical - 1``."""
+    """Find the ``(rank, virt)`` location whose logical stage is ``logical - 1``.
+
+    Used when a backward sweep needs to send cotangents upstream: the
+    schedule provides ``next_logical_loc`` for forward routing, but
+    backward routing needs the inverse. Falls back to a linear scan
+    over ``(rank, virt)`` slots.
+
+    Args:
+        schedule: The active :class:`Schedule`.
+        rank: Current physical rank.
+        virt: Current virtual sub-stage.
+        n: Number of physical pipeline ranks.
+
+    Returns:
+        ``(prev_rank, prev_virt)`` hosting the previous logical stage.
+
+    Raises:
+        ValueError: If no slot maps to ``logical - 1`` under
+            ``schedule``.
+    """
     logical = schedule.logical_at(rank, virt, n)
     prev_logical = logical - 1
     V = schedule.virtual_stages_per_rank()
@@ -5206,7 +6182,27 @@ def _prev_loc(schedule: Schedule, rank: int, virt: int, n: int) -> tuple[int, in
 
 
 def _loc_for_logical(schedule: Schedule, logical: int, n: int, V: int) -> tuple[int, int]:
-    """Return the ``(rank, virt)`` hosting ``logical``."""
+    """Return the ``(rank, virt)`` location that hosts logical stage ``logical``.
+
+    Inverts ``schedule.logical_at`` by linear scan over the
+    ``(rank, virt)`` grid. Used by callers that have a logical stage
+    index in hand and need to dispatch to the corresponding physical
+    location.
+
+    Args:
+        schedule: The active :class:`Schedule`.
+        logical: Logical stage index in ``[0, n * V)``.
+        n: Number of physical pipeline ranks.
+        V: Virtual stages per rank
+            (``schedule.virtual_stages_per_rank()``).
+
+    Returns:
+        ``(rank, virt)`` for the requested logical stage.
+
+    Raises:
+        ValueError: If no ``(rank, virt)`` maps to ``logical`` under
+            ``schedule``.
+    """
     for r in range(n):
         for v in range(V):
             if schedule.logical_at(r, v, n) == logical:

@@ -74,7 +74,14 @@ class _Empty:
     """
 
     def __repr__(self) -> str:
-        """Return ``"NOT_GIVEN"`` so the sentinel prints meaningfully."""
+        """Return the literal string ``"NOT_GIVEN"``.
+
+        Overridden so error messages and tracebacks render the sentinel
+        as ``NOT_GIVEN`` rather than ``<_Empty object at 0x...>``.
+
+        Returns:
+            The string ``"NOT_GIVEN"``.
+        """
         return "NOT_GIVEN"
 
 

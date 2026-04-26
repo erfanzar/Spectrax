@@ -26,9 +26,9 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
-from examples.llama import FSDP_TP_RULES, Llama3, Llama3Block, Llama3Config
 
 import spectrax as spx
+from examples.models.llama import FSDP_TP_RULES, Llama3, Llama3Block, Llama3Config
 from spectrax import nn
 from spectrax.sharding import logical_axis_rules
 
@@ -45,7 +45,7 @@ class RematLlama3(Llama3):
     def __init__(self, cfg: Llama3Config, *, rngs: spx.Rngs):
         """Build embed / remat-wrapped blocks / lm-head submodules."""
         spx.Module.__init__(self)
-        from examples.llama import Llama3Embed, Llama3LMHead
+        from examples.models.llama import Llama3Embed, Llama3LMHead
 
         self.embed = Llama3Embed(cfg, rngs=rngs)
         self.blocks = nn.ModuleList([RematBlock(cfg, rngs=rngs) for _ in range(cfg.n_layers)])

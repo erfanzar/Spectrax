@@ -2,7 +2,16 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Scaled dot-product attention primitive."""
+"""Scaled dot-product attention primitive.
+
+Implements the standard ``softmax(QK^T / sqrt(d)) V`` flavor used by
+multi-head attention. Inputs are expected in the
+``(..., seq, head_dim)`` layout that SpectraX uses everywhere — the
+trailing two axes are the per-token feature axis and the per-head
+features; all leading axes (batch, head, etc.) broadcast and are
+preserved in the output. Optional masks, causality, custom scale, and
+attention-weight dropout are all supported in a single fused path.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +20,7 @@ import math
 import jax
 import jax.numpy as jnp
 
+from ..common_types import DEFAULT_MASK_VALUE
 from ..core._typing import Array, ArrayLike, PRNGKey
 
 
@@ -53,15 +63,16 @@ def scaled_dot_product_attention(
     d = qa.shape[-1]
     s = scale if scale is not None else 1.0 / math.sqrt(d)
     logits = jnp.einsum("...qd,...kd->...qk", qa, ka) * s
+    mask_fill = jnp.asarray(DEFAULT_MASK_VALUE, dtype=logits.dtype)
     if is_causal:
         q_len = qa.shape[-2]
         k_len = ka.shape[-2]
         causal = jnp.tril(jnp.ones((q_len, k_len), dtype=jnp.bool_), k=k_len - q_len)
-        logits = jnp.where(causal, logits, jnp.finfo(logits.dtype).min)
+        logits = jnp.where(causal, logits, mask_fill)
     if mask is not None:
         m = jnp.asarray(mask)
         if m.dtype == jnp.bool_:
-            logits = jnp.where(m, logits, jnp.finfo(logits.dtype).min)
+            logits = jnp.where(m, logits, mask_fill)
         else:
             logits = logits + m
     attn = jax.nn.softmax(logits, axis=-1)

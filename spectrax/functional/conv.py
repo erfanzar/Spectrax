@@ -2,7 +2,18 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""N-dimensional convolution over channels-last inputs."""
+"""N-dimensional convolution over channels-last inputs.
+
+Both :func:`conv` and :func:`conv_transpose` follow the
+``(N, *spatial, C)`` layout used throughout SpectraX (matching Flax /
+Keras / TF). The kernel layout is ``(*kernel_spatial, C_in_per_group, C_out)``,
+so a 2-D 3x3 conv with 16 input channels (single-group) and 32 output
+channels has kernel shape ``(3, 3, 16, 32)``.
+
+The dimension-spec strings used inside both functions
+(``"NHWC"`` / ``"HWIO"``) are constructed from a fixed alphabet so the
+helpers work for 1-D, 2-D, 3-D, and arbitrary higher-N spatial inputs.
+"""
 
 from __future__ import annotations
 
@@ -14,8 +25,15 @@ import jax.numpy as jnp
 from ..core._typing import Array, ArrayLike
 
 PaddingSpec = str | Sequence[tuple[int, int]]
-"""Either a padding mode (``"SAME"`` / ``"VALID"``) or a per-axis ``(lo, hi)``
-pair sequence.
+"""Padding specification accepted by :func:`conv` / :func:`conv_transpose`.
+
+Either:
+
+* a string padding mode forwarded to JAX (``"SAME"`` keeps the spatial
+  output the same size as the input under unit stride; ``"VALID"`` drops
+  any partial windows), or
+* an explicit per-spatial-axis sequence of ``(lo, hi)`` integer pairs
+  giving the number of zero-padded elements on each side.
 """
 
 
@@ -92,7 +110,23 @@ def conv_transpose(
     * Kernel ``w``: ``(*kernel_spatial, C_in, C_out)``.
     * Output: ``(N, *spatial_out, C_out)``.
 
-    Uses :func:`jax.lax.conv_transpose` under the hood.
+    Forwards to :func:`jax.lax.conv_transpose` with
+    ``transpose_kernel=False`` so the kernel dimension layout matches the
+    forward :func:`conv`. Strides act as *upsampling* factors (the
+    spatial output is roughly ``stride * spatial_in``); dilations enlarge
+    the kernel's receptive field.
+
+    Args:
+        x: Input tensor, shape ``(N, *spatial, C_in)``.
+        w: Convolution kernel, shape ``(*kernel_spatial, C_in, C_out)``.
+        b: Optional bias of shape ``(C_out,)`` added to the output.
+        stride: Per-axis upsampling factor (int broadcasts to all axes).
+        padding: See :data:`PaddingSpec`.
+        dilation: Per-axis kernel dilation.
+
+    Returns:
+        The transposed-convolved tensor of shape
+        ``(N, *spatial_out, C_out)`` with optional bias added.
     """
     xa = jnp.asarray(x)
     wa = jnp.asarray(w)

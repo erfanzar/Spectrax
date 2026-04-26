@@ -2,7 +2,18 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""1F1B-family schedules: Std1F1B, Eager1F1B, _Std1F1BWarmupBumped."""
+"""1F1B-family schedules: :class:`Std1F1B`, :class:`Eager1F1B`, plus internal warmup-bumped variant.
+
+After a warmup that fills the pipe with forwards, every stage
+alternates one forward and one backward, then drains. The variants
+in this module differ only in the per-stage warmup length:
+
+* :class:`Std1F1B` uses ``min(n - s, m)`` (Megatron-LM standard).
+* :class:`Eager1F1B` uses ``2(n - s) - 1`` so the first backward
+  fires sooner.
+* :class:`_Std1F1BWarmupBumped` is an internal helper used by
+  :class:`KimiK2`.
+"""
 
 from __future__ import annotations
 
@@ -41,7 +52,22 @@ class Std1F1B(Schedule):
     """
 
     def _warmup(self, s: int, n: int, m: int) -> int:
-        """Per-stage warmup length; subclasses override for eager variants."""
+        """Per-stage warmup length (number of forwards before steady state).
+
+        Default is ``min(n - s, m)``: stage 0 warms up for ``n``
+        forwards, stage 1 for ``n - 1``, ..., stage ``n - 1`` for one.
+        Subclasses (:class:`Eager1F1B`, :class:`_Std1F1BWarmupBumped`)
+        override for variants that pull more forwards into warmup.
+
+        Args:
+            s: Stage index in ``[0, n)``.
+            n: Number of stages.
+            m: Number of microbatches.
+
+        Returns:
+            Warmup length (number of forward actions to enqueue
+            before steady-state alternation begins).
+        """
         return min(n - s, m)
 
     def build(self, n_stages: int) -> list[list[Action | None]]:
@@ -119,7 +145,21 @@ class Std1F1B(Schedule):
         return grid
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak is the warmup length for the first stage: ``n_stages``."""
+        """Peak live activations per stage equals ``n_stages``.
+
+        Stage 0 holds ``n_stages`` saved activations at the moment
+        warmup completes (one for each forward in flight); subsequent
+        stages hold strictly fewer. Crucially this is independent of
+        :attr:`microbatches` — the key memory advantage over
+        :class:`GPipe`.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``n_stages`` — bound on simultaneous saved activations
+            on the worst-case stage (stage 0).
+        """
         return n_stages
 
 
@@ -145,11 +185,33 @@ class Eager1F1B(Std1F1B):
     """
 
     def _warmup(self, s: int, n: int, m: int) -> int:
-        """Extended warmup: ``2(n - s) - 1`` forwards, capped at ``m``."""
+        """Extended warmup: ``2(n - s) - 1`` forwards, capped at ``m``.
+
+        Roughly twice the standard 1F1B warmup so the pipeline fills
+        more aggressively before the first backward fires.
+
+        Args:
+            s: Stage index.
+            n: Number of stages.
+            m: Number of microbatches.
+
+        Returns:
+            Eager warmup length, clamped to ``[0, m]``.
+        """
         return max(0, min(2 * (n - s) - 1, m))
 
     def peak_activations(self, n_stages: int) -> int:
-        """Peak ≈ ``2 * n_stages - 1`` (at stage 0 after full warmup)."""
+        """Peak ≈ ``2 * n_stages - 1`` saved activations on stage 0.
+
+        The longer warmup means stage 0 holds more in-flight forwards
+        at once. Still ``M``-independent provided ``M >= 2n - 1``.
+
+        Args:
+            n_stages: Number of physical pipeline ranks.
+
+        Returns:
+            ``min(2 * n_stages - 1, microbatches)``.
+        """
         return min(2 * n_stages - 1, self.microbatches)
 
 
@@ -169,6 +231,20 @@ class _Std1F1BWarmupBumped(Std1F1B):
     extra_warmup: int = 1
 
     def _warmup(self, s: int, n: int, m: int) -> int:
-        """Return the base :class:`Std1F1B` warmup plus ``extra_warmup`` (capped at ``m``)."""
+        """Return the base :class:`Std1F1B` warmup plus :attr:`extra_warmup` (capped at ``m``).
+
+        Bumps every stage's warmup by the same constant — the
+        building block :class:`KimiK2` uses to express its per-rank
+        +1 forward at the logical-stage level without bookkeeping the
+        physical mapping itself.
+
+        Args:
+            s: Stage index.
+            n: Number of stages.
+            m: Number of microbatches.
+
+        Returns:
+            Bumped warmup, clamped to ``[0, m]``.
+        """
         base = super()._warmup(s, n, m)
         return min(base + self.extra_warmup, m)

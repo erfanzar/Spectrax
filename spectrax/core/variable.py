@@ -84,7 +84,15 @@ def _maybe_stamped_sharding(value: Any) -> Sharding | None:
 
 
 def _existing_value_sharding(value: Any) -> Any | None:
-    """Return the concrete sharding already carried by ``value``, if any."""
+    """Return the concrete sharding already carried by ``value``, if any.
+
+    Tracers carry only a derived/origin sharding — accessing it triggers
+    ``find_progenitors`` over the entire jaxpr, which is O(jaxpr-size)
+    per call and O(N^2) when initializing many variables inside one
+    ``jax.eval_shape`` (e.g. lazy model construction). Skip them.
+    """
+    if isinstance(value, jax.core.Tracer):
+        return None
     return getattr(value, "sharding", None)
 
 
@@ -135,10 +143,29 @@ _INIT_PLACEMENT_HOOKS: threading.local = threading.local()
 def variable_init_placement(hook: InitPlacementHook) -> Iterator[None]:
     """Install a metadata-driven placement hook for new variable values.
 
-    The hook receives ``(value, metadata, explicit_sharding)`` after dtype
-    coercion and before the built-in SpectraX mesh fallback runs. Return a
-    placed value to claim the initialization, or ``None`` to let SpectraX
-    continue with its default behavior.
+    The hook is invoked from :func:`_initialize_value` for every freshly
+    constructed variable — after dtype coercion, before the built-in
+    SpectraX mesh fallback. Returning a non-``None`` value claims the
+    initialization and that returned value becomes the variable's
+    storage. Returning ``None`` defers to the default placement
+    behavior. Hooks stack: nested ``with`` blocks layer additional
+    hooks on top of the outer ones, but only the innermost hook is
+    consulted (subsequent hooks may opt back in by re-entering the
+    context).
+
+    The hook signature is
+    ``(value, metadata, explicit_sharding) -> Any | None`` where
+    ``explicit_sharding`` is ``True`` when the variable's constructor
+    received an explicit ``sharding=`` argument.
+
+    Args:
+        hook: Callable matching :data:`InitPlacementHook`.
+
+    Yields:
+        ``None``. The hook is uninstalled on exit.
+
+    Raises:
+        TypeError: If ``hook`` is not callable.
     """
     if not callable(hook):
         raise TypeError("variable_init_placement expected a callable hook")
@@ -232,15 +259,21 @@ class Variable:
     ) -> None:
         """Construct a reference cell wrapping ``value``.
 
+        Stamps the variable with an active :func:`assign_stage` hint
+        when the subclass opts in (:attr:`inherit_stage_assignment`)
+        and no pipeline-stage entry is already present in
+        ``metadata``. Initializes the observer list as empty.
+
         Args:
             value: The initial array (or array-like). Not coerced here;
-              subclasses that need coercion do it themselves.
-            kind: Override the default collection. ``None`` falls back to
-              :attr:`default_kind`.
-            metadata: Free-form per-variable metadata. A shallow copy is
-              made.
-            ref_id: An explicit ``ref_id`` to adopt. When ``None``
-              (the common case) a fresh id is allocated.
+                subclasses that need coercion do it themselves.
+            kind: Override the default collection. ``None`` falls back
+                to :attr:`default_kind`.
+            metadata: Free-form per-variable metadata. A shallow copy
+                is made; ``None`` is treated as an empty dict.
+            ref_id: An explicit ``ref_id`` to adopt. When ``None`` (the
+                common case) a fresh process-unique id is allocated
+                via :func:`_fresh_ref_id`.
         """
         self._value = value
         self.kind = kind if kind is not None else type(self).default_kind
@@ -710,11 +743,35 @@ class DeferredParameter(Parameter):
     ) -> None:
         """Construct a deferred parameter with a (possibly partial) shape spec.
 
-        Stores the initializer, RNG handle, and dtype for later use;
+        Stores the initializer, RNG handle, and dtype for later use and
         installs a single-element zero placeholder so the variable is
-        a valid pytree leaf right away. Shape resolution is performed
-        lazily by :meth:`resolve_shape`, then :meth:`materialize`
-        replaces the placeholder with the real initialized array.
+        immediately a valid pytree leaf. Shape resolution is performed
+        lazily by :meth:`resolve_shape` (typically driven by the first
+        forward pass that observes a real input shape), then
+        :meth:`materialize` replaces the placeholder with the real
+        initialized array.
+
+        Args:
+            shape_spec: Per-dimension shape specification. Entries may
+                be concrete ``int`` sizes or ``None`` placeholders to
+                be resolved later from observed input shapes; the rank
+                fixes the parameter's rank.
+            init: Initializer callable matching the
+                :class:`~spectrax.core.typing.Initializer` signature
+                ``(rngs, shape, dtype) -> Array``.
+            rngs: First positional argument forwarded to ``init``;
+                typically an :class:`~spectrax.Rngs` handle.
+            dtype: Storage dtype. Used for both the placeholder and
+                the materialized array.
+            sharding: Optional sharding spec; recorded in metadata.
+            axis_names: Optional logical axis names; recorded in
+                metadata.
+            trainable: ``True`` (default) routes the variable to the
+                ``"parameters"`` collection; ``False`` routes it to
+                ``"buffers"``.
+            metadata: Additional metadata merged into
+                :attr:`Variable.metadata`.
+            ref_id: Optional explicit ``ref_id`` to adopt.
         """
         meta: dict[str, Any] = dict(metadata) if metadata else {}
         if sharding is not None:
@@ -737,7 +794,15 @@ class DeferredParameter(Parameter):
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
         """Set the concrete shape.
 
-        Raises if the resolved rank disagrees with the specification.
+        No-op once the parameter has been materialized.
+
+        Args:
+            shape: Concrete shape tuple. Must have the same length as
+                the original ``shape_spec`` so the rank is preserved.
+
+        Raises:
+            ValueError: If ``shape`` has a different rank than
+                ``shape_spec``.
         """
         if self.is_materialized:
             return
@@ -746,7 +811,17 @@ class DeferredParameter(Parameter):
         self._deferred_resolved_shape = tuple(int(s) for s in shape)
 
     def materialize(self) -> None:
-        """Call the stored initializer and replace the placeholder value."""
+        """Call the stored initializer and replace the placeholder value.
+
+        Runs ``init(rngs, resolved_shape, dtype)`` and stores the
+        result through :func:`_initialize_value`, so any active
+        sharding metadata or placement hook is honored. Idempotent —
+        repeated calls after the first materialization are no-ops.
+
+        Raises:
+            RuntimeError: If :meth:`resolve_shape` has not yet been
+                called.
+        """
         if self.is_materialized:
             return
         if getattr(self, "_deferred_resolved_shape", None) is None:
@@ -796,11 +871,25 @@ class DeferredBuffer(Buffer):
         metadata: dict[str, Any] | None = None,
         ref_id: int | None = None,
     ) -> None:
-        """Construct a deferred buffer (mirror of :class:`DeferredParameter`'s ``__init__``).
+        """Construct a deferred buffer.
 
         Same lazy semantics as :class:`DeferredParameter` but creates
-        a non-trainable :class:`Buffer`. Optional ``kind`` overrides
-        the buffer's collection name (defaults to ``"buffers"``).
+        a non-trainable :class:`Buffer`.
+
+        Args:
+            shape_spec: Per-dimension shape specification with
+                ``None`` placeholders for as-yet-unknown sizes.
+            init: Initializer callable
+                ``(rngs, shape, dtype) -> Array``.
+            rngs: First positional argument forwarded to ``init``.
+            dtype: Storage dtype.
+            kind: Optional override for the buffer's collection name;
+                defaults to ``"buffers"``.
+            sharding: Optional sharding spec; recorded in metadata.
+            axis_names: Optional logical axis names; recorded in
+                metadata.
+            metadata: Additional metadata.
+            ref_id: Optional explicit ``ref_id`` to adopt.
         """
         meta: dict[str, Any] = dict(metadata) if metadata else {}
         if sharding is not None:
@@ -862,9 +951,50 @@ def _initialize_value(
     metadata: dict[str, Any],
     explicit_sharding: bool,
 ) -> Any:
-    """Coerce ``value`` and apply constructor-time sharding when available."""
+    """Coerce ``value`` and apply constructor-time sharding when available.
+
+    Pipeline:
+
+    1. Run ``value`` through :func:`_coerce_value` to honor an explicit
+       ``dtype`` while preserving any sharding the value already carries.
+    2. Short-circuit on tracers — under abstract evaluation the
+       ``.sharding`` probe is O(jaxpr-size) and must be skipped.
+    3. Consult any active :func:`variable_init_placement` hook; the
+       hook's non-``None`` return value claims the placement.
+    4. Otherwise fall back to the spectrax mesh: if a current mesh
+       resolves the metadata to a :class:`~jax.sharding.NamedSharding`,
+       :func:`jax.device_put` the value onto that sharding (unless the
+       value already carries an equivalent sharding and no explicit
+       override was requested).
+
+    Args:
+        value: The raw initial value (Python scalar, NumPy / JAX array,
+            tracer, …).
+        dtype: Optional explicit storage dtype. ``None`` preserves the
+            value's existing dtype.
+        metadata: The variable's metadata dict; consulted for sharding
+            and pipeline-stage hints.
+        explicit_sharding: ``True`` when the caller passed
+            ``sharding=`` to the variable constructor; controls
+            whether an existing sharding on ``value`` may be
+            overridden.
+
+    Returns:
+        Either ``value`` unchanged or a placed copy on the resolved
+        sharding.
+    """
     arr = _coerce_value(value, dtype)
     if not hasattr(arr, "shape") or not hasattr(arr, "dtype"):
+        return arr
+
+    # Under abstract evaluation (jax.eval_shape, e.g. lazy model
+    # construction) ``arr`` is a Tracer. Device placement on a tracer is
+    # meaningless, and reading its ``.sharding`` triggers JAX's
+    # ``find_progenitors`` walk over the entire growing jaxpr — fatal for
+    # large modules (O(N^2) over parameter count). Skip the hook and the
+    # downstream sharding probing entirely so all placement hooks are
+    # protected without requiring each hook to defend itself.
+    if isinstance(arr, jax.core.Tracer):
         return arr
 
     hook = _get_init_placement_hook()
@@ -894,8 +1024,16 @@ def _initialize_value(
 
 
 def _coerce_value(value: ArrayLike, dtype: DType | None) -> Any:
-    """Coerce ``value`` while preserving existing JAX-array sharding."""
-    if hasattr(value, "sharding") and hasattr(value, "dtype"):
+    """Coerce ``value`` while preserving existing JAX-array sharding.
+
+    Note: prefer ``isinstance(value, jax.Array)`` over
+    ``hasattr(value, "sharding")``. The ``hasattr`` form *invokes* the
+    ``sharding`` property to test for it, and on a tracer that property
+    walks the entire growing jaxpr (``find_progenitors``) — paying
+    O(jaxpr-size) per call, O(N^2) when initializing many variables
+    inside a single ``jax.eval_shape`` (e.g. lazy model construction).
+    """
+    if isinstance(value, jax.Array):
         return value.astype(dtype) if dtype is not None else value
     if dtype is not None:
         return jnp.asarray(value, dtype=dtype)
@@ -971,7 +1109,10 @@ def _variable_flatten_with_keys(
     v: Variable,
 ) -> tuple[list[tuple[jax.tree_util.KeyEntry, Any]], _VariableAux]:
     """Keyed flatten for :func:`jax.tree_util.register_pytree_with_keys`."""
-    return ([(jax.tree_util.GetAttrKey("value"), v.value)], (type(v), v.kind, dict(v.metadata), v.ref_id, _deferred_aux(v)))
+    return (
+        [(jax.tree_util.GetAttrKey("value"), v.value)],
+        (type(v), v.kind, dict(v.metadata), v.ref_id, _deferred_aux(v)),
+    )
 
 
 for _var_cls in (Variable, Parameter, Buffer, DeferredParameter, DeferredBuffer):

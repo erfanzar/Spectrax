@@ -547,10 +547,19 @@ def bind(graphdef: GraphDef, state: State) -> Module:
 def clone(module: Module) -> Module:
     """Deep-copy ``module`` with fresh :class:`Variable` instances.
 
-    Sharing within the graph is preserved — two attribute paths that
-    resolved to the same variable in the source still resolve to a
-    single (new) variable in the copy. No :class:`Variable` identity is
-    shared with the source.
+    Round-trips through :func:`export` followed by :func:`bind`. Sharing
+    within the graph is preserved — two attribute paths that resolved to
+    the same variable in the source still resolve to a single (new)
+    variable in the copy — but no :class:`Variable` identity is shared
+    with the source. Array storage is shared because :func:`export`
+    does not copy leaves.
+
+    Args:
+        module: The live module to clone.
+
+    Returns:
+        A structurally-equal module with freshly-allocated
+        :class:`Variable` instances.
     """
     gdef, state = export(module)
     return bind(gdef, state)
@@ -559,8 +568,16 @@ def clone(module: Module) -> Module:
 def update(module: Module, state: State) -> None:
     """Write ``state`` leaves into the live module in place.
 
-    Only leaves whose ``(collection, path)`` matches a live variable are
-    applied; extra entries in ``state`` are ignored.
+    For every variable reachable from ``module`` the matching
+    ``(collection, path)`` entry is looked up in ``state`` and pushed
+    back through :meth:`Variable._raw_set` (bypassing transform write
+    hooks). Extra entries in ``state`` are silently ignored, and
+    variables without a matching state entry retain their current
+    value.
+
+    Args:
+        module: The live module to mutate.
+        state: A :class:`State` whose leaves provide the new values.
     """
     for path, var in live_variables(module):
         new_val = _nested_get(state._data.get(var.kind, {}), str_to_path(path), None)
@@ -570,7 +587,19 @@ def update(module: Module, state: State) -> None:
 
 
 def tree_state(module: Module) -> State:
-    """Return only the :class:`State` part of :func:`export`."""
+    """Return only the :class:`State` part of :func:`export`.
+
+    Convenience wrapper for callers that need leaf storage without the
+    accompanying :class:`GraphDef`. Carries the same writer callbacks
+    as the underlying :func:`export` result, so writes through the
+    returned state propagate back to the live variables.
+
+    Args:
+        module: The live module to project.
+
+    Returns:
+        A live-backed :class:`State` for ``module``.
+    """
     _, s = export(module)
     return s
 
@@ -816,9 +845,23 @@ def pop(module: Module, selector: Any) -> State:
     """Remove-and-return variables matching ``selector`` from ``module``.
 
     Every matched variable is detached from its owning module (its
-    attribute slot is removed) and the collected values are returned as
-    a :class:`State`. Intended for clearing transient caches such as
-    ``intermediates`` after a forward pass.
+    attribute slot is removed, list entry deleted, or dict key popped)
+    and the collected values are returned as a :class:`State`.
+    Containers that expose :meth:`_spx_delete_graph_children` are
+    consulted so list/dict layouts stay consistent. Bumps the global
+    graph epoch when any removal succeeds so cached
+    :class:`~spectrax.GraphDef` snapshots are invalidated.
+
+    Args:
+        module: The live module to mutate.
+        selector: A :class:`~spectrax.Selector` or any
+            :data:`~spectrax.core.selector.SelectorSugar` accepted by
+            :func:`~spectrax.core.selector.as_selector`. Identifies the
+            variables to detach.
+
+    Returns:
+        A :class:`State` collecting the values of every removed variable
+        keyed by the variable's collection and canonical path.
     """
     sel = as_selector(selector)
     collected: dict[str, dict[str, Any]] = {}

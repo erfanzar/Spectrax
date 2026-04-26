@@ -33,6 +33,45 @@ import jax
 __all__ = ["boundary"]
 
 
+@jax.custom_jvp
+def _boundary(x: Any) -> Any:
+    """Identity primitive that survives jaxpr lowering as a named op.
+
+    Decorating with :func:`jax.custom_jvp` keeps the call from being
+    constant-folded or otherwise erased during tracing — the jaxpr
+    retains a distinct ``custom_jvp_call`` site that downstream
+    pipeline passes can recognise and use as a stage-split anchor.
+
+    Args:
+        x: Any JAX-compatible value.
+
+    Returns:
+        ``x`` unchanged.
+    """
+    return x
+
+
+@_boundary.defjvp
+def _boundary_jvp(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[Any, Any]:
+    """JVP rule for :func:`_boundary` — pass primal and tangent through.
+
+    Because :func:`_boundary` is mathematically the identity, the
+    correct tangent rule is also identity. Defining it explicitly
+    (rather than letting JAX infer one) keeps the marker visible in
+    both the forward and the linearised jaxpr.
+
+    Args:
+        primals: One-element tuple ``(x,)``.
+        tangents: One-element tuple ``(t,)``.
+
+    Returns:
+        ``(x, t)`` — primal and tangent forwarded unchanged.
+    """
+    (x,) = primals
+    (t,) = tangents
+    return x, t
+
+
 def boundary(x: Any) -> Any:
     """Mark a pipeline stage boundary inside a ``forward`` method.
 
@@ -52,17 +91,4 @@ def boundary(x: Any) -> Any:
         ``x`` unmodified. The call is preserved in the jaxpr as an
         identity named op so it can be introspected by transforms.
     """
-
-    @jax.custom_jvp
-    def _boundary(x):
-        """Identity primitive carrying the boundary annotation in the jaxpr."""
-        return x
-
-    @_boundary.defjvp
-    def _boundary_jvp(primals, tangents):
-        """JVP rule: forward both primal and tangent unchanged."""
-        (x,) = primals
-        (t,) = tangents
-        return x, t
-
     return _boundary(x)

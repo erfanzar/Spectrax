@@ -38,18 +38,37 @@ from ..types.stage import PipelineStage, _is_empty_state
 def _detect_homogeneous_core(
     stages: tuple[PipelineStage, ...],
 ) -> tuple[int, int] | None:
-    """Return ``(start, end)`` indices of the longest homogeneous run.
+    """Find the longest contiguous run of structurally identical stages.
 
-    Stages are homogeneous when their ``parameters`` have identical pytree
-    structure, leaf shapes, and leaf dtypes, and their ``fn`` is the
-    same callable object.
+    "Homogeneous" here means three things in conjunction: same
+    callable identity for ``stage.fn``, same pytree structure for
+    ``stage.parameters``, and same shape + dtype on every leaf. The
+    SPMD core path requires all three so the stages can be stacked
+    along a leading axis and dispatched as one ``shard_map`` body.
+
+    Args:
+        stages: Full pipeline stage tuple.
+
+    Returns:
+        ``(start, end)`` half-open indices of the longest run of
+        length >= 2, or ``None`` if no such run exists (in which
+        case :func:`hybrid_linear_run` falls back to pure MPMD).
     """
     n = len(stages)
     if n < 3:
         return None
 
     def _signature(stage: PipelineStage) -> tuple[Any, int]:
-        """Pack a stage's parameter shape/dtype tuple plus ``id(stage.fn)`` for run-detection."""
+        """Build the homogeneity signature for one stage.
+
+        Args:
+            stage: A :class:`PipelineStage`.
+
+        Returns:
+            A hashable triple ``(shapes, dtypes, id(fn))`` that
+            equals another stage's signature iff the two are
+            interchangeable on the SPMD core path.
+        """
         leaves = jax.tree.leaves(stage.parameters)
         shapes = tuple(tuple(a.shape) for a in leaves)
         dtypes = tuple(str(a.dtype) for a in leaves)
@@ -76,43 +95,80 @@ def _make_hybrid_core_fwd_body(
     stage_fn: Callable[..., Any],
     n_core: int,
     pp_axis: str,
+    *,
+    return_state: bool = False,
 ):
     """Build a ``shard_map`` body that runs a linear chain through ``n_core`` stages.
 
-    Each device in the core sub-mesh executes one stage.  The last
-    stage's output is broadcast to all devices via ``psum`` so the
-    caller (outside ``shard_map``) can retrieve it without indexing.
+    Each device in the core sub-mesh executes one stage. The last
+    stage's output is broadcast to all devices via :func:`jax.lax.psum`
+    (after masking inactive ranks to zero) so the caller outside
+    ``shard_map`` can retrieve it without indexing — convenient
+    because the caller may not know which physical device the SPMD
+    chunk's tail landed on.
+
+    When ``return_state=True`` the body also returns the per-rank
+    updated state (re-stacked along the pp axis via the caller's
+    ``out_specs``) so decode-style loops can thread KV cache / RNN
+    state forward across calls.
+
+    Args:
+        stage_fn: The single homogeneous stage callable. Same fn
+            runs on every core device; different params per rank.
+        n_core: Number of stages in the homogeneous core (== size of
+            the core sub-mesh's pp axis).
+        pp_axis: Pipeline-parallel axis name on the core sub-mesh.
+        return_state: When ``True``, the body's signature is
+            ``(stacked_params, stacked_state, x) -> (out, state)``;
+            when ``False`` it is ``... -> out`` and the state is
+            silently discarded.
+
+    Returns:
+        A function suitable to pass to :func:`jax.shard_map`.
     """
 
     def _drop0(t: Any) -> Any:
-        """Index axis 0 of every leaf — collapses the stacked-stages axis to per-rank vars."""
+        """Index axis 0 of every leaf, collapsing the stacked-stages axis to per-rank vars."""
         return jax.tree.map(lambda a: a[0], t)
 
-    def body(stacked_params: Any, stacked_state: Any, x: jax.Array) -> jax.Array:
+    def body(stacked_params: Any, stacked_state: Any, x: jax.Array):
         """``shard_map`` body: walk ``n_core`` stages with ``ppermute`` between them.
 
         Each device on the pipeline axis acts as one stage. At step
-        ``k`` the device with ``axis_index(pp_axis) == k`` runs the
-        stage; all others ``cond`` into a no-op. After the step, the
-        per-stage output is ``ppermute``-d to the next rank, completing
-        the pipeline. The final output is broadcast to all ranks via
-        ``psum`` so callers outside ``shard_map`` can read it
+        ``k`` the device whose ``axis_index(pp_axis) == k`` runs the
+        stage; all others ``cond`` into a no-op. After the step the
+        per-stage output is :func:`jax.lax.ppermute`'d to the next
+        rank, completing the pipeline. The final output is broadcast
+        to all ranks via :func:`jax.lax.psum` (after masking inactive
+        ranks to zero) so callers outside ``shard_map`` can read it
         regardless of which rank produced it.
+
+        Args:
+            stacked_params: Per-rank params stacked along the pp axis.
+                Inside the body the size-1 axis is dropped via
+                :func:`_drop0`.
+            stacked_state: Per-rank state, or ``()``.
+            x: Microbatch input replicated across the pp axis.
+
+        Returns:
+            ``out`` only when ``return_state=False``; otherwise
+            ``(out, new_stacked_state)``.
         """
         rank = jax.lax.axis_index(pp_axis)
         p = _drop0(stacked_params)
-        st = _drop0(stacked_state) if not _is_empty_state(stacked_state) else ()
+        has_state = not _is_empty_state(stacked_state)
+        st = _drop0(stacked_state) if has_state else ()
         cur = x
         for step in range(n_core):
             is_active = rank == step
 
             def _run(args: tuple[Any, Any]) -> tuple[Any, Any]:
-                """Run the stage on (carry, state); used for the active rank."""
+                """Active-rank branch: run the stage on ``(carry, state)``."""
                 c, s = args
                 return stage_fn(p, s, c)
 
             def _skip(args: tuple[Any, Any]) -> tuple[Any, Any]:
-                """No-op branch: pass (carry, state) through; used for inactive ranks."""
+                """Inactive-rank branch: pass ``(carry, state)`` through unchanged."""
                 return args
 
             cur, st = jax.lax.cond(is_active, _run, _skip, (cur, st))
@@ -127,6 +183,9 @@ def _make_hybrid_core_fwd_body(
             jnp.where(rank == n_core - 1, cur, jnp.zeros_like(cur)),
             pp_axis,
         )
+        if return_state and has_state:
+            new_stacked_state = jax.tree.map(lambda a: a[None], st)
+            return out, new_stacked_state
         return out
 
     return body
@@ -138,7 +197,22 @@ def _build_core_mesh(
     core_start: int,
     core_end: int,
 ) -> Mesh:
-    """Slice a contiguous chunk of the pipeline axis into a sub-mesh."""
+    """Slice a contiguous range of pipeline ranks into a sub-mesh.
+
+    The returned sub-mesh keeps every original axis name; only the
+    devices along ``pp_axis`` are restricted to indices
+    ``[core_start, core_end)``.
+
+    Args:
+        full_mesh: The full pipeline mesh.
+        pp_axis: Name of the pipeline axis.
+        core_start: First rank to include (inclusive).
+        core_end: One past the last rank to include.
+
+    Returns:
+        A :class:`~jax.sharding.Mesh` covering only the core's
+        devices.
+    """
     pp_idx = full_mesh.axis_names.index(pp_axis)
     devices = np.take(
         full_mesh.devices,
@@ -149,14 +223,33 @@ def _build_core_mesh(
 
 
 def _stack_pytree_list(items: tuple[Any, ...]) -> Any:
-    """Stack a tuple of identically-structured pytrees along a new leading axis."""
+    """Stack identically-structured pytrees along a new leading axis.
+
+    Mirror of the :func:`spmd.api._stack_pytree_list` helper, kept
+    local to avoid a circular import. Each leaf becomes a stacked
+    array with leading dimension ``len(items)``.
+
+    Args:
+        items: Pytrees to stack.
+
+    Returns:
+        A single pytree with the same structure as ``items[0]``.
+    """
     if not items:
         return items
     first = items[0]
     leaves0, treedef = jax.tree.flatten(first)
 
     def stack_one(idx: int) -> jax.Array:
-        """Gather leaf ``idx`` from every item and stack into a single array."""
+        """Gather leaf ``idx`` from every item and stack into a single array.
+
+        Args:
+            idx: Index into the flattened leaf tuple.
+
+        Returns:
+            ``jnp.stack`` of the corresponding leaves across
+            ``items``.
+        """
         leaves = [jax.tree.flatten(item)[0][idx] for item in items]
         return jnp.stack(leaves, axis=0)
 
@@ -165,19 +258,48 @@ def _stack_pytree_list(items: tuple[Any, ...]) -> Any:
 
 
 def _unstack_pytree(stacked: Any, n: int) -> tuple[Any, ...]:
-    """Inverse of :func:`_stack_pytree_list`."""
+    """Inverse of :func:`_stack_pytree_list` — split into ``n`` independent pytrees.
+
+    Args:
+        stacked: A pytree whose leaves all have a leading dimension
+            of size ``n``.
+        n: Number of pytrees to recover.
+
+    Returns:
+        A tuple of ``n`` pytrees with the same structure as
+        ``stacked``.
+    """
     leaves, treedef = jax.tree.flatten(stacked)
     sliced = tuple(tuple(leaf[i] for leaf in leaves) for i in range(n))
     return tuple(jax.tree.unflatten(treedef, list(sl)) for sl in sliced)
 
 
 def _vmap_stage_fwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Jitted vmap of the per-stage forward over the microbatch axis."""
+    """Jitted vmap of the per-stage forward over the microbatch axis.
+
+    Used for the prefix and suffix MPMD edges. ``in_axes=(None, None, 0)``
+    keeps params and state shared across microbatches.
+
+    Args:
+        stage_fn: Per-stage forward callable.
+
+    Returns:
+        A jitted vmapped callable.
+    """
     return jax.jit(jax.vmap(lambda p, s, x: stage_fn(p, s, x), in_axes=(None, None, 0)))
 
 
 def _vmap_stage_bwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Jitted vmap of the per-stage backward over the microbatch axis."""
+    """Jitted vmap of the per-stage backward over the microbatch axis.
+
+    Args:
+        stage_fn: Per-stage forward callable.
+
+    Returns:
+        A vmapped callable
+        ``(params, state, x_stack, g_y_stack) -> (g_params_stack,
+        g_x_stack)``.
+    """
 
     @jax.jit
     def bwd(params, state, x, g_y):
@@ -186,6 +308,15 @@ def _vmap_stage_bwd(stage_fn: Callable[..., Any]) -> Callable[..., Any]:
         The state cotangent ``_g_s`` is intentionally discarded —
         SPMD pipeline stages here are stateless w.r.t. their carry,
         so the state's gradient is not propagated.
+
+        Args:
+            params: Stage parameters.
+            state: Stage state (often ``()``).
+            x: Saved forward input.
+            g_y: Cotangent at the stage's output.
+
+        Returns:
+            ``(g_params, g_x)``.
         """
 
         def fwd_only(p, s, xi):
@@ -289,9 +420,26 @@ def hybrid_linear_run(
     )
     core_fwd_jit = jax.jit(jax.vmap(core_smap, in_axes=(None, None, 0)))
 
-    core_input = cur
-    with core_mesh:
-        core_output = core_fwd_jit(core_params, core_states, core_input)
+    has_core_state = not _is_empty_state(core_states)
+    if mode == "forward" and has_core_state:
+        fwd_body_with_state = _make_hybrid_core_fwd_body(core_stages[0].fn, n_core, pp_axis, return_state=True)
+        core_smap_with_state = shard_map(
+            fwd_body_with_state,
+            mesh=core_mesh,
+            in_specs=(params_spec, states_spec, xs_spec),
+            out_specs=(PartitionSpec(), states_spec),
+            axis_names=frozenset({pp_axis}),
+            check_vma=False,
+        )
+        core_fwd_state_jit = jax.jit(jax.vmap(core_smap_with_state, in_axes=(None, None, 0)))
+        core_input = cur
+        with core_mesh:
+            core_output, core_states_new = core_fwd_state_jit(core_params, core_states, core_input)
+    else:
+        core_input = cur
+        with core_mesh:
+            core_output = core_fwd_jit(core_params, core_states, core_input)
+        core_states_new = core_states
 
     cur = jax.device_put(core_output, replicated[core_end] if suffix_stages else replicated[n - 1])
     suffix_states: list[Any] = []
@@ -306,7 +454,15 @@ def hybrid_linear_run(
     final_output = cur
 
     if mode == "forward":
-        all_states = prefix_states + list(_unstack_pytree(core_states, n_core)) + suffix_states
+        if has_core_state:
+            # core_states_new has shape (m, n_core, ...); swap so _unstack_pytree
+            # yields per-stage entries shaped (m, ...) — matching prefix_states
+            # and suffix_states (which were vmap'd over the microbatch axis).
+            core_states_new = jax.tree.map(lambda a: jnp.swapaxes(a, 0, 1), core_states_new)
+            core_state_list = list(_unstack_pytree(core_states_new, n_core))
+        else:
+            core_state_list = [() for _ in range(n_core)]
+        all_states = prefix_states + core_state_list + suffix_states
         return final_output, tuple(all_states)
 
     assert loss_fn is not None
@@ -315,10 +471,28 @@ def hybrid_linear_run(
 
     @jax.jit
     def loss_and_g_y(y_stack: jax.Array, *targs: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Vmapped per-microbatch ``(loss, dloss/dy)`` over the stacked output."""
+        """Vmapped per-microbatch ``(loss, dloss/dy)`` over the stacked output.
+
+        Args:
+            y_stack: Final-stage output stacked along the microbatch
+                axis.
+            *targs: Targets stacked along the microbatch axis.
+
+        Returns:
+            ``(loss_stack, g_y)`` — per-microbatch losses and
+            per-microbatch cotangents, both leading-axis-stacked.
+        """
 
         def per_mb(yy: jax.Array, *tt: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Single-microbatch ``value_and_grad`` of ``loss_fn`` w.r.t. ``yy``."""
+            """Single-microbatch ``value_and_grad`` of ``loss_fn`` w.r.t. ``yy``.
+
+            Args:
+                yy: One microbatch's output.
+                *tt: One microbatch's targets.
+
+            Returns:
+                ``(loss_scalar, g_y)``.
+            """
             return jax.value_and_grad(lambda y: loss_fn(y, *tt))(yy)
 
         return jax.vmap(per_mb)(y_stack, *targs)
@@ -345,7 +519,22 @@ def hybrid_linear_run(
 
     @jax.jit
     def core_bwd(stacked_params: Any, stacked_state: Any, x: jax.Array, g_y_target: jax.Array) -> tuple[Any, jax.Array]:
-        """VJP through the homogeneous core, returning ``(g_params, g_x)``."""
+        """VJP through the homogeneous core, returning ``(g_params, g_x)``.
+
+        Reuses :func:`fwd_body` as the forward to differentiate
+        against — XLA gets to fuse the core's forward and backward
+        passes together as one shard_map.
+
+        Args:
+            stacked_params: Stage-stacked params for the core.
+            stacked_state: Stage-stacked state for the core (closed
+                over as nondiff data inside the VJP).
+            x: Saved input to the core (one microbatch).
+            g_y_target: Cotangent at the core's output.
+
+        Returns:
+            ``(g_params, g_x)``.
+        """
 
         def _core_forward(p: Any, x_in: jax.Array) -> jax.Array:
             """Core forward with stacked state closed over as nondiff data."""

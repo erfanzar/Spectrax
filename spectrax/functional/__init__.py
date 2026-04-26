@@ -4,10 +4,27 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Stateless tensor operations.
 
-Every function here is pure: it takes JAX-compatible inputs and returns
-an :class:`~spectrax.typing.Array`. The :mod:`spectrax.nn` layers build
-on these implementations, so users can drop down to the functional form
-whenever a module wrapper feels heavy.
+Every function exported here is pure — it takes JAX-compatible inputs
+and returns an :class:`~spectrax.typing.Array` with no module state on
+the side. The :mod:`spectrax.nn` layer modules wrap these primitives
+and supply learnable parameters; calling them directly is the right
+choice when:
+
+* a transform (``jit`` / ``vmap`` / ``scan`` / ``shard_map``) is easier
+  to reason about over plain functions than over module instances, or
+* the caller already owns the parameters (e.g. inside a custom training
+  step or a meta-learning inner loop).
+
+Submodules:
+
+* :mod:`spectrax.functional.activation` — elementwise activations.
+* :mod:`spectrax.functional.attention` — scaled dot-product attention.
+* :mod:`spectrax.functional.conv` — N-D convolution / transposed conv.
+* :mod:`spectrax.functional.dropout` — inverted dropout.
+* :mod:`spectrax.functional.linear` — dense matmul + bias.
+* :mod:`spectrax.functional.norm` — LayerNorm and RMSNorm.
+* :mod:`spectrax.functional.pool` — reduce-window pooling primitives.
+* :mod:`spectrax.functional.util` — shared dtype helpers.
 """
 
 from .activation import (

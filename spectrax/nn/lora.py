@@ -131,7 +131,31 @@ class LoRA(Module):
         b_init: Initializer | None = None,
         dtype: DType | None = None,
     ) -> None:
-        """Allocate the low-rank factors, optionally wiring a base module.
+        """Allocate the low-rank factors and optionally wire a base module.
+
+        Args:
+            d_in: Input feature count (size of the leading axis of
+                ``A``).
+            rank: Rank ``r`` of the factorization (size of the
+                shared inner axis of ``A`` and ``B``). Must be
+                positive.
+            d_out: Output feature count (size of the trailing axis
+                of ``B``).
+            base_module: Optional callable whose output is added to
+                the LoRA delta. Any callable works; typically a
+                :class:`Linear` or another spectrax module. Stored
+                on the instance only when not ``None``.
+            alpha: Optional scaling hyperparameter. When provided,
+                the delta is multiplied by ``alpha / rank``; when
+                ``None`` (default), no scaling is applied.
+            rngs: PRNG source for parameter initialization.
+            a_init: Initializer for ``lora_a``. Defaults to
+                Kaiming-uniform with ``"linear"`` gain.
+            b_init: Initializer for ``lora_b``. Defaults to
+                :func:`~spectrax.init.zeros` so the adapter is a
+                no-op at step 0.
+            dtype: Storage dtype for the factors; defaults to
+                ``float32``.
 
         Raises:
             ValueError: If ``rank`` is non-positive.
@@ -154,10 +178,17 @@ class LoRA(Module):
             self.base_module = base_module
 
     def _scale(self, out_dtype: DType) -> Array | float:
-        """Compute the ``alpha / rank`` scale as ``out_dtype``.
+        """Return the ``alpha / rank`` LoRA scaling factor as ``out_dtype``.
 
-        Returns the Python scalar ``1.0`` when ``alpha`` is unset, so
-        the call site can skip the broadcast-multiply entirely.
+        Args:
+            out_dtype: Dtype to cast the result to so it composes with
+                the matmul output without surprise upcasts.
+
+        Returns:
+            A 0-d :class:`jax.Array` of dtype ``out_dtype`` holding
+            ``alpha / rank`` when :attr:`has_alpha` is ``True``;
+            otherwise the Python scalar ``1.0`` so the call site
+            can skip the broadcast-multiply entirely.
         """
         if not self.has_alpha:
             return 1.0
@@ -252,9 +283,26 @@ class LoRALinear(Module):
     ) -> None:
         """Instantiate the base :class:`Linear` and the side-by-side :class:`LoRA`.
 
-        Both layers draw keys from the same resolved :class:`Rngs`, so
-        constructing two identically-seeded :class:`LoRALinear`\\ s
-        produces the same parameters.
+        Both sub-modules draw keys from the same resolved
+        :class:`Rngs` instance, so constructing two identically-seeded
+        :class:`LoRALinear`\\ s produces identical parameters.
+
+        Args:
+            in_features: Trailing input feature count.
+            out_features: Output feature count.
+            rank: LoRA rank ``r``.
+            alpha: Optional LoRA alpha; the delta is scaled by
+                ``alpha / rank`` when supplied.
+            use_bias: Whether the base :class:`Linear` carries a bias.
+            rngs: PRNG source for both the base and the adapter.
+            w_init: Initializer for the base weight (forwarded to
+                :class:`Linear`).
+            b_init: Initializer for the base bias.
+            a_init: Initializer for ``lora_a`` (forwarded to
+                :class:`LoRA`).
+            lora_b_init: Initializer for ``lora_b`` (defaults to
+                zeros via :class:`LoRA`'s default).
+            dtype: Parameter dtype for both base and adapter.
         """
         super().__init__()
         resolved = resolve_rngs(rngs)

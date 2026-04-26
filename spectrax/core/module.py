@@ -225,7 +225,22 @@ class Opaque:
 
     Wrap any Python object in ``Opaque`` to assign it as a module
     attribute without triggering :meth:`Module.__setattr__`'s strictness
-    check. Opaque values are invisible to graph traversal.
+    check. Opaque values are invisible to graph traversal — they do not
+    show up in :func:`~spectrax.iter_variables` or
+    :func:`~spectrax.iter_modules` and are not pytree leaves — but they
+    *do* round-trip through :func:`~spectrax.export` /
+    :func:`~spectrax.bind` because :class:`Module` records them
+    separately in :attr:`Module._spx_opaque`.
+
+    Most user code never instantiates :class:`Opaque` directly:
+    :meth:`Module.__setattr__` automatically wraps any value that
+    isn't a Module / Variable / static scalar into an :class:`Opaque`,
+    which is how attributes such as ``self.config = config_object``
+    Just Work.
+
+    Attributes:
+        value: The wrapped Python object, exposed unchanged when the
+            owning module reads back the attribute.
     """
 
     __slots__ = ("value",)
@@ -233,19 +248,26 @@ class Opaque:
     value: Any
 
     def __init__(self, value: Any) -> None:
-        """Wrap ``value`` as an opaque attribute."""
+        """Wrap ``value`` as an opaque attribute.
+
+        Args:
+            value: Any Python object. No coercion or copy is performed.
+        """
         self.value = value
 
     def __repr__(self) -> str:
-        """``Opaque(<class of value>)``."""
+        """Return ``Opaque(<class name of value>)`` for diagnostics."""
         return f"Opaque({type(self.value).__name__})"
 
 
 class _HookHandle:
-    """Lightweight handle returned by ``register_forward_*`` methods.
+    """Lightweight handle returned by ``register_forward_*`` and
+    :meth:`Module.register_context`.
 
-    Call :meth:`remove` to detach the hook from its module's list.
-    Removal is a no-op if the hook has already been removed.
+    Hold the handle to be able to :meth:`remove` the hook later. The
+    handle keeps a strong reference to the module-side hook list it was
+    appended to, so removing a hook does not require knowing the
+    owning module.
     """
 
     __slots__ = ("_fn", "_list")
@@ -254,12 +276,23 @@ class _HookHandle:
     _fn: Any
 
     def __init__(self, lst: list[Any], fn: Any) -> None:
-        """Record the list the hook was appended to and the hook itself."""
+        """Record the destination list and the registered callable.
+
+        Args:
+            lst: The hook list on the owning module
+                (e.g. ``module._spx_pre_hooks``).
+            fn: The callable that was appended to ``lst``.
+        """
         self._list = lst
         self._fn = fn
 
     def remove(self) -> None:
-        """Detach the hook from its containing list."""
+        """Detach the hook from its containing list.
+
+        Idempotent: if the hook was already removed (or the list has
+        been mutated externally so the entry no longer exists) the
+        :class:`ValueError` raised by ``list.remove`` is swallowed.
+        """
         with contextlib.suppress(ValueError):
             self._list.remove(self._fn)
 
@@ -268,12 +301,35 @@ _HOOK_WARNING_ONCE: set[int] = set()
 
 
 def _is_context_manager(value: Any) -> bool:
-    """Return ``True`` when ``value`` implements the context-manager protocol."""
+    """Return ``True`` when ``value`` implements the context-manager protocol.
+
+    Duck-typed: any object exposing both ``__enter__`` and ``__exit__``
+    is accepted, matching the looseness of :keyword:`with`.
+    """
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
 
 def _context_factory(value: Any) -> Any:
-    """Normalize a registered context or zero-arg context factory."""
+    """Normalize a registered context or zero-arg context factory.
+
+    Reusable context-manager objects (such as a single
+    :class:`jax.sharding.Mesh`) are wrapped in an identity factory so
+    they can be re-entered for every call. Plain callables are
+    returned unchanged on the assumption they construct a fresh
+    context manager on every call.
+
+    Args:
+        value: Either a context manager or a zero-argument callable
+            producing one.
+
+    Returns:
+        A zero-argument callable suitable for
+        :meth:`contextlib.ExitStack.enter_context` invocation.
+
+    Raises:
+        TypeError: If ``value`` is neither a context manager nor a
+            callable.
+    """
     if _is_context_manager(value):
         return lambda value=value: value
     if callable(value):
@@ -567,6 +623,12 @@ class Module:
     def train(self, mode: bool = True) -> Module:
         """Set this module (and all descendants) to training mode.
 
+        Updates :attr:`_spx_training`, mirrors the value into the
+        opaque-attribute map (so the flag survives
+        :func:`~spectrax.export` / :func:`~spectrax.bind`), invalidates
+        the export cache, bumps the global graph epoch, and recurses
+        into every child module.
+
         Args:
             mode: ``True`` (default) enables training; ``False`` disables.
 
@@ -587,12 +649,38 @@ class Module:
         return self.train(False)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Invoke the module: run pre-hooks, :meth:`forward`, post-hooks,
-        then apply any output-dtype policy.
+        """Invoke the module's forward pipeline.
 
-        Hooks are skipped under spectrax transforms (with a single warning
-        per module). Use ``self.sow("intermediates", ...)`` for
-        transform-safe capture instead.
+        The full ordering is:
+
+        1. Pre-hooks (registered with
+           :meth:`register_forward_pre_hook`) run; a non-``None``
+           return value rewrites the ``(args, kwargs)`` seen by
+           :meth:`forward`.
+        2. Every context registered via :meth:`register_context` is
+           entered, then the active :attr:`_spx_policy` is pushed onto
+           the dtype-policy stack.
+        3. :meth:`forward` runs.
+        4. Post-hooks (registered with :meth:`register_forward_hook`)
+           run; a non-``None`` return value replaces the output.
+        5. If the active policy specifies an
+           :attr:`~spectrax.Policy.output_dtype`, the output is cast
+           accordingly.
+
+        When invoked under a spectrax transform, hooks are silently
+        skipped (with a single warning per offending module) because
+        their side effects do not survive tracing. Use
+        :meth:`sow` for transform-safe activation capture instead.
+
+        Args:
+            *args: Forwarded to :meth:`forward` after pre-hook
+                rewriting.
+            **kwargs: Forwarded to :meth:`forward` after pre-hook
+                rewriting.
+
+        Returns:
+            Whatever :meth:`forward` returns (potentially rewritten by
+            post-hooks or cast by the active policy).
         """
         if self._spx_pre_hooks and not _inside_transform():
             for h in list(self._spx_pre_hooks):
@@ -634,17 +722,36 @@ class Module:
         raise NotImplementedError(f"{type(self).__name__} must override `forward`.")
 
     def register_forward_pre_hook(self, fn: ForwardPreHook) -> _HookHandle:
-        """Register a pre-hook invoked before every ``forward`` call.
+        """Register a pre-hook invoked before every :meth:`forward` call.
 
-        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        See :class:`~spectrax.core.typing.ForwardPreHook` for the call
+        signature; returning a non-``None`` ``(args, kwargs)`` rewrites
+        the inputs seen by :meth:`forward`. Hooks are skipped under
+        spectrax transforms.
+
+        Args:
+            fn: The hook callable.
+
+        Returns:
+            A :class:`_HookHandle`. Call :meth:`~_HookHandle.remove` on
+            it to detach the hook.
         """
         self._spx_pre_hooks.append(fn)
         return _HookHandle(self._spx_pre_hooks, fn)
 
     def register_forward_hook(self, fn: ForwardHook) -> _HookHandle:
-        """Register a post-hook invoked after every ``forward`` call.
+        """Register a post-hook invoked after every :meth:`forward` call.
 
-        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        See :class:`~spectrax.core.typing.ForwardHook` for the call
+        signature; returning a non-``None`` value replaces the
+        forward output. Hooks are skipped under spectrax transforms.
+
+        Args:
+            fn: The hook callable.
+
+        Returns:
+            A :class:`_HookHandle`. Call :meth:`~_HookHandle.remove` on
+            it to detach the hook.
         """
         self._spx_fwd_hooks.append(fn)
         return _HookHandle(self._spx_fwd_hooks, fn)
@@ -702,21 +809,39 @@ class Module:
         *,
         reduce: str = "last",
     ) -> None:
-        """Capture an intermediate value into a named
-        :class:`~spectrax.Variable` slot.
+        """Capture an intermediate value into a named :class:`~spectrax.Variable` slot.
 
-        The first call creates a variable attached to ``self`` at
-        ``"sow_{collection}_{name}"`` and populates it with ``value``.
-        Subsequent calls combine with the existing slot according to
-        ``reduce``:
+        The slot lives on ``self`` under the attribute
+        ``sow_{collection}_{name}``. On the first call a fresh
+        :class:`~spectrax.Variable` is allocated with the given
+        ``collection`` as its kind and the metadata pair
+        ``{"reduce": reduce, "sow_name": name}``. On subsequent calls
+        the existing slot is combined with ``value`` according to
+        ``reduce``.
 
-        * ``"last"`` — replace with ``value``;
-        * ``"sum"`` — add ``value`` to the running accumulator;
-        * ``"stack"`` — concatenate along a leading axis.
+        Sowing into ``"intermediates"`` is the standard mechanism for
+        transform-safe activation capture; the captured values survive
+        :func:`spectrax.jit` / :func:`spectrax.grad` provided the
+        transform marks the collection as mutable.
 
-        Use ``collection="intermediates"`` for activation capture that
-        survives transforms (as long as you also declare it mutable on
-        the transform).
+        Args:
+            collection: Variable :attr:`~spectrax.Variable.kind` for the
+                slot (typically ``"intermediates"``).
+            name: User-facing label appended to the slot's attribute
+                name.
+            value: Captured value to record or combine.
+            reduce: Combination strategy for repeated calls. One of:
+
+                * ``"last"`` — replace the stored value with ``value``.
+                * ``"sum"`` — add ``value`` to the running accumulator.
+                * ``"stack"`` — concatenate ``value`` along a freshly
+                  added leading axis.
+
+        Raises:
+            TypeError: If the slot exists but is not a
+                :class:`~spectrax.Variable`.
+            ValueError: If ``reduce`` is not one of the supported
+                strategies.
         """
         attr = f"sow_{collection}_{name}"
         existing = getattr(self, attr, None)
@@ -761,13 +886,27 @@ class Module:
     ) -> Module:
         """Attach an :class:`~spectrax.Rngs` and optionally run a dry forward.
 
+        When ``rngs`` is non-``None`` it is normalized to a
+        :class:`~spectrax.Rngs` (integers are wrapped via
+        ``Rngs(int)``), assigned as the attribute ``rngs``, and pinned
+        to the head of :attr:`_spx_attr_order` so it sorts consistently
+        in graph-defs. The graph epoch is bumped so any cached export
+        is rebuilt on next access.
+
+        Passing example inputs additionally invokes
+        :meth:`sequential_init`, which runs the forward pass under
+        the lazy-materialization permission so that
+        :class:`~spectrax.DeferredParameter` /
+        :class:`~spectrax.DeferredBuffer` cells resolve their shapes.
+
         Args:
             rngs: Either an :class:`~spectrax.Rngs`, an integer seed, or
-                ``None``. Non-``None`` values are attached to ``self`` as
-                the attribute ``rngs``.
+                ``None``. Non-``None`` values are attached to ``self``
+                as the attribute ``rngs``.
             *example_args: Positional example inputs passed to
                 :meth:`forward` to trigger lazy materialization.
-            **example_kwargs: Keyword example inputs.
+            **example_kwargs: Keyword example inputs passed to
+                :meth:`forward`.
 
         Returns:
             ``self`` for chaining.
@@ -790,10 +929,26 @@ class Module:
     def sequential_init(self, *example_args: Any, **example_kwargs: Any) -> Module:
         """Materialize lazy descendants explicitly using example inputs.
 
+        Runs ``self(*example_args, **example_kwargs)`` once with the
+        thread-local materialization permission active, which lets
+        :class:`~spectrax.DeferredParameter` and
+        :class:`~spectrax.DeferredBuffer` cells observe and record their
+        true shapes from the supplied inputs. Then invokes
+        :meth:`materialize` to allocate every deferred leaf.
+
         This is the explicit counterpart to the legacy "first eager
         forward materializes lazy modules" behavior. Modules created
-        under :func:`spectrax.lazy_init` require this method (or
+        under :func:`spectrax.lazy_init` require this call (or
         :meth:`init` with example inputs) before ordinary forward calls.
+
+        Args:
+            *example_args: Positional inputs shaped like the real
+                forward inputs. Skipping them runs only
+                :meth:`materialize`.
+            **example_kwargs: Keyword inputs to forward.
+
+        Returns:
+            ``self`` for chaining.
         """
         if example_args or example_kwargs:
             with _allow_materialization():
@@ -835,9 +990,21 @@ class Module:
     def _resolve_deferred(self, var: Variable, shape: tuple[int, ...]) -> None:
         """Resolve ``var``'s shape if it is a deferred variable.
 
-        Materializes immediately unless the current thread is inside
-        :func:`spectrax.lazy_init` without the explicit materialization
-        token (used by :meth:`sequential_init`).
+        Bridges layer construction code (which knows the inferred
+        per-layer shape) with the deferred-variable resolve/
+        materialize protocol. Refuses to run under a spectrax
+        transform via :meth:`_spx_guard_not_in_transform`. After
+        resolving the shape, materializes the variable immediately
+        unless we're inside :func:`spectrax.lazy_init` without an
+        explicit materialization permission (in which case the actual
+        materialization is deferred to
+        :meth:`sequential_init` / :meth:`materialize`).
+
+        Args:
+            var: A :class:`~spectrax.Variable` instance. No-op when
+                ``var`` is not a deferred subclass or is already
+                materialized.
+            shape: Concrete shape to record on the variable.
         """
         if isinstance(var, DeferredParameter | DeferredBuffer) and not var.is_materialized:
             self._spx_guard_not_in_transform(f"{type(var).__name__} materialization")
@@ -848,7 +1015,21 @@ class Module:
     def freeze(self, selector: Any = "parameters") -> Module:
         """Move every matched :class:`~spectrax.Variable`'s kind to ``"buffers"``.
 
-        This makes ``grad(wrt="parameters")`` skip them. Returns ``self`` for chaining.
+        Each matched variable's previous :attr:`~spectrax.Variable.kind`
+        is recorded in its metadata under the key ``"frozen_from"`` so
+        that :meth:`unfreeze` can restore it. After freezing, the
+        graph-export cache is cleared and the global graph epoch bumps
+        so downstream :func:`~spectrax.export` callers see the new
+        collection layout. Variables already in ``"buffers"`` are
+        skipped without recording metadata.
+
+        Args:
+            selector: Anything :func:`~spectrax.core.selector.as_selector`
+                accepts. Defaults to ``"parameters"`` so a bare
+                ``module.freeze()`` freezes every parameter.
+
+        Returns:
+            ``self`` for chaining.
         """
         from .selector import as_selector
 
@@ -865,7 +1046,23 @@ class Module:
         return self
 
     def unfreeze(self, selector: Any = "buffers") -> Module:
-        """Reverse :meth:`freeze` — move matched variables back to their pre-freeze kind."""
+        """Reverse :meth:`freeze` — move matched variables back to their pre-freeze kind.
+
+        For every matched variable that carries a ``"frozen_from"``
+        metadata entry, the entry is popped and the variable's
+        :attr:`~spectrax.Variable.kind` is reset to the recorded value.
+        Variables without a recorded prior kind are left unchanged.
+        Bumps the global graph epoch when at least one variable is
+        restored.
+
+        Args:
+            selector: Anything :func:`~spectrax.core.selector.as_selector`
+                accepts. Defaults to ``"buffers"`` to walk the
+                collection where :meth:`freeze` parks frozen variables.
+
+        Returns:
+            ``self`` for chaining.
+        """
         from .selector import as_selector
 
         sel = as_selector(selector)
@@ -883,11 +1080,24 @@ class Module:
     def perturb(self, name: str, x: Any) -> Any:
         """Insert an identity perturbation variable and add it to ``x``.
 
-        Creates (on first call) a zero-valued :class:`~spectrax.Variable` of
-        kind ``"perturbations"`` named ``perturb_{name}`` on ``self`` and
-        returns ``x + perturbation.value``. Under
-        ``spx.grad(wrt="perturbations")`` the returned gradient at that
-        variable equals ``dL/dx``.
+        On the first call a zero-valued :class:`~spectrax.Variable` is
+        created on ``self`` under the attribute ``perturb_{name}`` with
+        :attr:`~spectrax.Variable.kind` set to ``"perturbations"``. The
+        returned value is ``x + perturbation.value`` — algebraically
+        identity, but differentiating with respect to the perturbation
+        variable yields ``dL/dx`` at the call site, which is the
+        canonical trick for capturing intermediate-activation gradients
+        without rewriting the forward pass. Subsequent calls reuse the
+        existing variable.
+
+        Args:
+            name: Identifier for the perturbation slot. The actual
+                attribute name is ``perturb_{name}``.
+            x: Tensor (or pytree thereof) to perturb. Must be additively
+                compatible with a same-shape zero tensor.
+
+        Returns:
+            ``x`` with the (zero) perturbation added.
         """
         attr = f"perturb_{name}"
         existing = getattr(self, attr, None)
@@ -905,10 +1115,25 @@ class Module:
     ) -> Module:
         """Bulk-set attributes on ``self`` and every descendant module.
 
-        Only sets attributes that already exist on the target (so a
-        :class:`Linear` without ``deterministic`` is untouched).
-        ``filter_fn(module) -> bool`` restricts which modules are affected.
-        Returns ``self`` for chaining.
+        Walks the live graph (deduplicating shared submodules by
+        ``id``) and, for each module, assigns the given attributes
+        only when the attribute already exists on the target. This
+        guards against accidentally injecting an unrelated attribute
+        on a layer that does not understand it (e.g. a
+        :class:`~spectrax.nn.Linear` with no ``deterministic`` field
+        is untouched). ``filter_fn`` further narrows the targeted
+        modules.
+
+        Args:
+            filter_fn: Optional ``(module) -> bool`` predicate. When
+                provided, attribute updates are applied only to
+                modules for which the predicate returns truthy.
+            **attrs: Attributes to set. Each ``key=value`` pair is
+                pushed via ``setattr(module, key, value)`` on every
+                eligible module that already exposes ``key``.
+
+        Returns:
+            ``self`` for chaining.
         """
         seen: set[int] = set()
 

@@ -2,7 +2,14 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Simple feed-forward MLP block."""
+"""Two-layer feed-forward MLP block.
+
+Compact :class:`~spectrax.Module` implementing the standard
+``Linear -> activation -> Dropout -> Linear`` sandwich found inside
+every transformer block. Defaults to ``4 * features`` hidden width
+and GELU activation; ``out_features`` defaults back to ``features``
+so the block is residual-shape compatible by default.
+"""
 
 from __future__ import annotations
 
@@ -16,10 +23,20 @@ from .linear import Linear
 
 
 class MLPBlock(Module):
-    """Two-layer feed-forward block ``Linear -> activation -> dropout -> Linear``.
+    """Two-layer feed-forward block ``Linear -> activation -> Dropout -> Linear``.
 
-    A compact drop-in for the feed-forward half of a transformer block.
-    Defaults to ``4 * features`` hidden and GELU activation.
+    Drop-in feed-forward half of a transformer block. State layout:
+
+    * ``self.fc1`` — :class:`Linear` from ``features`` to
+      ``hidden_features``.
+    * ``self.fc2`` — :class:`Linear` from ``hidden_features`` to
+      ``out_features``.
+    * ``self.drop`` — :class:`Dropout` applied to the post-activation
+      hidden representation only.
+
+    Both linears use the framework defaults (Kaiming-uniform weight,
+    zero bias). Because the activation is selected by a string at
+    construction time, the layer is JAX-traceable and pickle-safe.
     """
 
     fc1: Linear
@@ -41,23 +58,32 @@ class MLPBlock(Module):
         fc1_bias_sharding: Sharding | AxisNames | None = None,
         fc2_bias_sharding: Sharding | AxisNames | None = None,
     ) -> None:
-        """Initialize.
+        """Initialize the block.
 
         Args:
-            features: Input feature count (and default for
-                ``out_features``).
-            hidden_features: Hidden size; defaults to ``4 * features``.
-            out_features: Output feature count; defaults to
-                ``features``.
-            dropout: Dropout applied between the two linear layers.
-            activation: Name of the activation: ``"gelu"`` / ``"relu"``
-                / ``"silu"``.
-            rngs: PRNG source for parameter initialization.
-            dtype: Parameter dtype.
-            fc1_sharding: Optional sharding for the first linear weight.
-            fc2_sharding: Optional sharding for the second linear weight.
-            fc1_bias_sharding: Optional sharding for the first linear bias.
-            fc2_bias_sharding: Optional sharding for the second linear bias.
+            features: Input feature count and default for
+                ``out_features``.
+            hidden_features: Hidden width. Defaults to
+                ``4 * features`` — the standard transformer ratio.
+            out_features: Output feature count. Defaults to
+                ``features`` so the block can be used as a residual
+                update without extra projections.
+            dropout: Drop probability for the :class:`Dropout` layer
+                between the activation and the second linear.
+                ``0.0`` (default) disables it entirely.
+            activation: Name of the activation; one of ``"gelu"``,
+                ``"relu"``, ``"silu"``. Used as a string so the
+                layer remains a static-attribute Spectrax module.
+            rngs: PRNG source for both ``fc1`` and ``fc2``.
+            dtype: Parameter dtype forwarded to both linears.
+            fc1_sharding: Optional sharding for the first linear's
+                weight.
+            fc2_sharding: Optional sharding for the second linear's
+                weight.
+            fc1_bias_sharding: Optional sharding for the first
+                linear's bias.
+            fc2_bias_sharding: Optional sharding for the second
+                linear's bias.
         """
         super().__init__()
         hidden = hidden_features if hidden_features is not None else 4 * features
@@ -85,10 +111,22 @@ class MLPBlock(Module):
         self.drop = Dropout(dropout)
 
     def forward(self, x: ArrayLike, *, rngs: Rngs | None = None, **_: object) -> Array:
-        """Thread ``x`` through ``fc1 -> activation -> dropout -> fc2``.
+        """Thread ``x`` through ``fc1 -> activation -> Dropout -> fc2``.
+
+        Args:
+            x: Input tensor whose trailing axis equals
+                :attr:`features`.
+            rngs: :class:`Rngs` forwarded to the inner
+                :class:`Dropout`. Required only when ``dropout > 0``
+                and the module is in training mode.
+            **_: Ignored; accepted for container interoperability.
+
+        Returns:
+            Tensor with shape ``x.shape[:-1] + (out_features,)``.
 
         Raises:
-            ValueError: If :attr:`activation` is not a recognized name.
+            ValueError: If :attr:`activation` is not one of
+                ``"gelu"``, ``"relu"``, ``"silu"``.
         """
         y = self.fc1(x)
         if self.activation == "gelu":

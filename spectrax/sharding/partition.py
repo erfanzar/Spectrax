@@ -48,6 +48,7 @@ rather than a silent miscompile.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -99,17 +100,32 @@ def with_partitioning(
 ) -> Callable[..., Array]:
     """Wrap an initializer so its output carries ``axis_names`` metadata.
 
-    The returned callable has the same ``(key, shape, dtype)`` signature
-    as the wrapped initializer but additionally returns arrays whose
-    sharding metadata has been pre-stamped via the companion
-    ``_spx_sharding`` attribute (consumed by constructors that don't
-    take a ``sharding=`` keyword but still want to record it). The
-    same attribute is also set on the wrapper itself so callers can
-    introspect the configured sharding without invoking the initializer.
+    Returns a callable with the same ``(key, shape, dtype) -> Array``
+    signature as the wrapped initializer. After invocation, the
+    returned array also has an ``_spx_sharding`` attribute set to the
+    normalized :class:`Sharding` derived from ``axis_names`` — this is
+    the channel through which constructors that *don't* take a
+    ``sharding=`` keyword still pick up sharding metadata. The same
+    attribute is set on the wrapper itself so callers can introspect
+    the configured sharding without invoking the initializer.
 
-    In practice the cleanest use is::
+    Note that some array implementations are immutable; the helper
+    suppresses the resulting ``AttributeError`` / ``TypeError`` so the
+    initializer still returns a usable value (just without the
+    ``_spx_sharding`` annotation in that case).
 
-        w_init = with_partitioning(normal(0.02), ("embed", "features"))
+    Args:
+        init: The base initializer to wrap.
+        axis_names: Either an axis-name spec (string, tuple of strings,
+            etc.) or a fully-formed :class:`Sharding`. Normalized via
+            :func:`spectrax.core.sharding.normalize_sharding`.
+
+    Returns:
+        A callable wrapping ``init`` with an attached ``_spx_sharding``
+        annotation.
+
+    Example:
+        >>> w_init = with_partitioning(normal(0.02), ("embed", "features"))
     """
     sharding = normalize_sharding(axis_names)
 
@@ -127,16 +143,36 @@ def with_partitioning(
 
 
 def _iter_variables(module: Module):
-    """Yield ``(path, var)`` for every variable in ``module`` in graph order."""
+    """Yield ``(path, var)`` for every :class:`Variable` in ``module`` in graph order.
+
+    A thin wrapper over :class:`~spectrax.core.selector.select` so the
+    spec-extraction helpers can iterate variables without importing the
+    selector module at every call site.
+    """
     yield from select().apply(module)
 
 
 def get_partition_spec(module: Module) -> dict[str, dict[str, PartitionSpec | None]]:
-    """Return ``{collection: {path: PartitionSpec}}`` derived from axis_names.
+    """Return ``{collection: {path: PartitionSpec}}`` derived from variable metadata.
 
-    Any variable without ``axis_names`` metadata maps to a fully
-    replicated :class:`PartitionSpec`. Resolution honors the
-    currently-active :func:`~spectrax.sharding.logical_axis_rules`.
+    Walks every :class:`~spectrax.Variable` reachable from ``module``
+    (via :class:`~spectrax.core.selector.select`) and builds a nested
+    dict keyed by collection (``"param"``, ``"state"``, ``"rng"``, …)
+    and then by tree path. Each variable's ``sharding`` metadata is
+    used directly when present; otherwise its ``axis_names`` metadata
+    is wrapped into a :class:`Sharding`, and finally absent metadata
+    falls through to a fully replicated :class:`PartitionSpec`.
+
+    Resolution honors the currently-active
+    :func:`~spectrax.sharding.logical_axis_rules` so the same module
+    can produce different specs depending on the enclosing rule
+    context.
+
+    Args:
+        module: The :class:`~spectrax.Module` to walk.
+
+    Returns:
+        Nested mapping ``{collection_name: {path: PartitionSpec | None}}``.
     """
     rules = current_axis_rules()
     out: dict[str, dict[str, PartitionSpec | None]] = {}
@@ -152,7 +188,12 @@ def get_partition_spec(module: Module) -> dict[str, dict[str, PartitionSpec | No
 
 
 def _resolve_named_sharding_mesh(mesh: "Mesh | SpxMesh | MpMdMesh") -> tuple["Mesh", "MpMdMesh | None"]:
-    """Return ``(base_mesh, mpmd_mesh_or_none)`` for sharding resolution."""
+    """Return ``(base_mesh, mpmd_mesh_or_none)`` for sharding resolution.
+
+    Unwraps :class:`SpxMesh` / :class:`MpMdMesh` into the underlying
+    :class:`jax.sharding.Mesh` plus, when applicable, the MPMD view.
+    Plain :class:`Mesh` inputs return ``(mesh, None)``.
+    """
     from ..runtime.types.mesh import MpMdMesh
 
     if isinstance(mesh, SpxMesh):
@@ -440,7 +481,31 @@ def sanitize_partition_spec_for_mesh_and_shape(
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
     shape: tuple[int, ...] | None = None,
 ) -> PartitionSpec:
-    """Make a ``PartitionSpec`` safe for the target mesh and optional value shape."""
+    """Make a :class:`PartitionSpec` safe for the target mesh and optional value shape.
+
+    The transformation is layered:
+
+    1. ``None`` / non-``PartitionSpec`` inputs are coerced to the
+       fully-replicated spec or wrapped via ``PartitionSpec(*spec)``.
+    2. The MPMD pipeline axis (if any) is dropped from every dimension
+       so a tensor is never accidentally constrained along the rank
+       axis.
+    3. Every remaining axis-name part is filtered to those present on
+       the mesh (via :func:`_sanitize_axis_for_mesh`).
+    4. If ``shape`` is given, specs whose length exceeds ``len(shape)``
+       collapse to fully replicated; otherwise per-dim entries that
+       don't divide ``shape[dim]`` evenly are zeroed out.
+
+    Args:
+        spec: Spec to sanitize, or ``None`` for fully replicated.
+        mesh: The target mesh (any SpectraX or JAX flavor). When ``None``,
+            only step 1 applies.
+        shape: Optional value shape used for the divisibility check.
+
+    Returns:
+        A :class:`PartitionSpec` safe to pass to ``with_sharding_constraint``
+        on the resolved mesh.
+    """
     if spec is None:
         spec = PartitionSpec()
     elif not isinstance(spec, PartitionSpec):
@@ -536,7 +601,37 @@ def _resolve_constraint_target(
     stage_mesh: "Mesh | None",
     metadata: dict[str, Any] | None,
 ) -> tuple["Mesh | None", "MpMdMesh | None", bool]:
-    """Return ``(target_mesh, mpmd_mesh, unresolved_mpmd)`` for a constraint."""
+    """Return ``(target_mesh, mpmd_mesh, unresolved_mpmd)`` for a constraint.
+
+    The fallback chain (in priority order) is:
+
+    1. Explicit ``stage_mesh`` argument.
+    2. Explicit ``stage`` argument (resolved to a sub-mesh via
+       :class:`MpMdMesh.submesh`).
+    3. Variable ``metadata['stage']`` -> resolved similarly.
+    4. Active :func:`assign_stage` context.
+    5. The array's existing :class:`NamedSharding` already on a
+       single-stage sub-mesh.
+    6. The current JAX physical mesh, again single-stage.
+    7. The owning MPMD rank of the running process.
+    8. If ``mpmd_dim == 1``, the only stage.
+
+    If none of those succeed (truly unresolved on a multi-stage mesh)
+    the function returns the base mesh with ``unresolved_mpmd=True``,
+    and callers treat the constraint as a no-op rather than risk a
+    miscompile.
+
+    Args:
+        arr: The array being constrained — used for the existing-sharding
+            and shape-based fallbacks.
+        mesh: The mesh to resolve against (any SpectraX or JAX flavor).
+        stage: Explicit stage selector.
+        stage_mesh: Pre-built stage-local mesh.
+        metadata: Optional variable metadata dict.
+
+    Returns:
+        ``(target_mesh, mpmd_mesh_or_none, unresolved_flag)``.
+    """
     base_mesh, mpmd_mesh = (None, None)
     if mesh is not None:
         base_mesh, mpmd_mesh = _resolve_named_sharding_mesh(mesh)
@@ -594,17 +689,39 @@ def with_sharding_constraint(
     metadata: dict[str, Any] | None = None,
     ignore_mpmd: bool = False,
 ) -> ArrayLike:
-    """MPMD-aware variant of ``jax.lax.with_sharding_constraint``.
+    """MPMD-aware variant of :func:`jax.lax.with_sharding_constraint`.
 
     Pure SPMD meshes use the same semantics as a normal sharding
-    constraint. MPMD meshes resolve a stage-local target mesh from, in
-    order: ``stage_mesh``, ``stage``, variable ``metadata``, active
-    ``assign_stage(...)`` context, the array's existing sharding, the
-    current JAX mesh context, or the process-local MPMD rank. If no stage
-    can be resolved on a multi-stage single-host mesh, this is a safe
-    no-op rather than accidentally constraining on the full PP mesh.
-    Passing ``ignore_mpmd=True`` makes MPMD meshes an explicit no-op,
-    while still constraining normally on SPMD meshes.
+    constraint. MPMD meshes resolve a stage-local target mesh through
+    :func:`_resolve_constraint_target` (see that function for the full
+    fallback chain). If no stage can be resolved on a multi-stage mesh,
+    this is a safe no-op rather than accidentally constraining on the
+    full pipeline mesh. Passing ``ignore_mpmd=True`` makes MPMD meshes
+    an explicit no-op while still constraining normally on SPMD meshes.
+
+    The function also accepts pytrees of arrays — a single sharding is
+    broadcast to every leaf via :func:`lax_reshard`. Specs are sanitized
+    (mesh-axis-filtered, shape-divisibility-checked) before being
+    passed to JAX so the same call can run on different mesh shapes
+    without manual cleanup. Empty-mesh ``RuntimeError``\\s from JAX
+    are caught and downgraded to a no-op.
+
+    Args:
+        arr: The array (or pytree of arrays) to constrain.
+        sharding: A :class:`PartitionSpec`, :class:`NamedSharding`, or
+            anything iterable that can be wrapped as a ``PartitionSpec``.
+        mesh: Optional explicit mesh; defaults to the active SpectraX /
+            JAX mesh context.
+        stage: Optional MPMD stage selector — see
+            :func:`_resolve_constraint_target`.
+        stage_mesh: Optional pre-built stage-local mesh.
+        metadata: Optional variable metadata used for stage inference.
+        ignore_mpmd: If ``True``, treat MPMD meshes as a no-op even
+            when a stage *can* be resolved.
+
+    Returns:
+        The constrained array (or pytree), or ``arr`` unchanged if the
+        constraint was determined to be a safe no-op.
     """
     resolved_mesh = mesh
     if resolved_mesh is None:
@@ -705,9 +822,30 @@ def lax_reshard(
 ) -> Any:
     """Apply an MPMD-aware sharding constraint to an array or pytree.
 
-    ``PartitionSpec`` / ``NamedSharding`` values apply to every array
-    leaf. A pytree of specs can also be passed, matching the input tree.
-    Non-array leaves are returned unchanged.
+    Two calling conventions:
+
+    * **Single spec, broadcast** — pass a :class:`PartitionSpec` /
+      :class:`NamedSharding` / ``None`` / list-of-axis-names; it is
+      applied to every array leaf in ``arr``.
+    * **Per-leaf pytree** — pass a pytree of specs whose structure
+      matches ``arr``; each leaf gets its own constraint.
+
+    The is-leaf detection is :func:`_is_single_sharding_spec`. Non-array
+    leaves are returned unchanged. The actual per-leaf constraint runs
+    through :func:`with_sharding_constraint`, so MPMD-aware
+    stage-local resolution applies.
+
+    Args:
+        arr: An array or pytree of arrays.
+        sharding: A single sharding spec or a per-leaf pytree of specs.
+        mesh: Forwarded to :func:`with_sharding_constraint`.
+        stage: Forwarded.
+        stage_mesh: Forwarded.
+        metadata: Forwarded.
+        ignore_mpmd: Forwarded.
+
+    Returns:
+        The reshareded pytree.
     """
     if _is_single_sharding_spec(sharding):
         return jax.tree_util.tree_map(
@@ -767,7 +905,25 @@ def _named_sharding_for_leaf(leaf: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None"
 
 
 def extract_shardings(tree: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None" = None) -> Any:
-    """Extract a pytree of compatible ``NamedSharding`` objects from ``tree``."""
+    """Extract a pytree of mesh-aligned :class:`NamedSharding` objects from ``tree``.
+
+    For every array leaf, reads the leaf's existing
+    :class:`NamedSharding` (if any), sanitizes its spec for ``mesh`` and
+    the leaf's shape, and re-binds the result to ``mesh``. Leaves
+    without a ``NamedSharding`` and non-array leaves become ``None``.
+
+    The returned pytree has the same structure as ``tree`` and is
+    suitable as the ``out_shardings`` / ``in_shardings`` argument of
+    :func:`jax.jit`.
+
+    Args:
+        tree: Input pytree.
+        mesh: Optional explicit mesh; forwarded to
+            :func:`_named_sharding_for_leaf`.
+
+    Returns:
+        A pytree of :class:`NamedSharding` (or ``None``) leaves.
+    """
     return jax.tree.map(lambda leaf: _named_sharding_for_leaf(leaf, mesh), tree)
 
 
@@ -851,8 +1007,42 @@ def match_partition_rules(
     min_size: int | None = None,
     strict: bool = True,
 ) -> Any:
-    """Match regex partition rules against tree paths and preserve tree structure."""
-    import re
+    """Match regex partition rules against tree paths and preserve tree structure.
+
+    Each entry in ``rules`` is a ``(regex, spec)`` pair. For every leaf
+    in ``tree`` the function renders the JAX tree path as a
+    ``"/"``-separated string, then walks the rules in order and uses
+    the *first* one whose ``regex`` matches anywhere in the path
+    (:func:`re.search` semantics). The resulting :class:`PartitionSpec`
+    is wrapped (if needed), optionally truncated to the leaf's rank,
+    and returned in place of the leaf.
+
+    Strict mode (default) and the optional ``min_size`` filter both
+    coerce certain leaves to fully-replicated specs:
+
+    * Non-array leaves -> ``PartitionSpec()``
+    * Scalar arrays (``ndim == 0``) -> ``PartitionSpec()``
+    * Arrays smaller than ``min_size`` -> ``PartitionSpec()``
+    * Specs with ``len(spec) > leaf.ndim`` are truncated.
+
+    Args:
+        rules: Sequence of ``(regex_pattern, PartitionSpec)`` pairs in
+            priority order.
+        tree: Pytree of arrays / leaves.
+        min_size: Skip the rule lookup (use replicated) for arrays
+            with fewer than ``min_size`` elements. ``None`` (default)
+            disables this check.
+        strict: When ``True`` (default), apply the empty-shape and
+            spec-truncation checks above; when ``False``, return the
+            matched spec verbatim.
+
+    Returns:
+        Pytree of :class:`PartitionSpec` matching ``tree``'s structure.
+
+    Raises:
+        ValueError: If no rule matches a given leaf path. (To allow
+            unmatched leaves silently, prepend a catch-all ``(".", PartitionSpec())``.)
+    """
 
     def _path_to_string(path: tuple[Any, ...], sep: str = "/") -> str:
         """Render a JAX tree-key path as a forward-slash-separated string."""
@@ -900,7 +1090,35 @@ def make_shard_and_gather_fns(
     partition_specs: Any,
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
 ) -> tuple[Any, Any]:
-    """Build shard/gather helper pytrees matching ``partition_specs``."""
+    """Build shard / gather helper pytrees matching ``partition_specs``.
+
+    Returns a pair of pytrees with the same structure as
+    ``partition_specs``:
+
+    * **shard fns** — each leaf is a callable ``(x) -> x_sharded`` that
+      :func:`jax.device_put`\\s its argument onto the resolved
+      :class:`NamedSharding` (with per-call shape sanitization).
+    * **gather fns** — each leaf is a callable ``(x) -> x_replicated``
+      that :func:`jax.device_put`\\s onto the same mesh but with a
+      fully-replicated :class:`PartitionSpec`.
+
+    Pair these with :func:`jax.tree.map` over a model state to push
+    parameters into a sharded layout (or pull them back to a single
+    process) — typical use is checkpoint save / load.
+
+    Args:
+        partition_specs: Pytree of :class:`PartitionSpec` (typically
+            produced by :func:`get_partition_spec` or
+            :func:`match_partition_rules`).
+        mesh: The target mesh. Required — raises :class:`ValueError`
+            if ``None`` because shard/gather both need a concrete mesh.
+
+    Returns:
+        ``(shard_fns, gather_fns)`` — two pytrees of callables.
+
+    Raises:
+        ValueError: If ``mesh`` is ``None``.
+    """
     target_mesh = to_jax_mesh(mesh)
     if target_mesh is None:
         raise ValueError("mesh must be provided to make_shard_and_gather_fns")
@@ -953,7 +1171,25 @@ def get_corrected_named_sharding(
     partition_spec: PartitionSpec,
     raise_mesh_error: bool = True,
 ) -> NamedSharding:
-    """Return an active-mesh ``NamedSharding`` whose spec is valid for ``shape``."""
+    """Return an active-mesh :class:`NamedSharding` whose spec is valid for ``shape``.
+
+    Wraps :func:`sanitize_partition_spec_for_mesh_and_shape` and binds
+    the result to the active SpectraX / JAX mesh. When no mesh context
+    is active, falls back to a 1-device dummy mesh so the result is
+    still usable on single-host CPU runs (controlled by
+    ``raise_mesh_error``).
+
+    Args:
+        shape: The value's shape (used for divisibility-based axis
+            dropping).
+        partition_spec: The desired raw spec, before sanitization.
+        raise_mesh_error: When ``True`` (default), raise if no mesh is
+            active. When ``False``, fall back to a 1-device CPU dummy
+            mesh.
+
+    Returns:
+        A mesh-bound :class:`NamedSharding`.
+    """
     mesh = get_incontext_mesh(raise_error=raise_mesh_error)
     if mesh is None:
         target_mesh = jax.sharding.Mesh(jax.devices()[:1], ("spx",))
@@ -1023,7 +1259,34 @@ def _identity_mesh_axis_rules(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -
 
 
 def named_sharding_for_metadata(metadata: dict[str, Any], mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding | None:
-    """Resolve raw variable-style metadata to a ``NamedSharding``."""
+    """Resolve raw variable-style ``metadata`` to a :class:`NamedSharding`.
+
+    Reads a ``Variable``-style metadata dict (the kind returned from
+    ``var.metadata`` or built by hand for non-variable arrays) and
+    produces a :class:`NamedSharding` aligned to ``mesh``. Resolution
+    rules:
+
+    1. ``metadata['sharding']`` is normalized via
+       :func:`spectrax.core.sharding.normalize_sharding`.
+    2. If absent, ``metadata['axis_names']`` is wrapped in a fresh
+       :class:`Sharding`.
+    3. If neither is present, returns ``None`` so callers can fall
+       back to a default replicated spec.
+    4. The resolved spec passes through the active
+       :func:`current_axis_rules` mapping (with raw mesh axis names
+       automatically mapped to themselves).
+    5. On an MPMD mesh, a ``metadata['stage']`` hint is honored to
+       produce a stage-local :class:`NamedSharding` via
+       :class:`MpMdMesh.sub_sharding`.
+
+    Args:
+        metadata: A variable's metadata dict (or equivalent).
+        mesh: The mesh to bind against (any SpectraX or JAX flavor).
+
+    Returns:
+        A :class:`NamedSharding` or ``None`` if the metadata declares
+        no sharding intent.
+    """
     sharding = normalize_sharding(metadata.get("sharding"))
     if sharding is None:
         names = metadata.get("axis_names")

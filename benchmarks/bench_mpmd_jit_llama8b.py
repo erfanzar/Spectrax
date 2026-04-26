@@ -20,7 +20,7 @@ import contextlib
 import os
 import time
 
-os.environ.setdefault("JAX_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp

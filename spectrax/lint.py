@@ -2,7 +2,13 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Optional lint checks for spectrax modules."""
+"""Optional lint checks for :class:`~spectrax.Module` instances.
+
+These checks are advisory: nothing in spectrax's runtime depends on
+running them. They exist as escape hatches for catching common authoring
+mistakes (e.g. accidentally aliased parameters) before they show up as
+divergent gradients during training.
+"""
 
 from __future__ import annotations
 
@@ -38,7 +44,21 @@ def check_unintentional_sharing(module: Module) -> list[tuple[str, str]]:
     canonical_paths = {p for _, p in gdef.var_canonical}
 
     def untagged_variable_alias(_alias: str, canonical: str) -> bool:
-        """Return ``True`` iff the variable at ``canonical`` lacks a ``tie_group``."""
+        """Decide whether the variable at ``canonical`` lacks a ``tie_group`` tag.
+
+        Looks up the variable's metadata via :data:`gdef.var_canonical`
+        and the ``rid_metadata`` map captured in the enclosing scope.
+
+        Args:
+            _alias: The aliased path (unused here; kept so the
+                signature mirrors the iterator producing pairs).
+            canonical: The canonical variable path being checked.
+
+        Returns:
+            ``True`` when the variable is shared without an explicit
+            ``"tie_group"`` metadata key (i.e. the alias is suspect),
+            ``False`` otherwise.
+        """
         for r, p in gdef.var_canonical:
             if p == canonical:
                 return "tie_group" not in rid_metadata.get(r, {})
@@ -53,7 +73,7 @@ def check_unintentional_sharing(module: Module) -> list[tuple[str, str]]:
                 if canonical == "":
                     var_alias = f"{alias}.{var_path}" if alias else var_path
                 elif var_path.startswith(canonical + "."):
-                    var_alias = f"{alias}{var_path[len(canonical):]}"
+                    var_alias = f"{alias}{var_path[len(canonical) :]}"
                 else:
                     continue
                 if untagged_variable_alias(var_alias, var_path):

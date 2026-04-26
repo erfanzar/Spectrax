@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+.json
 build/
 develop-eggs/
 dist/
@@ -205,3 +206,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+exp.py
+env.py
+vxp.py
+tmp-files/autoresearch-results.tsv
+/autoresearch-results.tsv
+*.tsv
+benchmarks/results
+*.json

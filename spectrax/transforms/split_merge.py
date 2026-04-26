@@ -1,0 +1,752 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""The shared split/merge shim used by every spectrax transform.
+
+Every spectrax transform follows the same recipe:
+
+1. Walk ``args`` / ``kwargs`` to locate :class:`~spectrax.Module`
+   instances via :func:`locate_and_strip` (or
+   :func:`locate_and_strip_fast` on the kwargs-empty hot path).
+2. :func:`~spectrax.export` each to produce ``(GraphDef, State)``.
+3. Build a pure function that, given the list of states, rebinds fresh
+   modules, calls the user function, and captures mutations by
+   snapshotting variable ``_value`` identities (:func:`make_pure`).
+4. Apply the underlying JAX transform to that pure function.
+5. On exit, apply mutations back to the original live modules,
+   restricted to the ``mutable`` selector, via :func:`apply_mutations`.
+
+Non-module arguments flow through unchanged via :func:`strip_modules`
+and :func:`splice_modules` (they are replaced with ``None`` placeholders
+through the pure function and re-spliced on the other side).
+"""
+
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+import jax
+
+from ..core.context import _enter as _ctx_enter
+from ..core.errors import IllegalMutationError
+from ..core.graph import GraphDef, bind, export, live_variables
+from ..core.module import Module, _graph_epoch, _inside_transform, _set_inside_transform
+from ..core.selector import Selector, SelectorSugar, as_selector
+from ..core.selector import select as _sel
+from ..core.state import State
+from ..core.variable import _get_write_hook, _set_write_hook
+
+__all__ = [
+    "apply_mutations",
+    "assert_state_unchanged",
+    "locate_and_strip",
+    "locate_modules",
+    "make_direct_readonly",
+    "make_pure",
+    "make_pure_ctx",
+    "make_pure_readonly",
+    "make_pure_readonly_ctx",
+    "make_pure_readonly_single_positional",
+    "make_pure_single_positional",
+    "resolve_mutable",
+    "splice_modules",
+    "strip_modules",
+]
+
+
+PureFn = Callable[
+    [tuple[State, ...], tuple[Any, ...], dict[str, Any]],
+    tuple[Any, tuple[State, ...]],
+]
+"""Type of the pure function produced by :func:`make_pure`."""
+
+
+@dataclass(slots=True)
+class _ModuleRef:
+    """A located module inside a transform's argument tree.
+
+    Attributes:
+        kind: ``"arg"`` or ``"kwarg"``.
+        locator: Integer index (when ``kind == "arg"``) or string key
+            (when ``kind == "kwarg"``).
+        module: The live module reference.
+        gdef: The graph-def snapshotted at :func:`locate_modules`.
+        state: The state snapshotted at :func:`locate_modules`.
+    """
+
+    kind: str
+    locator: int | str
+    module: Module
+    gdef: GraphDef
+    state: State
+
+
+def locate_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[_ModuleRef]:
+    """Scan ``args`` / ``kwargs`` and return one :class:`_ModuleRef` per :class:`Module`.
+
+    Each reference carries a freshly-computed ``(gdef, state)`` snapshot
+    used as the input to the transform.
+    """
+    refs: list[_ModuleRef] = []
+    for i, a in enumerate(args):
+        if isinstance(a, Module):
+            g, s = export(a)
+            refs.append(_ModuleRef("arg", i, a, g, s))
+    for k, v in kwargs.items():
+        if isinstance(v, Module):
+            g, s = export(v)
+            refs.append(_ModuleRef("kwarg", k, v, g, s))
+    return refs
+
+
+def locate_and_strip_fast(args: tuple[Any, ...]) -> tuple[list[_ModuleRef], tuple[Any, ...]]:
+    """Kwargs-less fast variant of :func:`locate_and_strip`.
+
+    Single pass over positional ``args``; each :class:`Module` is
+    exported into a :class:`_ModuleRef` and replaced by ``None`` in the
+    stripped tuple. Used by :func:`~spectrax.jit`'s kwargs-empty hot
+    path (the common case for training-step wrappers).
+    """
+    refs: list[_ModuleRef] = []
+    stripped: list[Any] = []
+    for i, a in enumerate(args):
+        if isinstance(a, Module):
+            g, s = export(a)
+            refs.append(_ModuleRef("arg", i, a, g, s))
+            stripped.append(None)
+        else:
+            stripped.append(a)
+    return refs, tuple(stripped)
+
+
+def locate_and_strip(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[list[_ModuleRef], tuple[Any, ...], dict[str, Any]]:
+    """Locate modules and strip them to ``None`` placeholders in one pass.
+
+    Fused equivalent of :func:`locate_modules` followed by
+    :func:`strip_modules`. Each ``args`` / ``kwargs`` sequence is
+    iterated exactly once; non-module values flow through to the
+    stripped tuple/dict while module values are exported (gdef + state
+    snapshot) and recorded in a :class:`_ModuleRef`. Used by every
+    module-aware transform wrapper (:func:`~spectrax.jit`,
+    :func:`~spectrax.vmap`, :func:`~spectrax.remat`) on the dispatch
+    hot path.
+
+    Args:
+        args: Positional arguments passed to the wrapped function.
+        kwargs: Keyword arguments passed to the wrapped function.
+
+    Returns:
+        A triple ``(refs, stripped_args, stripped_kwargs)``:
+
+        * ``refs`` — one :class:`_ModuleRef` per located module, in the
+          order ``args`` first then ``kwargs``.
+        * ``stripped_args`` — ``args`` with every module replaced by
+          ``None`` so the rest passes cleanly through :func:`jax.jit`.
+        * ``stripped_kwargs`` — same substitution applied to ``kwargs``.
+    """
+    refs: list[_ModuleRef] = []
+    new_args_list: list[Any] = [None] * len(args)
+    for i, a in enumerate(args):
+        if isinstance(a, Module):
+            g, s = export(a)
+            refs.append(_ModuleRef("arg", i, a, g, s))
+        else:
+            new_args_list[i] = a
+    new_kwargs: dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if isinstance(v, Module):
+            g, s = export(v)
+            refs.append(_ModuleRef("kwarg", k, v, g, s))
+            new_kwargs[k] = None
+        else:
+            new_kwargs[k] = v
+    return refs, tuple(new_args_list), new_kwargs
+
+
+def strip_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Replace :class:`Module` entries with ``None`` placeholders.
+
+    The result flows through the pure function as a normal JAX pytree
+    input; modules themselves are passed separately as states.
+    """
+    new_args = tuple(None if isinstance(a, Module) else a for a in args)
+    new_kwargs = {k: None if isinstance(v, Module) else v for k, v in kwargs.items()}
+    return new_args, new_kwargs
+
+
+def splice_modules(
+    stripped_args: tuple[Any, ...],
+    stripped_kwargs: dict[str, Any],
+    refs: list[_ModuleRef],
+    modules: list[Module],
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Write freshly-bound ``modules`` back into the stripped-arg tree.
+
+    The inverse of :func:`strip_modules`. Preserves positional and
+    keyword locations as recorded in ``refs``.
+    """
+    args = list(stripped_args)
+    kwargs = dict(stripped_kwargs)
+    for ref, m in zip(refs, modules, strict=False):
+        if ref.kind == "arg":
+            args[ref.locator] = m
+        else:
+            kwargs[ref.locator] = m
+    return tuple(args), kwargs
+
+
+def _run_pure_body(
+    fn: Callable[..., Any],
+    gdefs: tuple[GraphDef, ...],
+    orig_modules: tuple[Module, ...],
+    refs: list[_ModuleRef],
+    states: tuple[State, ...],
+    stripped_args: tuple[Any, ...],
+    stripped_kwargs: dict[str, Any],
+    ctx: dict[str, Any] | None,
+) -> tuple[Any, tuple[State, ...]]:
+    """Shared trace-time body of :func:`make_pure` and :func:`make_pure_ctx`.
+
+    Rebinds fresh modules from ``states``, snapshots each live
+    variable's ``_value`` identity, invokes ``fn``, and re-packs only
+    the mutated leaves into ``new_states``. When ``ctx`` is provided
+    (the :func:`make_pure_ctx` path), the invocation is wrapped in
+    :func:`_ctx_enter` so :func:`~spectrax.scope` lookups inside the
+    trace see the traced values instead of concrete ones.
+    """
+    modules = [bind(g, s) for g, s in zip(gdefs, states, strict=False)]
+    for src, dst in zip(orig_modules, modules, strict=False):
+        _copy_runtime_state(src, dst)
+    initial: list[list[tuple[str, Any, Any]]] = []
+    for m in modules:
+        entries: list[tuple[str, Any, Any]] = []
+        for path, v in live_variables(m):
+            entries.append((path, v, v._value))
+        initial.append(entries)
+    fargs, fkwargs = splice_modules(stripped_args, stripped_kwargs, refs, modules)
+    _set_inside_transform(True)
+    try:
+        if ctx is None:
+            out = fn(*fargs, **fkwargs)
+        else:
+            with _ctx_enter(ctx):
+                out = fn(*fargs, **fkwargs)
+    finally:
+        _set_inside_transform(False)
+    new_states: list[State] = []
+    for entries in initial:
+        changed: dict[str, dict[str, Any]] = {}
+        for path, var, init_val in entries:
+            cur = var._value
+            if cur is not init_val:
+                changed.setdefault(var.kind, {})[path] = cur
+        new_states.append(State(changed))
+    return out, tuple(new_states)
+
+
+def _raise_illegal_mutation(collection: str, path: str) -> None:
+    """Raise the standard undeclared-mutation error."""
+    raise IllegalMutationError(
+        f"Collection {collection!r} at path {path!r} changed under a "
+        f"transform but was not declared mutable. Add it to `mutable=`."
+    )
+
+
+def make_direct_readonly(
+    fn: Callable[..., Any],
+    *,
+    explicit_modules: tuple[Module, ...] | None = None,
+    structural_error_message: str | None = None,
+) -> Callable[..., Any]:
+    """Wrap ``fn`` so any direct module write raises immediately.
+
+    This helper is used by immutable fast paths that operate on live
+    Module pytrees directly instead of round-tripping through
+    ``(GraphDef, State)``. It snapshots the current variable identities,
+    installs a temporary write hook, and verifies both value and
+    structural immutability after ``fn`` returns.
+    """
+
+    @functools.wraps(fn)
+    def guarded(*args: Any, **kwargs: Any) -> Any:
+        """Variable-write-protected wrapper around ``fn``.
+
+        Snapshots all live variables of the module(s) involved,
+        installs a write hook that raises on any direct mutation,
+        runs ``fn``, and asserts that no value or structural change
+        slipped through. Module collections that the caller wants
+        to mutate must use the explicit :func:`apply_mutations`
+        path instead.
+        """
+        modules = list(explicit_modules) if explicit_modules is not None else []
+        if explicit_modules is None:
+            for value in args:
+                if isinstance(value, Module):
+                    modules.append(value)
+            for value in kwargs.values():
+                if isinstance(value, Module):
+                    modules.append(value)
+
+        epoch_before = _graph_epoch()
+        snapshots: list[tuple[str, str, Any, Any]] = []
+        for module in modules:
+            for path, var in live_variables(module):
+                snapshots.append((path, var.kind, var, var._value))
+
+        prev_hook = _get_write_hook()
+        prev_active = _inside_transform()
+
+        def readonly_hook(var: Any, _new: Any) -> bool:
+            """Write hook installed during a readonly transform — every write is an error.
+
+            Looks up the variable in the pre-recorded snapshots so the
+            error message includes the variable's path; falls back to
+            ``"<unknown>"`` for variables that were created during the
+            wrapped function (which is itself a structural mutation).
+            """
+            for path, kind, snap_var, _initial in snapshots:
+                if snap_var is var:
+                    _raise_illegal_mutation(kind, path)
+            _raise_illegal_mutation(var.kind, "<unknown>")
+
+        _set_write_hook(readonly_hook)
+        _set_inside_transform(True)
+        try:
+            out = fn(*args, **kwargs)
+        finally:
+            _set_inside_transform(prev_active)
+            _set_write_hook(prev_hook)
+
+        if _graph_epoch() != epoch_before:
+            if structural_error_message is not None:
+                raise ValueError(structural_error_message)
+            raise IllegalMutationError(
+                "Module structure changed under a transform but was not declared mutable. "
+                "Structural mutations are not supported here."
+            )
+        for path, kind, var, initial in snapshots:
+            if var._value is not initial:
+                _raise_illegal_mutation(kind, path)
+        return out
+
+    return guarded
+
+
+def _run_readonly_body(
+    fn: Callable[..., Any],
+    gdefs: tuple[GraphDef, ...],
+    orig_modules: tuple[Module, ...],
+    refs: list[_ModuleRef],
+    states: tuple[State, ...],
+    stripped_args: tuple[Any, ...],
+    stripped_kwargs: dict[str, Any],
+    ctx: dict[str, Any] | None,
+) -> Any:
+    """Pure-body variant for transforms that do not permit mutations."""
+    modules = [bind(g, s) for g, s in zip(gdefs, states, strict=False)]
+    for src, dst in zip(orig_modules, modules, strict=False):
+        _copy_runtime_state(src, dst)
+    epoch_before = _graph_epoch()
+    initial: list[list[tuple[str, str, Any, Any]]] = []
+    for m in modules:
+        entries: list[tuple[str, str, Any, Any]] = []
+        for path, v in live_variables(m):
+            entries.append((path, v.kind, v, v._value))
+        initial.append(entries)
+    fargs, fkwargs = splice_modules(stripped_args, stripped_kwargs, refs, modules)
+    _set_inside_transform(True)
+    try:
+        if ctx is None:
+            out = fn(*fargs, **fkwargs)
+        else:
+            with _ctx_enter(ctx):
+                out = fn(*fargs, **fkwargs)
+    finally:
+        _set_inside_transform(False)
+    if _graph_epoch() != epoch_before:
+        raise IllegalMutationError(
+            "Module structure changed under a transform but was not declared mutable. "
+            "Structural mutations are not supported here."
+        )
+    for entries in initial:
+        for path, kind, var, initial_value in entries:
+            if var._value is not initial_value:
+                _raise_illegal_mutation(kind, path)
+    return out
+
+
+def _run_single_positional_body(
+    fn: Callable[..., Any],
+    gdef: GraphDef,
+    orig_module: Module,
+    locator: int,
+    state: State,
+    args_without_module: tuple[Any, ...],
+    *,
+    readonly: bool,
+) -> Any:
+    """Specialized trace body for one positional Module and no kwargs."""
+    module = bind(gdef, state)
+    _copy_runtime_state(orig_module, module)
+    initial: list[tuple[str, str, Any, Any]] = []
+    for path, v in live_variables(module):
+        initial.append((path, v.kind, v, v._value))
+    epoch_before = _graph_epoch()
+    fargs = list(args_without_module)
+    fargs.insert(locator, module)
+    _set_inside_transform(True)
+    try:
+        out = fn(*fargs)
+    finally:
+        _set_inside_transform(False)
+    if _graph_epoch() != epoch_before:
+        raise IllegalMutationError(
+            "Module structure changed under a transform but was not declared mutable. "
+            "Structural mutations are not supported here."
+        )
+    if readonly:
+        for path, kind, var, initial_value in initial:
+            if var._value is not initial_value:
+                _raise_illegal_mutation(kind, path)
+        return out
+    changed: dict[str, dict[str, Any]] = {}
+    for path, _kind, var, initial_value in initial:
+        cur = var._value
+        if cur is not initial_value:
+            changed.setdefault(var.kind, {})[path] = cur
+    return out, State(changed)
+
+
+def make_pure(fn: Callable[..., Any], refs: list[_ModuleRef]) -> PureFn:
+    """Construct the pure function fed into :mod:`jax`.
+
+    The returned function has signature
+    ``pure(states, stripped_args, stripped_kwargs) -> (out, new_states)``.
+    It rebinds fresh :class:`Module` instances from the states, sets
+    the thread-local "inside transform" flag, calls ``fn`` with the
+    spliced arguments, and captures mutations by comparing each live
+    variable's ``_value`` identity against the pre-call snapshot.
+
+    This runs at trace time (once per compile). The trick:
+    :func:`~spectrax.bind` creates fresh :class:`~spectrax.Variable`
+    instances whose ``_value`` is the incoming tracer from
+    ``states``. Before calling ``fn`` we snapshot the ``_value``
+    identity of every live variable; after ``fn`` returns, any
+    variable whose ``_value`` is no longer identity-equal to its
+    snapshot was mutated during the call (a ``var.value = ...``
+    assignment rebinds ``_value`` to a new tracer).
+
+    Only those mutated leaves are packed into ``new_states``. The
+    unmutated majority is absent from the output pytree entirely,
+    so the post-jit :func:`apply_mutations` step has no per-leaf
+    comparison work to do on the dispatch hot path. The net effect
+    is that a pure forward pass through jit returns an empty state
+    tuple for every module.
+    """
+    gdefs = tuple(r.gdef for r in refs)
+    orig_modules = tuple(r.module for r in refs)
+
+    def pure(
+        states: tuple[State, ...],
+        stripped_args: tuple[Any, ...],
+        stripped_kwargs: dict[str, Any],
+    ) -> tuple[Any, tuple[State, ...]]:
+        """JAX-traced body: rebind modules, invoke ``fn``, emit only mutated leaves."""
+        return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
+
+    return pure
+
+
+def make_pure_readonly(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+    """Construct a pure function that rejects all module mutations."""
+    gdefs = tuple(r.gdef for r in refs)
+    orig_modules = tuple(r.module for r in refs)
+
+    def pure(
+        states: tuple[State, ...],
+        stripped_args: tuple[Any, ...],
+        stripped_kwargs: dict[str, Any],
+    ) -> Any:
+        """JAX-traced body: rebind modules read-only, invoke ``fn``, return its output."""
+        return _run_readonly_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
+
+    return pure
+
+
+def make_pure_single_positional(fn: Callable[..., Any], ref: _ModuleRef) -> Callable[..., Any]:
+    """Specialized pure fn for one positional Module and no kwargs."""
+    if ref.kind != "arg":
+        raise TypeError("make_pure_single_positional() requires a positional Module ref")
+    locator = int(ref.locator)
+
+    def pure(state: State, *args_without_module: Any) -> tuple[Any, State]:
+        """One-module variant: rebind, run ``fn``, return ``(output, mutated_state)``."""
+        return _run_single_positional_body(
+            fn,
+            ref.gdef,
+            ref.module,
+            locator,
+            state,
+            args_without_module,
+            readonly=False,
+        )
+
+    return pure
+
+
+def make_pure_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+    """Variant of :func:`make_pure` that reinstates a scope frame before ``fn``.
+
+    Used by :func:`~spectrax.jit` when the caller has active
+    :func:`~spectrax.scope` bindings. The extra ``traced_ctx`` argument
+    carries the array-typed scope values as a pytree, which JAX
+    lowers to tracers; installing them as a scope frame before
+    invoking ``fn`` lets deep ``spx.scope.get(...)`` calls inside the
+    traced body resolve to tracer values instead of the concrete
+    constants that were live at trace time.
+
+    Signature:
+    ``pure(states, traced_ctx, stripped_args, stripped_kwargs) ->
+    (out, new_states)``.
+
+    Args:
+        fn: The user function being traced.
+        refs: Module refs produced by :func:`locate_and_strip`.
+
+    Returns:
+        A pure callable consumable by :func:`jax.jit`.
+    """
+    gdefs = tuple(r.gdef for r in refs)
+    orig_modules = tuple(r.module for r in refs)
+
+    def pure(
+        states: tuple[State, ...],
+        traced_ctx: dict[str, Any],
+        stripped_args: tuple[Any, ...],
+        stripped_kwargs: dict[str, Any],
+    ) -> tuple[Any, tuple[State, ...]]:
+        """Same shape as :func:`make_pure`'s pure, plus a ``traced_ctx`` arg."""
+        return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, traced_ctx)
+
+    return pure
+
+
+def make_pure_readonly_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+    """Readonly variant of :func:`make_pure_ctx`."""
+    gdefs = tuple(r.gdef for r in refs)
+    orig_modules = tuple(r.module for r in refs)
+
+    def pure(
+        states: tuple[State, ...],
+        traced_ctx: dict[str, Any],
+        stripped_args: tuple[Any, ...],
+        stripped_kwargs: dict[str, Any],
+    ) -> Any:
+        """Same shape as :func:`make_pure_readonly`'s ``pure``, plus a ``traced_ctx`` arg."""
+        return _run_readonly_body(
+            fn,
+            gdefs,
+            orig_modules,
+            refs,
+            states,
+            stripped_args,
+            stripped_kwargs,
+            traced_ctx,
+        )
+
+    return pure
+
+
+def make_pure_readonly_single_positional(fn: Callable[..., Any], ref: _ModuleRef) -> Callable[..., Any]:
+    """Readonly specialized fn for one positional Module and no kwargs."""
+    if ref.kind != "arg":
+        raise TypeError("make_pure_readonly_single_positional() requires a positional Module ref")
+    locator = int(ref.locator)
+
+    def pure(state: State, *args_without_module: Any) -> Any:
+        """One-module readonly variant: rebind, run ``fn``, return only its output."""
+        return _run_single_positional_body(
+            fn,
+            ref.gdef,
+            ref.module,
+            locator,
+            state,
+            args_without_module,
+            readonly=True,
+        )
+
+    return pure
+
+
+def assert_state_unchanged(module: Module, before: State, after: State) -> None:
+    """Raise if any leaf value changed between two same-structure states."""
+    before_paths = set(before.paths())
+    after_paths = set(after.paths())
+    if before_paths != after_paths:
+        return
+    for collection, path, new_val in after.items():
+        old_val = before.get(collection, path)
+        if old_val is not new_val:
+            _raise_illegal_mutation(collection, path)
+
+
+def apply_mutations(
+    refs: list[_ModuleRef],
+    new_states: list[State],
+    mutable: Selector | None,
+) -> None:
+    """Write ``new_states`` back to the live modules, honoring ``mutable``.
+
+    The inverse of the trace-time capture done in :func:`make_pure`: for
+    every variable whose leaf differs from the pre-transform snapshot,
+    the new value is copied into the live :class:`~spectrax.Variable`'s
+    underlying storage. Leaves that are identity-equal to
+    :attr:`_ModuleRef.state` are treated as unchanged — either
+    :func:`make_pure` elided them at trace time, or a control-flow path
+    (:func:`~spectrax.cond`, :func:`~spectrax.scan`, …) merged the
+    untouched invariant portion of the state back in. Mutations outside
+    the ``mutable`` selector raise :class:`~spectrax.IllegalMutationError`.
+
+    The ``vars_by_path`` dict is built once per call by reusing the live
+    module's :func:`~spectrax.export` cache — no extra tree walk. The
+    ``allowed`` set is constructed lazily only when a real mutation is
+    detected, so a pure forward pass (no mutations) pays only an
+    ``if not new_raw: continue`` check per module.
+
+    Args:
+        refs: One :class:`_ModuleRef` per live module that flowed
+            through the transform.
+        new_states: List of :class:`State` objects parallel to ``refs``,
+            typically the second half of the pure function's return.
+        mutable: Selector picking which (collection, path) pairs are
+            allowed to mutate. ``None`` means "nothing mutable".
+
+    Raises:
+        IllegalMutationError: When a variable's leaf changed under a
+            transform but the (collection, path) is not picked by
+            ``mutable``.
+    """
+    mutable_kind_set: set[str] | None = None
+    if (
+        mutable is not None
+        and not mutable.subselectors
+        and not mutable.module_types
+        and not mutable.exclude_module_types
+        and not mutable.module_where
+        and not mutable.variable_types
+        and not mutable.exclude_variable_types
+        and not mutable.path_globs
+        and not mutable.variable_where
+        and not mutable.invert
+        and mutable.variable_kinds
+    ):
+        mutable_kind_set = set(mutable.variable_kinds)
+
+    if mutable_kind_set is not None:
+        for ref, new_state in zip(refs, new_states, strict=False):
+            if not new_state:
+                continue
+            cache = ref.module._spx_export_cache
+            vars_by_collection = cache[5] if cache is not None and len(cache) >= 6 else None
+            for c, p, new_val in new_state.items():
+                old_val = ref.state.get(c, p)
+                if old_val is new_val:
+                    continue
+                if c not in mutable_kind_set:
+                    raise IllegalMutationError(
+                        f"Collection {c!r} at path {p!r} changed under a "
+                        f"transform but was not declared mutable. "
+                        f"Add it to `mutable=`."
+                    )
+                if vars_by_collection is not None:
+                    inner = vars_by_collection.get(c)
+                    if inner is not None:
+                        var = inner.get(p)
+                        if var is not None:
+                            var._value = new_val
+                else:
+                    vars_by_path = {(_v.kind, _p): _v for _p, _v in _sel().apply(ref.module)}
+                    var = vars_by_path.get((c, p))
+                    if var is not None:
+                        var._value = new_val
+        return
+
+    for ref, new_state in zip(refs, new_states, strict=False):
+        if not new_state:
+            continue
+
+        vars_by_path: dict[tuple[str, str], Any] | None = None
+        allowed: set[tuple[str, str]] | None = None
+
+        for c, p, new_val in new_state.items():
+            old_val = ref.state.get(c, p)
+            if old_val is new_val:
+                continue
+            if allowed is None:
+                allowed = set()
+                if mutable is not None:
+                    for _p, _v in mutable.apply(ref.module):
+                        allowed.add((_v.kind, _p))
+            if (c, p) not in allowed:
+                raise IllegalMutationError(
+                    f"Collection {c!r} at path {p!r} changed under a "
+                    f"transform but was not declared mutable. "
+                    f"Add it to `mutable=`."
+                )
+            if vars_by_path is None:
+                cache = ref.module._spx_export_cache
+                if cache is not None and len(cache) >= 4:
+                    vars_by_path = cache[3]
+                else:
+                    vars_by_path = {(_v.kind, _p): _v for _p, _v in _sel().apply(ref.module)}
+            var = vars_by_path.get((c, p))
+            if var is not None:
+                var._raw_set(new_val)
+
+
+def _copy_runtime_state(src: Module, dst: Module) -> None:
+    """Copy non-graph runtime state (training flag) from ``src`` onto ``dst``.
+
+    :class:`Module` mode flags are not part of :class:`GraphDef` and
+    therefore do not survive :func:`bind`. This helper walks both trees in
+    lockstep and restores them so eager-mode toggles (``train()`` /
+    ``eval()``) take effect inside transforms.
+    """
+    object.__setattr__(dst, "_spx_training", src._spx_training)
+    src_children = list(src._spx_graph_children())
+    dst_children = list(dst._spx_graph_children())
+    for (_, sc), (_, dc) in zip(src_children, dst_children, strict=False):
+        if isinstance(sc, Module) and isinstance(dc, Module):
+            _copy_runtime_state(sc, dc)
+
+
+def _is_same(a: Any, b: Any) -> bool:
+    """Return ``True`` if ``a`` and ``b`` refer to the same array value.
+
+    Falls back to :func:`jax.numpy.array_equal`; returns ``False`` on
+    any comparison exception (traced values during tracing, etc.).
+    """
+    if a is b:
+        return True
+    try:
+        return bool(jax.numpy.array_equal(a, b))
+    except Exception:
+        return False
+
+
+def resolve_mutable(mutable: SelectorSugar | tuple[()] | list[Any]) -> Selector | None:
+    """Coerce a ``mutable=`` argument into a :class:`~spectrax.Selector`.
+
+    The empty tuple ``()`` and empty list ``[]`` as well as ``None``
+    resolve to ``None`` (meaning "no collections are mutable").
+    Everything else is forwarded to :func:`~spectrax.as_selector`.
+    """
+    if mutable is None or mutable == () or mutable == []:
+        return None
+    return as_selector(mutable)

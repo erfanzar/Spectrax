@@ -1,0 +1,1162 @@
+# Copyright (C) 2026 Erfan Zare Chavoshi
+# This file is part of EasyDeL.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""The :class:`Module` base class.
+
+:class:`Module` is the PyTorch-shaped base class every user module
+subclasses. It is deliberately *not* registered as a JAX pytree — state
+lives externally in :class:`~spectrax.State` and modules own
+:class:`~spectrax.Variable` cells that are the sole mutable leaves.
+
+Attribute discipline: an attribute assigned on a module must be one of
+
+* another :class:`Module` (including a container);
+* a :class:`~spectrax.Variable`
+  (:class:`~spectrax.Parameter`, :class:`~spectrax.Buffer`, …);
+* a :class:`~spectrax.Static` marker or an immutable hashable scalar
+  (contributes to :class:`~spectrax.GraphDef`);
+* an :class:`Opaque` escape hatch;
+* or a name starting with ``"_"`` (implementation detail; not
+  graph-visible).
+
+Attribute assignment order is recorded and becomes the stable path
+naming scheme used throughout spectrax.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import threading
+import warnings
+from collections.abc import Iterator
+from dataclasses import dataclass, fields, is_dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, Self
+
+import jax
+import jax.numpy as jnp
+
+from ._typing import ForwardHook, ForwardPreHook
+from .context import scope as _scope
+from .errors import LazyInitUnderTransformError
+from .lazy_init import _allow_materialization, _explicit_lazy_mode, _materialization_allowed
+from .policy import Policy, push_policy
+from .static import Static, is_static_scalar
+from .variable import DeferredBuffer, DeferredParameter, Variable
+
+if TYPE_CHECKING:
+    from ..rng.rngs import Rngs
+
+
+__all__ = ["Module", "Opaque"]
+
+
+_TRANSFORM_FLAG: threading.local = threading.local()
+
+
+def _inside_transform() -> bool:
+    """Return ``True`` iff a spectrax transform is currently active in this thread."""
+    return bool(getattr(_TRANSFORM_FLAG, "active", False))
+
+
+def _set_inside_transform(active: bool) -> None:
+    """Set the thread-local "inside a spectrax transform" flag.
+
+    Called by the split/merge shim on entry and exit of every transform.
+    """
+    _TRANSFORM_FLAG.active = active
+
+
+_GRAPH_EPOCH: int = 0
+"""Monotonic global counter bumped whenever any Module's structural
+shape changes (a Module/Variable attribute is added, replaced, or
+deleted anywhere in the program).
+
+Used by :mod:`spectrax.core.graph` to short-circuit repeat :func:`export`
+calls on the dispatch hot path: a Module caches its last
+``(epoch, gdef, var_paths)`` snapshot, and when the global epoch is
+unchanged the cache is still valid (the graph shape has not been
+touched). Value mutations on :class:`~spectrax.Variable` (``.value = …``
+or ``_raw_set``) do **not** bump the epoch — they change leaf contents,
+not shape — so normal training loops keep the cache hot.
+"""
+
+
+def _bump_graph_epoch() -> None:
+    """Invalidate every :func:`spectrax.export` cache across the program.
+
+    Called from :meth:`Module.__setattr__` and :meth:`Module.__delattr__`
+    whenever a graph-visible attribute is added, replaced, or removed.
+    Only the global counter is mutated; stale cache entries are detected
+    lazily on the next :func:`export` call.
+    """
+    global _GRAPH_EPOCH
+    _GRAPH_EPOCH += 1
+
+
+def _graph_epoch() -> int:
+    """Return the current global graph-structure epoch."""
+    return _GRAPH_EPOCH
+
+
+def _public_value(value: Any) -> Any:
+    """Return the value users should see for wrapper-backed attributes."""
+    if isinstance(value, Opaque | Static):
+        return value.value
+    return value
+
+
+def _opaque_hash_payload(value: Any) -> Any:
+    """Build a best-effort stable payload for an opaque Python object."""
+    if isinstance(value, Opaque):
+        return {"opaque": _opaque_hash_payload(value.value)}
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        try:
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "to_dict": value.to_dict(),
+            }
+        except Exception:
+            pass
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "model_dump": value.model_dump(),
+            }
+        except Exception:
+            pass
+    return {
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "repr": repr(value),
+    }
+
+
+def _normalize_hash_payload(value: Any, *, _seen: set[int] | None = None) -> Any:
+    """Normalize arbitrary metadata into a deterministic JSON-like tree.
+
+    Arrays are represented by shape and dtype only, never by values.
+    """
+    if _seen is None:
+        _seen = set()
+
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        return {"float": repr(value)}
+    if isinstance(value, complex):
+        return {"complex": [repr(value.real), repr(value.imag)]}
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+
+    if isinstance(value, Static):
+        return {"Static": _normalize_hash_payload(value.value, _seen=_seen)}
+    if isinstance(value, Opaque):
+        return {"Opaque": _normalize_hash_payload(_opaque_hash_payload(value.value), _seen=_seen)}
+
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if shape is not None or dtype is not None:
+        return {
+            "array": {
+                "shape": tuple(int(dim) for dim in tuple(shape or ())),
+                "dtype": str(dtype),
+            }
+        }
+
+    value_id = id(value)
+    if isinstance(value, dict | list | tuple | set | frozenset) or is_dataclass(value):
+        if value_id in _seen:
+            return {"cycle": f"{type(value).__module__}.{type(value).__qualname__}"}
+        _seen.add(value_id)
+        try:
+            if isinstance(value, dict):
+                return {
+                    "dict": [
+                        [
+                            _normalize_hash_payload(k, _seen=_seen),
+                            _normalize_hash_payload(v, _seen=_seen),
+                        ]
+                        for k, v in sorted(value.items(), key=lambda item: repr(item[0]))
+                    ]
+                }
+            if isinstance(value, list | tuple):
+                return {
+                    type(value).__name__: [_normalize_hash_payload(v, _seen=_seen) for v in value],
+                }
+            if isinstance(value, set | frozenset):
+                return {
+                    type(value).__name__: sorted(
+                        (_normalize_hash_payload(v, _seen=_seen) for v in value),
+                        key=repr,
+                    )
+                }
+            if is_dataclass(value):
+                return {
+                    "dataclass": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "fields": {
+                        f.name: _normalize_hash_payload(getattr(value, f.name), _seen=_seen) for f in fields(value)
+                    },
+                }
+        finally:
+            _seen.discard(value_id)
+
+    try:
+        json.dumps(value)
+    except TypeError:
+        return {
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "repr": repr(value),
+        }
+    return value
+
+
+def _digest_payload(payload: Any) -> str:
+    """Return a stable hex digest for a normalized payload."""
+    normalized = _normalize_hash_payload(payload)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class Opaque:
+    """Escape hatch for attributes that are neither Modules nor Variables.
+
+    Wrap any Python object in ``Opaque`` to assign it as a module
+    attribute without triggering :meth:`Module.__setattr__`'s strictness
+    check. Opaque values are invisible to graph traversal.
+    """
+
+    __slots__ = ("value",)
+
+    value: Any
+
+    def __init__(self, value: Any) -> None:
+        """Wrap ``value`` as an opaque attribute."""
+        self.value = value
+
+    def __repr__(self) -> str:
+        """``Opaque(<class of value>)``."""
+        return f"Opaque({type(self.value).__name__})"
+
+
+class _HookHandle:
+    """Lightweight handle returned by ``register_forward_*`` methods.
+
+    Call :meth:`remove` to detach the hook from its module's list.
+    Removal is a no-op if the hook has already been removed.
+    """
+
+    __slots__ = ("_fn", "_list")
+
+    _list: list[Any]
+    _fn: Any
+
+    def __init__(self, lst: list[Any], fn: Any) -> None:
+        """Record the list the hook was appended to and the hook itself."""
+        self._list = lst
+        self._fn = fn
+
+    def remove(self) -> None:
+        """Detach the hook from its containing list."""
+        with contextlib.suppress(ValueError):
+            self._list.remove(self._fn)
+
+
+_HOOK_WARNING_ONCE: set[int] = set()
+
+
+def _is_context_manager(value: Any) -> bool:
+    """Return ``True`` when ``value`` implements the context-manager protocol."""
+    return hasattr(value, "__enter__") and hasattr(value, "__exit__")
+
+
+def _context_factory(value: Any) -> Any:
+    """Normalize a registered context or zero-arg context factory."""
+    if _is_context_manager(value):
+        return lambda value=value: value
+    if callable(value):
+        return value
+    raise TypeError(
+        "Module.register_context() positional arguments must be context "
+        "managers or zero-argument factories returning context managers."
+    )
+
+
+class Module:
+    """PyTorch-shaped module base class.
+
+    Subclasses override :meth:`__init__` to declare children and
+    parameters, and :meth:`forward` to define the computation.
+
+    Modules are **JAX pytrees**: their leaves are the arrays stored in
+    descendant :class:`~spectrax.Variable` cells, flattened via
+    :func:`~spectrax.export` and reconstituted via :func:`~spectrax.bind`
+    on unflatten. That means :func:`jax.jit`, :func:`jax.tree.map`,
+    :func:`jax.value_and_grad`, and every other JAX pytree consumer
+    accept modules directly.
+
+    **Mutation gotcha.** Inside a *plain* :func:`jax.jit`, mutations
+    via ``var.value = new`` happen on a freshly-unflattened module
+    inside the trace and are **silently dropped** — the outer live
+    module sees no change. Use :func:`~spectrax.jit` with the
+    ``mutable=`` selector (or the other spectrax transforms) when you
+    want mutations to survive the transform boundary: those wrappers
+    run :func:`~spectrax.core.graph.export`/``bind`` with
+    mutation-detection around the traced body and write changes back
+    through the :class:`~spectrax.Variable` write hook.
+
+    Attributes:
+        _spx_attr_order: Ordered list of public attribute names in
+            declaration order. Becomes the stable graph naming scheme.
+        _spx_static: Dict of static (graph-def-contributing) attribute
+            values.
+        _spx_training: Training-mode flag, toggled by :meth:`train` /
+            :meth:`eval`, propagated recursively to children.
+        _spx_fwd_hooks: List of post-hooks invoked after
+            :meth:`forward` completes.
+        _spx_pre_hooks: List of pre-hooks invoked before
+            :meth:`forward`.
+        _spx_contexts: List of call contexts entered around every
+            :meth:`forward` invocation.
+        _spx_policy: Optional dtype :class:`~spectrax.Policy` governing
+            this subtree.
+        _spx_opaque: Dict recording :class:`Opaque` attributes.
+    """
+
+    _spx_container_kind: ClassVar[str] = "module"
+    """Graph-def container classification.
+
+    Overridden by containers (:class:`Sequential` -> ``"sequential"``,
+    :class:`ModuleList` / :class:`ParameterList` -> ``"list"``,
+    :class:`ModuleDict` and :class:`~spectrax.Rngs` -> ``"dict"``) so
+    :func:`~spectrax.bind` knows how to reconstruct their children.
+    """
+
+    _SPX_RESERVED: ClassVar[tuple[str, ...]] = (
+        "_spx_attr_order",
+        "_spx_static",
+        "_spx_training",
+        "_spx_fwd_hooks",
+        "_spx_pre_hooks",
+        "_spx_contexts",
+        "_spx_policy",
+        "_spx_opaque",
+        "_spx_scan_plan_cache",
+    )
+    """Private slot names reserved by the :class:`Module` machinery."""
+
+    _spx_attr_order: list[str]
+    _spx_static: dict[str, Any]
+    _spx_training: bool
+    _spx_fwd_hooks: list[ForwardHook]
+    _spx_pre_hooks: list[ForwardPreHook]
+    _spx_contexts: list[Any]
+    _spx_policy: Policy | None
+    _spx_opaque: dict[str, Opaque]
+    _spx_scan_plan_cache: Any
+    _spx_scan_safe_static_fields: ClassVar[frozenset[str] | tuple[str, ...]] = frozenset()
+    _spx_scan_safe_opaque_fields: ClassVar[frozenset[str] | tuple[str, ...]] = frozenset()
+    """Private scan metadata.
+
+    Subclasses may list static/opaque field names whose per-layer values are
+    metadata-only for repeated-layer scans. Differing unlisted values are
+    treated as behavior-changing and form separate scan graph families.
+    """
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        """Allocate the instance and pre-initialise private slots.
+
+        Slots are created here (rather than in ``__init__``) so that
+        subclasses which assign attributes *before* calling
+        ``super().__init__()`` do not crash in ``__setattr__``.
+        """
+        instance = super().__new__(cls)
+        object.__setattr__(instance, "_spx_attr_order", [])
+        object.__setattr__(instance, "_spx_static", {})
+        object.__setattr__(instance, "_spx_training", True)
+        object.__setattr__(instance, "_spx_fwd_hooks", [])
+        object.__setattr__(instance, "_spx_pre_hooks", [])
+        object.__setattr__(instance, "_spx_contexts", [])
+        object.__setattr__(instance, "_spx_policy", None)
+        object.__setattr__(instance, "_spx_opaque", {})
+        object.__setattr__(instance, "_spx_export_cache", None)
+        object.__setattr__(instance, "_spx_scan_plan_cache", None)
+        return instance
+
+    def __init__(self) -> None:
+        """No-op — all state is initialised in :meth:`__new__`.
+
+        Subclasses may assign attributes before or after calling
+        ``super().__init__()``.
+        """
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Register every :class:`Module` subclass as a JAX pytree.
+
+        JAX's :func:`jax.tree_util.register_pytree_with_keys` takes a
+        specific class; pytree registration does *not* inherit. To keep
+        the user-facing ergonomics simple (every user-defined
+        ``class MyModel(spx.Module)`` Just Works with
+        :func:`jax.jit` / :func:`jax.tree.map` / …), we auto-register
+        each subclass at class-definition time. Safe to call
+        repeatedly — JAX raises if a class is re-registered, so we
+        guard with a sentinel attribute.
+        """
+        super().__init_subclass__(**kwargs)
+        _register_module_pytree(cls)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Enforce module attribute discipline.
+
+        Names starting with ``_spx_`` bypass all checks (implementation
+        details). Single-underscore runtime attributes are preserved as
+        opaque runtime metadata across :func:`spectrax.export` /
+        :func:`spectrax.bind`. The name ``policy`` is special and funnels
+        into the private slot :attr:`_spx_policy`. Otherwise ``value`` must be a
+        :class:`Module`, a :class:`~spectrax.Variable`, a static scalar,
+        or an :class:`Opaque`.
+
+        One convenience makes the ergonomics friendlier:
+
+        **Annotation-driven static.** If the class declares
+           ``name: spx.Static[T]``, the value is automatically wrapped in
+           :class:`Static` and stored in :attr:`_spx_static`.
+
+        Everything else falls back to :class:`Opaque`. This keeps
+        ergonomic attributes such as ``self.config = config`` available
+        on the module without accidentally treating large mutable config
+        objects as graph-def static fields.
+        """
+        if name.startswith("_spx_"):
+            object.__setattr__(self, name, value)
+            return
+
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            if hasattr(self, "_spx_opaque"):
+                if isinstance(value, Module | Variable):
+                    self._spx_opaque.pop(name, None)
+                else:
+                    self._spx_opaque[name] = value if isinstance(value, Opaque) else Opaque(value)
+                object.__setattr__(self, "_spx_export_cache", None)
+                _bump_graph_epoch()
+            return
+
+        if name == "policy":
+            if value is not None and not isinstance(value, Policy):
+                raise TypeError("`.policy` must be a spectrax.Policy or None")
+            object.__setattr__(self, "_spx_policy", value)
+            return
+
+        is_module = isinstance(value, Module)
+        is_variable = isinstance(value, Variable)
+        is_opaque = isinstance(value, Opaque)
+        is_static = is_static_scalar(value)
+
+        if not (is_module or is_variable or is_opaque or is_static):
+            annotations = getattr(type(self), "__annotations__", {})
+            ann = annotations.get(name)
+            if ann is not None:
+                origin = getattr(ann, "__origin__", None)
+                if origin is Static or (isinstance(ann, type) and issubclass(ann, Static)):
+                    value = Static(value) if not isinstance(value, Static) else value
+                    is_static = True
+
+            if not is_static:
+                value = Opaque(value)
+                is_opaque = True
+
+        attr_order = self._spx_attr_order
+        if name not in attr_order:
+            attr_order.append(name)
+
+        _bump_graph_epoch()
+
+        if is_static and not (is_module or is_variable or is_opaque):
+            self._spx_static[name] = value
+            object.__setattr__(self, name, _public_value(value))
+            return
+
+        if is_opaque:
+            self._spx_opaque[name] = value
+            object.__setattr__(self, name, _public_value(value))
+            return
+
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete an attribute and remove it from the graph order/static dicts."""
+        if name in self._spx_attr_order:
+            self._spx_attr_order.remove(name)
+        self._spx_static.pop(name, None)
+        self._spx_opaque.pop(name, None)
+        _bump_graph_epoch()
+        object.__delattr__(self, name)
+
+    def _spx_graph_children(self) -> Iterator[tuple[str | int, Module | Variable]]:
+        """Yield ``(key, child)`` pairs for Modules/Variables in declaration order.
+
+        The base implementation iterates :attr:`_spx_attr_order` and
+        yields attribute-name keys. Containers override this method to
+        yield integer or string keys reflecting their native addressing.
+        """
+        for name in self._spx_attr_order:
+            value = getattr(self, name, None)
+            if isinstance(value, Module | Variable):
+                yield name, value
+
+    def _spx_static_fields(self) -> dict[str, Any]:
+        """Return a shallow copy of :attr:`_spx_static` for graph-def export."""
+        return dict(self._spx_static)
+
+    def structure_hash(self) -> str:
+        """Return a stable hash of this module's non-value structure.
+
+        The digest includes the exported :class:`~spectrax.GraphDef`,
+        static fields, opaque metadata such as configs, variable
+        collections/metadata, sharing topology, and canonical paths. It
+        does **not** hash parameter or buffer array values.
+        """
+        from .graph import export
+
+        graphdef, _state = export(self)
+        return _digest_payload(
+            {
+                "version": 1,
+                "kind": "spectrax.structure_hash",
+                "graphdef": graphdef,
+            }
+        )
+
+    def shape_hash(self) -> str:
+        """Return a stable hash of structure plus state leaf shape/dtype.
+
+        This is useful for checkpoint or compile-cache compatibility:
+        it includes all information from :meth:`structure_hash` plus
+        each exported state leaf's collection, path, shape, and dtype,
+        but never hashes array contents.
+        """
+        from .graph import export
+
+        graphdef, state = export(self)
+        state_signature = tuple(
+            (
+                collection,
+                path,
+                tuple(int(dim) for dim in tuple(getattr(leaf, "shape", ()))),
+                str(getattr(leaf, "dtype", type(leaf).__name__)),
+            )
+            for collection, path, leaf in state.items()
+        )
+        return _digest_payload(
+            {
+                "version": 1,
+                "kind": "spectrax.shape_hash",
+                "graphdef": graphdef,
+                "state_signature": state_signature,
+            }
+        )
+
+    @property
+    def training(self) -> bool:
+        """Whether this module is currently in training mode."""
+        return self._spx_training
+
+    def train(self, mode: bool = True) -> Module:
+        """Set this module (and all descendants) to training mode.
+
+        Args:
+            mode: ``True`` (default) enables training; ``False`` disables.
+
+        Returns:
+            ``self`` for chaining.
+        """
+        object.__setattr__(self, "_spx_training", bool(mode))
+        self._spx_opaque["_spx_training"] = bool(mode)
+        self._spx_export_cache = None
+        _bump_graph_epoch()
+        for _, child in self._spx_graph_children():
+            if isinstance(child, Module):
+                child.train(mode)
+        return self
+
+    def eval(self) -> Module:
+        """Shorthand for ``self.train(False)``."""
+        return self.train(False)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Invoke the module: run pre-hooks, :meth:`forward`, post-hooks,
+        then apply any output-dtype policy.
+
+        Hooks are skipped under spectrax transforms (with a single warning
+        per module). Use ``self.sow("intermediates", ...)`` for
+        transform-safe capture instead.
+        """
+        if self._spx_pre_hooks and not _inside_transform():
+            for h in list(self._spx_pre_hooks):
+                r = h(self, args, kwargs)
+                if r is not None:
+                    args, kwargs = r
+        elif self._spx_pre_hooks and _inside_transform():
+            _warn_hooks_suppressed(self)
+
+        policy = self._spx_policy
+        if self._spx_contexts:
+            with contextlib.ExitStack() as stack:
+                for make_context in list(self._spx_contexts):
+                    stack.enter_context(make_context())
+                stack.enter_context(push_policy(policy))
+                out: Any = self.forward(*args, **kwargs)
+        else:
+            with push_policy(policy):
+                out = self.forward(*args, **kwargs)
+
+        if self._spx_fwd_hooks and not _inside_transform():
+            for h in list(self._spx_fwd_hooks):
+                r = h(self, args, kwargs, out)
+                if r is not None:
+                    out = r
+        elif self._spx_fwd_hooks and _inside_transform():
+            _warn_hooks_suppressed(self)
+
+        if policy is not None and policy.output_dtype is not None:
+            out = policy.cast_output(out)
+        return out
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Compute and return the module output.
+
+        Subclasses override this method. The default implementation
+        raises :class:`NotImplementedError`.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must override `forward`.")
+
+    def register_forward_pre_hook(self, fn: ForwardPreHook) -> _HookHandle:
+        """Register a pre-hook invoked before every ``forward`` call.
+
+        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        """
+        self._spx_pre_hooks.append(fn)
+        return _HookHandle(self._spx_pre_hooks, fn)
+
+    def register_forward_hook(self, fn: ForwardHook) -> _HookHandle:
+        """Register a post-hook invoked after every ``forward`` call.
+
+        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        """
+        self._spx_fwd_hooks.append(fn)
+        return _HookHandle(self._spx_fwd_hooks, fn)
+
+    def register_context(self, *contexts: Any, **scope_values: Any) -> _HookHandle:
+        """Register contexts entered around every ``forward`` invocation.
+
+        Positional arguments may be reusable context-manager objects or
+        zero-argument factories returning fresh context managers. Keyword
+        arguments are made available through :func:`spx.scope`; keyword
+        values that are context managers (for example a JAX mesh) are
+        also entered before the scope frame is pushed.
+
+        Example::
+
+            mesh = jax.sharding.Mesh(devices, ("fsdp", "tp"))
+            self.register_context(mesh=mesh)
+
+        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        """
+        factories = [_context_factory(ctx) for ctx in contexts]
+        for value in scope_values.values():
+            if _is_context_manager(value):
+                factories.append(_context_factory(value))
+        if scope_values:
+            values = dict(scope_values)
+            factories.append(lambda values=values: _scope(**values))
+
+        @contextlib.contextmanager
+        def call_context() -> Iterator[None]:
+            """Combined ``with``-block that enters every registered context for one call.
+
+            Built lazily from ``factories`` so that argument re-binding
+            (e.g. via :meth:`Module.register_context` with a fresh
+            value) is picked up on every call. Raises
+            :class:`TypeError` if any factory yields something that
+            isn't a context manager.
+            """
+            with contextlib.ExitStack() as stack:
+                for make_context in factories:
+                    ctx = make_context()
+                    if not _is_context_manager(ctx):
+                        raise TypeError("Module.register_context() factories must return context managers.")
+                    stack.enter_context(ctx)
+                yield
+
+        self._spx_contexts.append(call_context)
+        return _HookHandle(self._spx_contexts, call_context)
+
+    def sow(
+        self,
+        collection: str,
+        name: str,
+        value: Any,
+        *,
+        reduce: str = "last",
+    ) -> None:
+        """Capture an intermediate value into a named
+        :class:`~spectrax.Variable` slot.
+
+        The first call creates a variable attached to ``self`` at
+        ``"sow_{collection}_{name}"`` and populates it with ``value``.
+        Subsequent calls combine with the existing slot according to
+        ``reduce``:
+
+        * ``"last"`` — replace with ``value``;
+        * ``"sum"`` — add ``value`` to the running accumulator;
+        * ``"stack"`` — concatenate along a leading axis.
+
+        Use ``collection="intermediates"`` for activation capture that
+        survives transforms (as long as you also declare it mutable on
+        the transform).
+        """
+        attr = f"sow_{collection}_{name}"
+        existing = getattr(self, attr, None)
+        if existing is None:
+            initial = value[None] if reduce == "stack" else value
+            var = Variable(initial, kind=collection, metadata={"reduce": reduce, "sow_name": name})
+            self.__setattr__(attr, var)
+            return
+        if not isinstance(existing, Variable):
+            raise TypeError(f"sow slot {attr} is not a Variable")
+        if reduce == "last":
+            existing.value = value
+        elif reduce == "sum":
+            cur = existing._raw_get()
+            existing.value = value if cur is None else cur + value
+        elif reduce == "stack":
+            cur = existing._raw_get()
+            if cur is None:
+                existing.value = value[None]
+            else:
+                existing.value = jnp.concatenate([cur, value[None]], axis=0)
+        else:
+            raise ValueError(f"Unknown reduce strategy: {reduce!r}")
+
+    def _spx_guard_not_in_transform(self, what: str) -> None:
+        """Raise :class:`LazyInitUnderTransformError` if a transform is active.
+
+        Used by lazy layers to refuse materialization under ``jit`` /
+        ``grad`` / ``vmap`` / ``scan`` / ``remat``.
+        """
+        if _inside_transform():
+            raise LazyInitUnderTransformError(
+                f"{what} cannot run inside a spectrax transform. "
+                f"Call `module.init(rngs, ...)` before entering jit/grad/vmap/scan/remat."
+            )
+
+    def init(
+        self,
+        rngs: Rngs | int | None = None,
+        *example_args: Any,
+        **example_kwargs: Any,
+    ) -> Module:
+        """Attach an :class:`~spectrax.Rngs` and optionally run a dry forward.
+
+        Args:
+            rngs: Either an :class:`~spectrax.Rngs`, an integer seed, or
+                ``None``. Non-``None`` values are attached to ``self`` as
+                the attribute ``rngs``.
+            *example_args: Positional example inputs passed to
+                :meth:`forward` to trigger lazy materialization.
+            **example_kwargs: Keyword example inputs.
+
+        Returns:
+            ``self`` for chaining.
+        """
+        from ..rng.rngs import Rngs as _Rngs
+
+        if rngs is not None and not isinstance(rngs, _Rngs):
+            rngs = _Rngs(rngs)
+        if rngs is not None:
+            object.__setattr__(self, "rngs", rngs)
+            if "rngs" not in self._spx_attr_order:
+                self._spx_attr_order.insert(0, "rngs")
+            object.__setattr__(self, "_spx_export_cache", None)
+            _bump_graph_epoch()
+
+        if example_args or example_kwargs:
+            self.sequential_init(*example_args, **example_kwargs)
+        return self
+
+    def sequential_init(self, *example_args: Any, **example_kwargs: Any) -> Module:
+        """Materialize lazy descendants explicitly using example inputs.
+
+        This is the explicit counterpart to the legacy "first eager
+        forward materializes lazy modules" behavior. Modules created
+        under :func:`spectrax.lazy_init` require this method (or
+        :meth:`init` with example inputs) before ordinary forward calls.
+        """
+        if example_args or example_kwargs:
+            with _allow_materialization():
+                self(*example_args, **example_kwargs)
+        self.materialize()
+        return self
+
+    def materialize(self) -> Module:
+        """Resolve and initialize every :class:`~spectrax.DeferredParameter`
+        and :class:`~spectrax.DeferredBuffer` in this subtree.
+
+        Typically called automatically during the first eager forward
+        pass (or via :meth:`sequential_init`).  Safe to call repeatedly —
+        already-materialized variables are skipped.
+        """
+        seen: set[int] = set()
+
+        def walk(m: Module) -> None:
+            """Recurse through ``m``'s graph, materializing any deferred variables.
+
+            ``seen`` (closure variable) guards against revisiting the
+            same module via shared references, which would otherwise
+            cause unbounded recursion or duplicate ``materialize()``
+            calls on the same deferred variable.
+            """
+            mid = id(m)
+            if mid in seen:
+                return
+            seen.add(mid)
+            for _, child in m._spx_graph_children():
+                if isinstance(child, DeferredParameter | DeferredBuffer):
+                    child.materialize()
+                elif isinstance(child, Module):
+                    walk(child)
+
+        walk(self)
+        return self
+
+    def _resolve_deferred(self, var: Variable, shape: tuple[int, ...]) -> None:
+        """Resolve ``var``'s shape if it is a deferred variable.
+
+        Materializes immediately unless the current thread is inside
+        :func:`spectrax.lazy_init` without the explicit materialization
+        token (used by :meth:`sequential_init`).
+        """
+        if isinstance(var, DeferredParameter | DeferredBuffer) and not var.is_materialized:
+            self._spx_guard_not_in_transform(f"{type(var).__name__} materialization")
+            var.resolve_shape(shape)
+            if _materialization_allowed() or not _explicit_lazy_mode():
+                var.materialize()
+
+    def freeze(self, selector: Any = "parameters") -> Module:
+        """Move every matched :class:`~spectrax.Variable`'s kind to ``"buffers"``.
+
+        This makes ``grad(wrt="parameters")`` skip them. Returns ``self`` for chaining.
+        """
+        from .selector import as_selector
+
+        sel = as_selector(selector)
+        changed = False
+        for _p, v in sel.apply(self):
+            if v.kind != "buffers":
+                v.metadata.setdefault("frozen_from", v.kind)
+                v.kind = "buffers"
+                changed = True
+        if changed:
+            object.__setattr__(self, "_spx_export_cache", None)
+            _bump_graph_epoch()
+        return self
+
+    def unfreeze(self, selector: Any = "buffers") -> Module:
+        """Reverse :meth:`freeze` — move matched variables back to their pre-freeze kind."""
+        from .selector import as_selector
+
+        sel = as_selector(selector)
+        changed = False
+        for _p, v in sel.apply(self):
+            prev = v.metadata.pop("frozen_from", None)
+            if prev is not None:
+                v.kind = prev
+                changed = True
+        if changed:
+            object.__setattr__(self, "_spx_export_cache", None)
+            _bump_graph_epoch()
+        return self
+
+    def perturb(self, name: str, x: Any) -> Any:
+        """Insert an identity perturbation variable and add it to ``x``.
+
+        Creates (on first call) a zero-valued :class:`~spectrax.Variable` of
+        kind ``"perturbations"`` named ``perturb_{name}`` on ``self`` and
+        returns ``x + perturbation.value``. Under
+        ``spx.grad(wrt="perturbations")`` the returned gradient at that
+        variable equals ``dL/dx``.
+        """
+        attr = f"perturb_{name}"
+        existing = getattr(self, attr, None)
+        if existing is None:
+            var = Variable(jnp.zeros_like(x), kind="perturbations", metadata={"perturb_name": name})
+            self.__setattr__(attr, var)
+            existing = var
+        return x + existing.value
+
+    def set_attributes(
+        self,
+        *,
+        filter_fn: Any = None,
+        **attrs: Any,
+    ) -> Module:
+        """Bulk-set attributes on ``self`` and every descendant module.
+
+        Only sets attributes that already exist on the target (so a
+        :class:`Linear` without ``deterministic`` is untouched).
+        ``filter_fn(module) -> bool`` restricts which modules are affected.
+        Returns ``self`` for chaining.
+        """
+        seen: set[int] = set()
+
+        def walk(m: Module) -> None:
+            """Recurse through ``m``'s sub-modules, applying ``attrs`` where they already exist.
+
+            Like :meth:`materialize`'s ``walk``, ``seen`` (a
+            closure ``set``) guards against revisiting the same module
+            via shared references and so against double-applying
+            attribute updates.
+            """
+            mid = id(m)
+            if mid in seen:
+                return
+            seen.add(mid)
+            if filter_fn is None or filter_fn(m):
+                for k, v in attrs.items():
+                    if hasattr(m, k):
+                        setattr(m, k, v)
+            for _, child in m._spx_graph_children():
+                if isinstance(child, Module):
+                    walk(child)
+
+        walk(self)
+        return self
+
+    def __repr__(self) -> str:
+        """Render a pretty tree repr via
+        :func:`spectrax.inspect.repr_module`, falling back to the class
+        name if rendering raises.
+        """
+        try:
+            from ..inspect.repr import repr_module
+
+            return repr_module(self)
+        except Exception:
+            return f"<{type(self).__name__}>"
+
+
+def _warn_hooks_suppressed(module: Module) -> None:
+    """Emit a one-shot warning when hooks are skipped under a transform.
+
+    Each distinct module instance produces at most one warning to keep
+    traces clean during training loops.
+    """
+    key = id(module)
+    if key in _HOOK_WARNING_ONCE:
+        return
+    _HOOK_WARNING_ONCE.add(key)
+    warnings.warn(
+        f"Forward hooks on {type(module).__name__} are suppressed under a "
+        f"spectrax transform. Use `self.sow('intermediates', ...)` to capture "
+        f"values transform-safely.",
+        stacklevel=3,
+    )
+
+
+@dataclass(frozen=True)
+class _ModuleAux:
+    """Aux data for the :class:`Module` pytree registration.
+
+    Carries everything JAX needs to reconstruct a module that ``bind``
+    alone can't recover — the structural :class:`~spectrax.GraphDef`,
+    the ordered ``(collection, path)`` leaf specification, the
+    training flag, forward/pre hooks, call contexts, the dtype policy,
+    and the ``Opaque`` attribute map.
+
+    JAX requires ``aux_data`` to be hashable for jit cache-key
+    deduplication. The :class:`GraphDef`, the leaf spec, and the
+    training bool are already hashable. Hooks/contexts (lists of closures),
+    policy (unspecified), and the opaque dict are not generally
+    hashable, so :meth:`__hash__` and :meth:`__eq__` fall back to
+    ``id(...)``-based comparison for those three — producing
+    conservative jit cache misses when hook/policy/opaque identity
+    differs, while deduplicating on the hot path where a user re-uses
+    the same model instance across steps.
+    """
+
+    gdef: Any
+    leaf_spec: tuple[tuple[str, str], ...]
+    training: bool
+    fwd_hooks: list
+    pre_hooks: list
+    contexts: list
+    policy: Any
+    opaque: dict
+
+    def __hash__(self) -> int:
+        """Hash structural parts directly; hash hook/policy/opaque by identity."""
+        return hash(
+            (
+                self.gdef,
+                self.leaf_spec,
+                self.training,
+                id(self.fwd_hooks),
+                id(self.pre_hooks),
+                id(self.contexts),
+                id(self.policy),
+                id(self.opaque),
+            )
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """Match on structural fields, and on identity for mutable containers."""
+        if not isinstance(other, _ModuleAux):
+            return NotImplemented
+        return (
+            self.gdef == other.gdef
+            and self.leaf_spec == other.leaf_spec
+            and self.training == other.training
+            and self.fwd_hooks is other.fwd_hooks
+            and self.pre_hooks is other.pre_hooks
+            and self.contexts is other.contexts
+            and self.policy is other.policy
+            and self.opaque is other.opaque
+        )
+
+
+_PYTREE_REGISTERED: set[type] = set()
+"""Track which Module subclasses have been pytree-registered.
+
+:func:`jax.tree_util.register_pytree_node` raises if a class is
+registered twice. Test fixtures that redefine subclasses at module
+reload, or a module imported transitively, can trigger repeat
+registration; the set guards against that.
+"""
+
+
+def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[Any, Any], ...], _ModuleAux]:
+    """Pytree flatten-with-keys for any :class:`Module` instance.
+
+    Reads the hot :func:`spectrax.export` cache and returns the raw
+    variable leaves directly, in canonical-path order, without building
+    an intermediate :class:`~spectrax.State` pytree. Static /
+    structural information, runtime flags, and non-graph attributes all
+    go into :class:`_ModuleAux`.
+    """
+    from .graph import export
+
+    cache = m._spx_export_cache
+    if cache is None or cache[0] != _graph_epoch():
+        export(m)
+        cache = m._spx_export_cache
+    assert cache is not None
+    gdef = cache[1]
+    var_entries = cache[7] if len(cache) >= 8 else cache[2]
+    leaf_spec = cache[6] if len(cache) >= 7 else tuple((kind, path) for kind, path, _ in var_entries)
+    key_leaves = []
+    for (collection, path), (_kind, _path, var) in zip(leaf_spec, var_entries, strict=True):
+        key = (jax.tree_util.DictKey(collection), *[jax.tree_util.DictKey(seg) for seg in path.split(".") if seg])
+        key_leaves.append((key, var._raw_get()))
+    aux = _ModuleAux(
+        gdef=gdef,
+        leaf_spec=leaf_spec,
+        training=m._spx_training,
+        fwd_hooks=m._spx_fwd_hooks,
+        pre_hooks=m._spx_pre_hooks,
+        contexts=m._spx_contexts,
+        policy=m._spx_policy,
+        opaque=m._spx_opaque,
+    )
+    return tuple(key_leaves), aux
+
+
+def _module_flatten(m: Module) -> tuple[list[Any], _ModuleAux]:
+    """Pytree flatten (no keys) — complement of :func:`_module_flatten_with_keys`.
+
+    Needed by :func:`jax.tree_util.register_pytree_with_keys` so
+    ``tree_flatten`` / ``tree_leaves`` can skip the key computation
+    when the caller doesn't need paths.
+    """
+    from .graph import export
+
+    cache = m._spx_export_cache
+    if cache is None or cache[0] != _graph_epoch():
+        export(m)
+        cache = m._spx_export_cache
+    assert cache is not None
+    gdef = cache[1]
+    var_entries = cache[7] if len(cache) >= 8 else cache[2]
+    leaf_spec = cache[6] if len(cache) >= 7 else tuple((kind, path) for kind, path, _ in var_entries)
+    leaves = [var._raw_get() for _kind, _path, var in var_entries]
+    aux = _ModuleAux(
+        gdef=gdef,
+        leaf_spec=leaf_spec,
+        training=m._spx_training,
+        fwd_hooks=m._spx_fwd_hooks,
+        pre_hooks=m._spx_pre_hooks,
+        contexts=m._spx_contexts,
+        policy=m._spx_policy,
+        opaque=m._spx_opaque,
+    )
+    return list(leaves), aux
+
+
+def _module_unflatten(aux: _ModuleAux, leaves: Any) -> Module:
+    """Rebuild a :class:`Module` from ``(aux, leaves)``.
+
+    Reassembles the :class:`~spectrax.State` directly from the ordered
+    ``(collection, path)`` leaf spec, hands it to :func:`~spectrax.bind`
+    to rebuild the module tree, then restores
+    the runtime-state attributes from ``aux``. Hooks and the opaque
+    dict are shallow-copied so mutations on the unflattened copy don't
+    leak back to the original list/dict references held in ``aux``.
+    """
+    from .graph import bind
+    from .paths import str_to_path
+    from .state import State, _nested_set
+
+    state_data: dict[str, dict[str, Any]] = {}
+    if len(aux.leaf_spec) != len(leaves):
+        raise ValueError(
+            "Module pytree leaf count mismatch during unflatten: "
+            f"expected {len(aux.leaf_spec)} leaves from the auxiliary spec, got {len(leaves)}."
+        )
+    for (collection, path), leaf in zip(aux.leaf_spec, leaves, strict=True):
+        _nested_set(state_data.setdefault(collection, {}), str_to_path(path), leaf)
+    state = State._from_raw(state_data)
+    m = bind(aux.gdef, state)
+    object.__setattr__(m, "_spx_training", aux.training)
+    object.__setattr__(m, "_spx_fwd_hooks", list(aux.fwd_hooks))
+    object.__setattr__(m, "_spx_pre_hooks", list(aux.pre_hooks))
+    object.__setattr__(m, "_spx_contexts", list(aux.contexts))
+    object.__setattr__(m, "_spx_policy", aux.policy)
+    object.__setattr__(m, "_spx_opaque", dict(aux.opaque))
+    for opaque_name, opaque_value in aux.opaque.items():
+        if not opaque_name.startswith("_") and opaque_name not in m._spx_attr_order:
+            m._spx_attr_order.append(opaque_name)
+        object.__setattr__(m, opaque_name, _public_value(opaque_value))
+    return m
+
+
+def _register_module_pytree(cls: type) -> None:
+    """Register ``cls`` with JAX's pytree registry (idempotent).
+
+    The three callbacks all delegate to the class-agnostic helpers
+    above, so every Module subclass shares a single flatten/unflatten
+    implementation — no per-class code generation.
+    """
+    if cls in _PYTREE_REGISTERED:
+        return
+    _PYTREE_REGISTERED.add(cls)
+    jax.tree_util.register_pytree_with_keys(
+        cls,
+        _module_flatten_with_keys,
+        _module_unflatten,
+        flatten_func=_module_flatten,
+    )
+
+
+_register_module_pytree(Module)

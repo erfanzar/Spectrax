@@ -31,7 +31,7 @@ Public surface:
   ``HEAD_DIM``, ``KV_HEAD_DIM``, ``MLP_INTERMEDIATE``, ``VOCAB``,
   ``EXPERT``, ``EXPERT_GATE``, ``BIAS_HEAD_SEQ``, ``BIAS_KV_SEQ``,
   and ``EMPTY`` (token marking a replicated dim).
-* **Parallelism tokens** — ``DATA_PARALLEL``/``DP``,
+* **Parallelism tokens** — ``PIPELINE_PARALLEL``/ ``PP``, ``DATA_PARALLEL``/``DP``,
   ``FULLY_SHARDED_DATA_PARALLEL``/``FSDP``, ``TENSOR_PARALLEL``/``TP``,
   ``EXPERT_PARALLEL``/``EP``, ``SEQUENCE_PARALLEL``/``SP``.
 * **Runtime modes** — ``MODE_TRAIN``, ``MODE_PREFILL``,
@@ -111,12 +111,14 @@ KV_HEAD_DIM: tp.Final = "__KV_HEAD_DIM__"
 BIAS_HEAD_SEQ: tp.Final = "__BIAS_HEAD_SEQ__"
 BIAS_KV_SEQ: tp.Final = "__BIAS_KV_SEQ__"
 
+PIPELINE_PARALLEL: tp.Final = "__PIPELINE_PARALLEL__"
 DATA_PARALLEL: tp.Final = "__DATA_PARALLEL__"
 FULLY_SHARDED_DATA_PARALLEL: tp.Final = "__FULLY_SHARDED_DATA_PARALLEL__"
 TENSOR_PARALLEL: tp.Final = "__TENSOR_PARALLEL__"
 EXPERT_PARALLEL: tp.Final = "__EXPERT_PARALLEL__"
 SEQUENCE_PARALLEL: tp.Final = "__SEQUENCE_PARALLEL__"
 
+PP: tp.Final = PIPELINE_PARALLEL
 DP: tp.Final = DATA_PARALLEL
 FSDP: tp.Final = FULLY_SHARDED_DATA_PARALLEL
 TP: tp.Final = TENSOR_PARALLEL
@@ -375,6 +377,8 @@ __all__ = [
     "MODE_PREFILL",
     "MODE_TRAIN",
     "NOT_GIVEN",
+    "PIPELINE_PARALLEL",
+    "PP",
     "QUERY_LENGTH",
     "RUNTIME_MODE_TYPES",
     "SEQUENCE_PARALLEL",

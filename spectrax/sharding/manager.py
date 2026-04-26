@@ -197,6 +197,7 @@ class PartitionAxis:
     libraries add new symbolic axes without subclassing.
     """
 
+    pipeline_parallel_axis: str = "pp"
     data_parallel_axis: str = "dp"
     fully_sharded_data_parallel_axis: str = "fsdp"
     tensor_parallel_axis: str = "tp"
@@ -246,6 +247,7 @@ class PartitionAxis:
         ct.BIAS_KV_SEQ: "bias_key_sequence_axis",
         ct.EMPTY: None,
         ct.DATA_PARALLEL: "data_parallel_axis",
+        ct.PIPELINE_PARALLEL: "pipeline_parallel_axis",
         ct.FULLY_SHARDED_DATA_PARALLEL: "fully_sharded_data_parallel_axis",
         ct.TENSOR_PARALLEL: "tensor_parallel_axis",
         ct.SEQUENCE_PARALLEL: "sequence_parallel_axis",

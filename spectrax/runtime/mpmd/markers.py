@@ -497,27 +497,39 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         if id(eqn) not in local_eqn_ids:
             out[id(eqn)] = eqn
 
-    read_after: list[set[Var]] = [set() for _ in range(n_eqns + 1)]
-    post: set[Var] = set()
-    for v in jaxpr.outvars:
-        if isinstance(v, Var):
-            post.add(v)
-    read_after[n_eqns] = set(post)
+    # # @erfanzar NOTE: ``read_after`` and ``defined_up_to`` are only ever
+    # *read* at cluster-boundary indices (see ``defined_up_to[start]`` and
+    # ``read_after[end]`` below), not at every position.  The previous
+    # implementation built one full set per equation (``set(post)`` /
+    # ``set(pre)`` in a loop over all N eqns), which is O(N^2) in both time
+    # and space and dominates the sxjit setup cost on large unrolled models
+    # -- e.g. Qwen3-8B with PP=4 has ~50k jaxpr eqns and a live-var set that
+    # grows to ~10k entries, giving ~500M Python set ops just to build these
+    # tables (observed: ~30 minutes silent at 99% CPU before the first XLA
+    # compile event).  We now snapshot only at the boundaries we actually
+    # need, walking the jaxpr once forward and once backward.
+    boundary_set = set(boundaries)
+    read_after_at: dict[int, set[Var]] = {}
+    post: set[Var] = {v for v in jaxpr.outvars if isinstance(v, Var)}
+    if n_eqns in boundary_set:
+        read_after_at[n_eqns] = set(post)
     for i in range(n_eqns - 1, -1, -1):
-        post = set(post)
         for invar in jaxpr.eqns[i].invars:
             if isinstance(invar, Var):
                 post.add(invar)
-        read_after[i] = post
+        if i in boundary_set:
+            read_after_at[i] = set(post)
 
-    defined_up_to: list[set[Var]] = [set(jaxpr.invars)]
+    defined_up_to_at: dict[int, set[Var]] = {}
     pre: set[Var] = set(jaxpr.invars)
-    for eqn in jaxpr.eqns:
-        pre = set(pre)
+    if 0 in boundary_set:
+        defined_up_to_at[0] = set(pre)
+    for idx, eqn in enumerate(jaxpr.eqns, start=1):
         for outvar in eqn.outvars:
             if isinstance(outvar, Var):
                 pre.add(outvar)
-        defined_up_to.append(pre)
+        if idx in boundary_set:
+            defined_up_to_at[idx] = set(pre)
 
     clusters: list[Jaxpr] = []
     for idx, (start, end) in enumerate(itertools.pairwise(boundaries)):
@@ -536,11 +548,11 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         remat_eqns = sorted(remat_eqns_by_id.values(), key=lambda eqn: eqn_index_by_id[id(eqn)])
         eqns = [*remat_eqns, *base_eqns]
         used = _collect_used_vars(eqns)
-        defined_before = defined_up_to[start]
+        defined_before = defined_up_to_at[start]
         defined_here = _collect_defined_vars(eqns)
         invars = [v for v in defined_before if v in used and v not in defined_here]
         if end < n_eqns:
-            needed_downstream = read_after[end]
+            needed_downstream = read_after_at[end]
             outvars: list[Var] = [v for v in defined_here if v in needed_downstream and not can_rematerialize(v)]
         else:
             needed_downstream = set(v for v in jaxpr.outvars if isinstance(v, Var))

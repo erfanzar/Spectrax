@@ -21,6 +21,7 @@ from .base import ArrayLike, BaseBackend, Scalar
 
 _ProtoCache: dict[str, tp.Any] = {}
 
+
 def _masked_crc(data: bytes) -> int:
     crc = zlib.crc32(data) & 0xFFFFFFFF
     return ((crc >> 15) | (crc << 17)) + 0xA282EAD8 & 0xFFFFFFFF
@@ -34,12 +35,9 @@ def _write_record(f: tp.BinaryIO, data: bytes) -> None:
     f.write(struct.pack("<I", _masked_crc(data)))
 
 
-
-
 def _get_protos() -> dict[str, tp.Any]:
     if _ProtoCache:
         return _ProtoCache
-
 
     pool = descriptor_pool.DescriptorPool()
     file_proto = descriptor_pb2.FileDescriptorProto()
@@ -261,7 +259,7 @@ class TensorBoardBackend(BaseBackend):
         if channels != 3:
             raise ValueError("Image must have 1 or 3 channels")
         try:
-            from PIL import Image as PILImage
+            from PIL import Image as PILImage  #type:ignore
         except Exception as exc:
             raise RuntimeError("TensorBoardBackend image logging requires Pillow") from exc
         img = PILImage.fromarray(image)

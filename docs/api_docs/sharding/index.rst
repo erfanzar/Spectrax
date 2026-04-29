@@ -5,5 +5,6 @@ spectrax.sharding package
    :maxdepth: 2
 
    logical
+   manager
    mesh
    partition

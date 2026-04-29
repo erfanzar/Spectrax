@@ -545,16 +545,20 @@ class State:
     def merge(self, other: State, *, copy: bool = False) -> State:
         """Merge ``other`` into ``self``.
 
-        Entries in ``other`` win on collision. Mutates ``self`` by
-        default; pass ``copy=True`` for a detached merged result.
+        Entries in ``other`` win on collision. Returns a new State that
+        shares leaf objects with both inputs; neither input is mutated.
+        The ``copy`` parameter is kept for API compatibility but no longer
+        affects behaviour.
         """
-        target = self.copy() if copy else self
-        if target._writers is None:
-            _merge_nested(target._data, other._data)
-            return target
-        for c, path, value in other.items():
-            target._sync_leaf(c, str_to_path(path), value)
-        return target
+        data = _deep_copy_nested(self._data)
+        _merge_nested(data, other._data)
+        result = State._from_raw(data)
+        writers = self._copy_writers()
+        if writers is not None:
+            result._set_writers(writers)
+            for c, path, value in other.items():
+                result._sync_leaf(c, str_to_path(path), value)
+        return result
 
     def map(self, fn: Callable[..., Leaf], *collections: str, copy: bool = False) -> State:
         """Apply ``fn`` to every leaf, optionally restricted to some collections.
@@ -648,13 +652,13 @@ def _state_flatten(s: State) -> tuple[tuple[Any, ...], _StateAux]:
 
 def _state_flatten_with_keys(
     s: State,
-) -> tuple[tuple[tuple[tuple[jax.tree_util.DictKey, ...], Any], ...], _StateAux]:
+) -> tuple[tuple[tuple[tuple[jax.tree_util.DictKey, ...], Any], ...], _StateAux]:  # type: ignore
     """JAX pytree flattener for :class:`State` with per-leaf keypaths.
 
     Emits explicit :class:`DictKey` tuples for every leaf while sharing
     the same leaf spec as :func:`_state_flatten`.
     """
-    key_leaves: list[tuple[tuple[jax.tree_util.DictKey, ...], Any]] = []
+    key_leaves: list[tuple[tuple[jax.tree_util.DictKey, ...], Any]] = []  # type: ignore
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
         for path_tuple, v in _nested_items(inner):

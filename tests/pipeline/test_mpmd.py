@@ -25,13 +25,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 import spectrax as spx
 from spectrax import nn
 from spectrax.nn import PipelineSequential
 from spectrax.runtime.mpmd import collect_task_times_ms, sxcall, sxgrad, sxjit, sxstage_iter, sxvalue_and_grad
-from spectrax.runtime.schedules import Eager1F1B, GPipe, InterleavedH1, KimiK2, Std1F1B, ZeroBubbleH1
+from spectrax.runtime.mpmd.runtime import _build_schedule_units_from_plan
+from spectrax.runtime.schedules import (
+    DualPipeV,
+    Eager1F1B,
+    FusedTask,
+    GPipe,
+    Interleaved1F1BPlusOne,
+    InterleavedGPipe,
+    InterleavedH1,
+    KimiK2,
+    Std1F1B,
+    ZeroBubbleH1,
+)
 from spectrax.runtime.types import MpMdMesh
 
 _N = 2
@@ -494,6 +506,34 @@ def pipe_args_4stage():
     return (*weights, x, y)
 
 
+def _grid_action_count(grid):
+    count = 0
+    for row in grid:
+        for cell in row:
+            if cell is None:
+                continue
+            count += 2 if isinstance(cell, FusedTask) else 1
+    return count
+
+
+def _assert_true_fused_async_mpmd(pipe_forward, *, n_ranks: int):
+    plan = pipe_forward._mpmd_state["schedule_plan"]
+    stats = plan["last_schedule_runtime_stats"]
+    units = _build_schedule_units_from_plan(plan)
+    grid_actions = _grid_action_count(plan["grid"])
+    unit_actions = sum(2 if unit.kind == "fused" else 1 for unit in units)
+    fused_units = sum(1 for unit in units if unit.kind == "fused")
+
+    assert stats["dispatcher"] == "fused_async"
+    assert stats["fallback_reason"] in (None, "")
+    assert stats["unit_count"] == len(units)
+    assert stats["action_count"] == unit_actions
+    assert stats["fused_count"] == fused_units
+    assert 0 < stats["action_count"] <= grid_actions
+    assert set(stats["per_rank_launch_count"]) == set(range(n_ranks))
+    assert all(count > 0 for count in stats["per_rank_launch_count"].values())
+
+
 def test_mpmd_jit_schedule_forward(mpmd_mesh, pipe_args):
     """Schedule-driven ``sxjit`` forward pass matches single-device result."""
     pipe_forward = _make_pipe_forward(mpmd_mesh, GPipe)
@@ -521,6 +561,61 @@ def test_mpmd_jit_schedule_default_keeps_array_args_dynamic(mpmd_mesh, pipe_args
     assert jnp.allclose(first_loss, ((stage1(stage0(x)) - y) ** 2).mean(), atol=1e-5)
     assert jnp.allclose(second_loss, ((stage1(stage0(x + 0.25)) - (y - 0.5)) ** 2).mean(), atol=1e-5)
     assert not jnp.allclose(first_loss, second_loss)
+
+
+def test_mpmd_jit_schedule_batch_argnums_keeps_state_whole(mpmd_mesh):
+    """Dynamic non-batch state should be passed whole while batch args split."""
+    state = {
+        "step": jnp.asarray(7, dtype=jnp.int32),
+        "bias": jnp.arange(_D, dtype=jnp.float32),
+        "scale": jnp.asarray(0.5, dtype=jnp.float32),
+    }
+    x = jax.random.normal(jax.random.PRNGKey(24), (_BATCH, _D))
+
+    @sxjit(
+        mesh=mpmd_mesh,
+        schedule=GPipe(microbatches=_M),
+        batch_argnums=(1,),
+    )
+    def pipe_forward(state, x):
+        h = x + state["bias"]
+        h = sxstage_iter(h)
+        return (h + state["scale"] + state["step"].astype(jnp.float32) * 0.0).mean()
+
+    loss = pipe_forward(state, x)
+    ref_loss = (x + state["bias"] + state["scale"]).mean()
+    plan = pipe_forward._mpmd_state["schedule_plan"]
+
+    assert jnp.allclose(loss, ref_loss, atol=1e-5)
+    assert plan["batch_argnums"] == (1,)
+    assert any(plan["microbatch_mask"])
+    state_start, state_end = 0, len(jax.tree.leaves(state))
+    assert not any(plan["microbatch_mask"][state_start:state_end])
+
+
+def test_schedule_const_placement_promotes_single_device_values_to_stage_submesh():
+    from spectrax.runtime.mpmd.runtime import _place_schedule_const_value
+
+    devs = jax.devices()[:2]
+    if len(devs) < 2:
+        pytest.skip("need 2 devices for stage-local placement check")
+
+    mesh = MpMdMesh(Mesh(np.array(devs).reshape(1, 2), ("pp", "tp")), "pp")
+    rank_submeshes = [mesh.submesh(0)]
+    stage_shardings = [mesh.sub_sharding(0)]
+    value = jax.device_put(jnp.asarray([1, 2], dtype=jnp.uint32), devs[0])
+
+    placed = _place_schedule_const_value(
+        value,
+        loc=(0, 0),
+        flat_idx=None,
+        leaf_shardings=[{}],
+        leaf_stage_owners={},
+        stage_shardings=stage_shardings,
+        rank_submeshes=rank_submeshes,
+    )
+
+    assert set(placed.devices()) == set(rank_submeshes[0].devices.flat)
 
 
 def test_mpmd_jit_schedule_rebinds_live_weight_values(mpmd_mesh, pipe_args):
@@ -719,6 +814,7 @@ def test_mpmd_jit_schedule_grad_matches_reference(mpmd_mesh, pipe_args):
 
     for pg, rg in zip(pipe_grads, ref_grads, strict=True):
         assert jnp.allclose(pg, rg, atol=1e-4, rtol=1e-4)
+    assert pipe_forward._mpmd_state["schedule_plan"]["last_schedule_runtime_stats"]["dispatcher"] == "fused_async"
 
     faithful_grads = sxgrad(pipe_forward, argnums=argnums)(*pipe_args)
     for fg, rg in zip(faithful_grads, ref_grads, strict=True):
@@ -729,6 +825,39 @@ def test_mpmd_jit_schedule_grad_matches_reference(mpmd_mesh, pipe_args):
     assert jnp.allclose(loss_vg, ref_loss, atol=1e-5)
     for vg, rg in zip(vg_grads, ref_grads, strict=True):
         assert jnp.allclose(vg, rg, atol=1e-4, rtol=1e-4)
+
+
+def test_mpmd_jit_schedule_value_and_grad_repacks_multileaf_arg(mpmd_mesh, pipe_args):
+    """Plain JAX value_and_grad on scheduled sxjit uses the schedule dispatcher."""
+    w0, b0, w1, b1, x, y = pipe_args
+    params = {"s0": {"w": w0, "b": b0}, "s1": {"w": w1, "b": b1}}
+    full_replicated = NamedSharding(mpmd_mesh.jax_mesh, PartitionSpec())
+    params = jax.tree.map(lambda leaf: jax.device_put(leaf, full_replicated), params)
+
+    def ref_forward(p, x, y):
+        h = jnp.maximum(x @ p["s0"]["w"] + p["s0"]["b"], 0)
+        h = jnp.maximum(h @ p["s1"]["w"] + p["s1"]["b"], 0)
+        return ((h - y) ** 2).mean()
+
+    @sxjit(
+        mesh=mpmd_mesh,
+        schedule=Std1F1B(microbatches=_M),
+        static_argnums=(),
+        batch_argnums=(1, 2),
+    )
+    def pipe_forward(p, x, y):
+        h = jnp.maximum(x @ p["s0"]["w"] + p["s0"]["b"], 0)
+        h = sxstage_iter(h)
+        h = jnp.maximum(h @ p["s1"]["w"] + p["s1"]["b"], 0)
+        return ((h - y) ** 2).mean()
+
+    loss, grads = jax.value_and_grad(pipe_forward, argnums=0)(params, x, y)
+    ref_loss, ref_grads = jax.value_and_grad(ref_forward, argnums=0)(params, x, y)
+
+    assert np.allclose(jax.device_get(loss), jax.device_get(ref_loss), atol=1e-4, rtol=1e-4)
+    for grad, ref_grad in zip(jax.tree.leaves(grads), jax.tree.leaves(ref_grads), strict=True):
+        assert np.allclose(jax.device_get(grad), jax.device_get(ref_grad), atol=1e-4, rtol=1e-4)
+    assert pipe_forward._mpmd_state["schedule_plan"]["last_schedule_runtime_stats"]["dispatcher"] == "fused_async"
 
 
 def test_mpmd_jit_schedule_profiler_records_tasks(mpmd_mesh, pipe_args):
@@ -809,6 +938,62 @@ def test_mpmd_grad_virtual_kimi_matches_reference(mpmd_mesh, pipe_args_4stage):
 
     for fg, rg in zip(faithful_grads, ref_grads, strict=True):
         assert jnp.allclose(fg, rg, atol=1e-1, rtol=6e-2)
+
+
+@pytest.mark.parametrize(
+    ("schedule_cls", "schedule_kwargs", "microbatches", "four_stage", "atol", "rtol"),
+    [
+        (GPipe, {}, _M, False, 1e-4, 1e-4),
+        (Std1F1B, {}, _M, False, 1e-4, 1e-4),
+        (Eager1F1B, {}, _M, False, 1e-4, 1e-4),
+        (ZeroBubbleH1, {}, _M, False, 1e-2, 1e-2),
+        (InterleavedH1, {"virtual_stages": 2}, 4, True, 1e-1, 6e-2),
+        (Interleaved1F1BPlusOne, {"virtual_stages": 2}, 4, True, 1e-1, 6e-2),
+        (InterleavedGPipe, {"virtual_stages": 2}, 4, True, 1e-1, 6e-2),
+        (KimiK2, {"virtual_stages": 2, "extra_warmup": 1}, 4, True, 1e-1, 6e-2),
+        (DualPipeV, {}, 4, True, 1e-1, 6e-2),
+    ],
+)
+def test_mpmd_sxjit_true_dispatch_for_all_schedulers(
+    schedule_cls,
+    schedule_kwargs,
+    microbatches,
+    four_stage,
+    atol,
+    rtol,
+    mpmd_mesh,
+    pipe_args,
+    pipe_args_4stage,
+):
+    """Every sxjit-supported scheduler uses the real fused async MPMD dispatcher."""
+    if four_stage:
+        args = pipe_args_4stage
+        argnums = tuple(range(8))
+        pipe_forward = _make_pipe_forward_4stage(
+            mpmd_mesh,
+            schedule_cls,
+            microbatches=microbatches,
+            **schedule_kwargs,
+        )
+        ref_loss, ref_grads = jax.value_and_grad(_ref_forward_4stage, argnums=argnums)(*args)
+    else:
+        args = pipe_args
+        argnums = (0, 1, 2, 3)
+        pipe_forward = _make_pipe_forward(
+            mpmd_mesh,
+            schedule_cls,
+            microbatches=microbatches,
+            **schedule_kwargs,
+        )
+        ref_loss, ref_grads = jax.value_and_grad(_ref_forward, argnums=argnums)(*args)
+
+    loss, grads = sxvalue_and_grad(pipe_forward, argnums=argnums)(*args)
+    jax.block_until_ready((loss, grads))
+
+    assert jnp.allclose(loss, ref_loss, atol=atol, rtol=rtol)
+    for grad, ref_grad in zip(grads, ref_grads, strict=True):
+        assert jnp.allclose(grad, ref_grad, atol=atol, rtol=rtol)
+    _assert_true_fused_async_mpmd(pipe_forward, n_ranks=mpmd_mesh.mpmd_dim)
 
 
 @pytest.mark.parametrize("schedule_cls", [GPipe, Std1F1B, Eager1F1B])

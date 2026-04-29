@@ -6,7 +6,7 @@
 
 Fold Python-orchestrated pipeline dispatch into a small number of
 compiled programs per rank, shrinking the per-step jit dispatch count
-from ``O(T × n)`` (one per :class:`Action`) to ``O(n)``. Each rank
+from ``O(T x n)`` (one per :class:`Action`) to ``O(n)``. Each rank
 gets a **forward-sweep** jit that runs every ``FWD`` assigned to that
 rank back-to-back, and a **backward-sweep** jit that does the same
 for the rank's ``BWD`` actions plus the terminal-rank loss/g_y seed.

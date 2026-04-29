@@ -77,6 +77,7 @@ __all__ = [
     "extract_shardings",
     "get_axes_size_in_mesh",
     "get_corrected_named_sharding",
+    "get_current_stage_mesh",
     "get_incontext_mesh",
     "get_named_sharding",
     "get_partition_spec",
@@ -677,6 +678,41 @@ def _resolve_constraint_target(
         return mpmd_mesh.submesh(0), mpmd_mesh, False
 
     return base_mesh, mpmd_mesh, True
+
+
+def get_current_stage_mesh(
+    mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
+    *,
+    arr: ArrayLike | None = None,
+    stage: int | tuple[int, int] | None = None,
+    stage_mesh: "Mesh | None" = None,
+    metadata: dict[str, Any] | None = None,
+    raise_error: bool = False,
+) -> "Mesh | None":
+    """Return the stage-local JAX mesh for the current MPMD context.
+
+    This is the public query form of the same resolution used by
+    :func:`with_sharding_constraint`: explicit ``stage_mesh`` wins, then
+    explicit ``stage``, variable metadata, active ``assign_stage(...)``,
+    existing array sharding, active JAX submesh context, and finally the
+    process-local MPMD rank. For non-MPMD meshes it returns the plain JAX
+    mesh. If a multi-stage MPMD mesh cannot be resolved, returns ``None``
+    unless ``raise_error=True``.
+    """
+
+    queried_mesh = _promote_active_spx_mesh(_query_mesh(mesh, raise_error=raise_error))
+    target_mesh, _mpmd_mesh, unresolved_mpmd = _resolve_constraint_target(
+        arr if arr is not None else object(),
+        mesh=queried_mesh,
+        stage=stage,
+        stage_mesh=stage_mesh,
+        metadata=metadata,
+    )
+    if unresolved_mpmd:
+        if raise_error:
+            raise ValueError("Could not resolve the current MPMD stage mesh.")
+        return None
+    return target_mesh
 
 
 def with_sharding_constraint(

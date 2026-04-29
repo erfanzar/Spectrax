@@ -483,6 +483,20 @@ def _arg_leaf_ranges(args: tuple[Any, ...]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _template_leaf(x: Any) -> Any:
+    """Return a tracer-free shape/dtype template for array-like leaves."""
+    if hasattr(x, "shape") and hasattr(x, "dtype"):
+        return jax.ShapeDtypeStruct(tuple(x.shape), x.dtype)
+    return x
+
+
+def _zeros_like_template(x: Any) -> Any:
+    """Like ``jnp.zeros_like`` but accepts ``ShapeDtypeStruct`` templates."""
+    if isinstance(x, jax.ShapeDtypeStruct):
+        return jnp.zeros(x.shape, x.dtype)
+    return jnp.zeros_like(x)
+
+
 def _normalize_argnums(argnums: int | tuple[int, ...] | None, total: int) -> tuple[int, ...]:
     """Coerce ``argnums`` to a validated tuple of non-negative indices.
 
@@ -620,6 +634,18 @@ def _has_array_leaf(x: Any) -> bool:
         or (hasattr(leaf, "shape") and hasattr(leaf, "dtype"))
         for leaf in leaves
     )
+
+
+def _has_microbatch_axis(x: Any) -> bool:
+    """Return whether ``x`` has a leading axis that can be split."""
+    return hasattr(x, "shape") and getattr(x, "ndim", len(getattr(x, "shape", ()))) > 0
+
+
+def _microbatch_sample(x: Any, m: int) -> Any:
+    """Return microbatch 0 for batch leaves and pass shared leaves through."""
+    if not _has_microbatch_axis(x):
+        return x
+    return _microbatch(x, m)[0]
 
 
 def _infer_schedule_static_argnums(args: tuple[Any, ...]) -> tuple[int, ...]:
@@ -800,6 +826,68 @@ def _same_sharding(a: Any, b: Any) -> bool:
     return _sharding_device_set(a) == _sharding_device_set(b)
 
 
+def _stage_axis_size(mesh: Any, axis: Any) -> int:
+    """Return the size of ``axis`` on ``mesh``; unknown axes behave replicated."""
+    if axis is None:
+        return 1
+    try:
+        return int(mesh.shape[axis])
+    except Exception:
+        return 1
+
+
+def _stage_axis_product(mesh: Any, axis: Any) -> int:
+    """Return the product of every mesh axis referenced by one spec entry."""
+    if axis is None:
+        return 1
+    if isinstance(axis, tuple):
+        product = 1
+        for part in axis:
+            product *= _stage_axis_size(mesh, part)
+        return product
+    return _stage_axis_size(mesh, axis)
+
+
+def _trim_trailing_replicated_stage_axes(spec: Any, mesh: Any) -> Any:
+    """Drop trailing spec entries that are equivalent to replication.
+
+    JAX commonly canonicalizes outputs by omitting trailing replicated
+    dimensions.  For example, on a stage mesh where ``fsdp`` and ``sp`` both
+    have size 1, ``P('tp', ('fsdp', 'sp'))`` and ``P('tp')`` are physically
+    identical.  Scheduled MPMD stage jits key on the full sharding signature,
+    so normalize to the canonical shorter form before the first launch.
+    """
+    try:
+        parts = list(tuple(spec))
+    except Exception:
+        return spec
+    while parts and _stage_axis_product(mesh, parts[-1]) <= 1:
+        parts.pop()
+    return jax.sharding.PartitionSpec(*parts)
+
+
+def _canonical_stage_sharding(value: Any, sharding: Any, stage_mesh: Any) -> Any | None:
+    """Return a canonical ``NamedSharding`` for ``value`` on ``stage_mesh``.
+
+    The runtime may receive parameters whose existing sharding still contains
+    singleton mesh axes from model initialization, while the optimizer returns
+    the same physical layout with those trailing singleton axes elided.  Without
+    canonicalization, the first training step compiles one set of stage jits and
+    the second step compiles the same jits again with equivalent but shorter
+    specs.
+    """
+    spec = getattr(sharding, "spec", None)
+    if spec is None or not hasattr(value, "shape"):
+        return None
+    spec = sanitize_partition_spec_for_mesh_and_shape(
+        spec,
+        mesh=stage_mesh,
+        shape=tuple(getattr(value, "shape", ())),
+    )
+    spec = _trim_trailing_replicated_stage_axes(spec, stage_mesh)
+    return jax.sharding.NamedSharding(stage_mesh, spec)
+
+
 def _partition_spec_axes(spec: Any) -> set[str]:
     """Return the flat set of mesh-axis names referenced anywhere in ``spec``.
 
@@ -921,31 +1009,6 @@ def _can_skip_device_put(value: Any, dest_sharding: Any) -> tuple[bool, bool]:
     return skip, False
 
 
-def _is_replicated_sharding(sharding: Any) -> bool:
-    """Return ``True`` when ``sharding``'s spec replicates over every dimension.
-
-    Detects shardings where every entry of the underlying
-    :class:`PartitionSpec` is ``None`` (no axis sharded). Falls back to
-    ``False`` if the object exposes no ``.spec`` attribute or fails
-    iteration — it is a best-effort fast path for the placement
-    decision in :func:`_place_schedule_const_value`.
-
-    Args:
-        sharding: Any sharding-like object (typically
-            :class:`NamedSharding`).
-
-    Returns:
-        ``True`` only when every dimension is replicated.
-    """
-    spec = getattr(sharding, "spec", None)
-    if spec is None:
-        return False
-    try:
-        return all(part is None for part in tuple(spec))
-    except Exception:
-        return False
-
-
 def _place_schedule_const_value(
     value: Any,
     *,
@@ -978,21 +1041,104 @@ def _place_schedule_const_value(
     else:
         target = None
 
+    target = _canonical_stage_sharding(value, target, rank_submeshes[rank]) or target
     rank_devices = set(rank_submeshes[rank].devices.flat)
     value_devices = _array_device_set(value)
     current_sharding = getattr(value, "sharding", None)
-    if value_devices == rank_devices:
-        if target is None or current_sharding == target:
-            return value
-        current_is_replicated = _is_replicated_sharding(current_sharding)
-        target_is_replicated = _is_replicated_sharding(target)
-        if not (current_is_replicated and not target_is_replicated):
-            return value
+    if target is None and value_devices == rank_devices:
+        target = _canonical_stage_sharding(value, current_sharding, rank_submeshes[rank])
     if target is not None:
+        if _same_sharding(current_sharding, target):
+            return value
         return jax.device_put(value, target)
-    if value_devices is not None and value_devices.issubset(rank_devices):
+    if value_devices is not None and value_devices == rank_devices:
         return value
     return jax.device_put(value, stage_shardings[rank])
+
+
+def _place_schedule_dynamic_invar(
+    value: Any,
+    *,
+    rank: int,
+    flat_idx: int,
+    leaf_shardings: list[dict[int, Any]],
+    leaf_stage_owners: dict[int, int],
+    stage_shardings: list[Any],
+    rank_submeshes: list[Any],
+) -> Any:
+    """Place a dynamic non-batch schedule invar onto its consuming stage.
+
+    Dynamic parameter/state leaves are passed live so gradients can flow, but
+    they still need the same stage-local placement policy as schedule consts
+    before entering a per-stage JIT.
+    """
+    owner = leaf_stage_owners.get(flat_idx)
+    if owner is not None and owner != rank:
+        raise ValueError(
+            f"sxjit: flat argument leaf {flat_idx} is assigned to pipeline "
+            f"stage {owner}, but traced stage {rank} uses it. Move the "
+            "corresponding layer into the matching pipeline segment or "
+            "update its assign_stage(...) hint."
+        )
+
+    target = _canonical_stage_sharding(value, leaf_shardings[rank].get(flat_idx), rank_submeshes[rank])
+    rank_devices = set(rank_submeshes[rank].devices.flat)
+    value_devices = _array_device_set(value)
+    current_sharding = getattr(value, "sharding", None)
+    if target is None and value_devices == rank_devices:
+        target = _canonical_stage_sharding(value, current_sharding, rank_submeshes[rank])
+    if target is not None:
+        if _same_sharding(current_sharding, target):
+            return value
+        return jax.device_put(value, target)
+    if value_devices is not None and value_devices == rank_devices:
+        return value
+    return jax.device_put(value, stage_shardings[rank])
+
+
+def _is_differentiable_array(value: Any) -> bool:
+    """Return whether a value can carry a normal floating-point cotangent."""
+    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+        return False
+    try:
+        return bool(jnp.issubdtype(jnp.dtype(value.dtype), jnp.inexact))
+    except TypeError:
+        return False
+
+
+def _schedule_grad_target_for_flat_leaf(
+    *,
+    value: Any,
+    rank: int,
+    flat_idx: int,
+    leaf_shardings: list[dict[int, Any]],
+    rank_submeshes: list[Any],
+) -> Any | None:
+    """Return the sharding that a gradient for ``value`` should use.
+
+    Scheduled training often receives parameters as dynamic ``State``
+    leaves rather than as a live ``Module`` argument. In that case the
+    stage backward may naturally choose a different output layout for a
+    weight gradient than the input parameter layout. If the optimizer then
+    adopts that layout, the next scheduled call recompiles every stage.
+
+    Make the contract explicit: cotangents for dynamic leaves should be
+    emitted in the same canonical stage-local sharding as the leaf that
+    entered the stage.
+    """
+    if not _is_differentiable_array(value):
+        return None
+    target = _canonical_stage_sharding(value, leaf_shardings[rank].get(flat_idx), rank_submeshes[rank])
+    if target is not None:
+        return target
+    return _canonical_stage_sharding(value, getattr(value, "sharding", None), rank_submeshes[rank])
+
+
+def _schedule_grad_target_for_value(value: Any, stage_mesh: Any) -> Any | None:
+    """Return a canonical gradient sharding matching a concrete stage value."""
+    if not _is_differentiable_array(value):
+        return None
+    return _canonical_stage_sharding(value, getattr(value, "sharding", None), stage_mesh)
 
 
 def _build_schedule_plan(
@@ -1005,6 +1151,7 @@ def _build_schedule_plan(
     rank_submeshes: list,
     static_argnums: tuple[int, ...] | None,
     donate_argnums: tuple[int, ...] | None = None,
+    batch_argnums: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Build the per-call dispatch plan for schedule-driven :func:`sxjit`.
 
@@ -1031,6 +1178,9 @@ def _build_schedule_plan(
             :func:`_infer_schedule_static_argnums`.
         donate_argnums: Optional argnums whose buffers may be donated
             into the compiled stage jits.
+        batch_argnums: Optional argnums whose leading axis should be
+            split across schedule microbatches. Dynamic args omitted
+            from this set are passed whole to every microbatch.
 
     Returns:
         A plan dict consumed by the schedule dispatchers
@@ -1047,7 +1197,19 @@ def _build_schedule_plan(
         static_nums = set(_infer_schedule_static_argnums(args))
     else:
         static_nums = set(_normalize_argnums(static_argnums, len(args)))
+    donate_nums = set(_normalize_argnums(donate_argnums, len(args)))
     dynamic_argnums = tuple(i for i in range(len(args)) if i not in static_nums)
+    dynamic_num_set = set(dynamic_argnums)
+    if batch_argnums is None:
+        batch_nums = dynamic_num_set
+    else:
+        batch_nums = set(_normalize_argnums(batch_argnums, len(args)))
+        invalid_batch = sorted(batch_nums - dynamic_num_set)
+        if invalid_batch:
+            raise ValueError(
+                f"sxjit: batch_argnums contains static or invalid argument indices {invalid_batch}. "
+                "Only dynamic positional arguments can be microbatched."
+            )
 
     placeholder_args = list(args)
     for i in dynamic_argnums:
@@ -1068,7 +1230,12 @@ def _build_schedule_plan(
             full_args[idx] = darg
         return fn(*full_args, **kwargs)
 
-    mb_dynamic_args = tuple(jax.tree.map(lambda a: _microbatch(a, m)[0], args[i]) for i in dynamic_argnums)
+    def _make_mb_arg(i: int):
+        if i in batch_nums:
+            return jax.tree.map(lambda a: _microbatch_sample(a, m), args[i])
+        return args[i]
+
+    mb_dynamic_args = tuple(_make_mb_arg(i) for i in dynamic_argnums)
     closed_jaxpr = jax.make_jaxpr(_wrapper)(*mb_dynamic_args)
 
     edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
@@ -1089,6 +1256,7 @@ def _build_schedule_plan(
     all_const_idx_by_id = {id(v): i for i, v in enumerate(all_constvars)}
 
     flat_args = jax.tree.leaves(args)
+    flat_arg_templates = tuple(_template_leaf(leaf) for leaf in flat_args)
 
     def _schedule_stage_owner(assignment: tuple[int, int] | None) -> int | None:
         """Map a stage assignment (current, total) to its physical rank.
@@ -1133,7 +1301,40 @@ def _build_schedule_plan(
             dynamic_flat_to_global_flat[dyn_local_idx] = g_start + li
             dyn_local_idx += 1
 
+    dynamic_usage_ranks: dict[int, set[int]] = {}
+    for logical, sources in enumerate(invar_sources):
+        rank = loc_for_logical[logical][0]
+        for source_kind, source_a, _source_b in sources:
+            if source_kind != "body_invar":
+                continue
+            flat_idx = dynamic_flat_to_global_flat.get(source_a)
+            if flat_idx is not None:
+                dynamic_usage_ranks.setdefault(flat_idx, set()).add(rank)
+
+    for flat_idx, ranks in dynamic_usage_ranks.items():
+        if len(ranks) != 1:
+            continue
+        rank = next(iter(ranks))
+        owner = leaf_stage_owners.get(flat_idx)
+        if owner is not None and owner != rank:
+            raise ValueError(
+                f"sxjit: flat argument leaf {flat_idx} is assigned to pipeline "
+                f"stage {owner}, but the scheduled jaxpr uses it only on stage {rank}. "
+                "Update the leaf's assign_stage(...) hint or the pipeline boundaries."
+            )
+        leaf_stage_owners.setdefault(flat_idx, rank)
+        if flat_idx in leaf_shardings[rank]:
+            continue
+        leaf = flat_args[flat_idx]
+        if not hasattr(leaf, "shape"):
+            continue
+        target = _canonical_stage_sharding(leaf, getattr(leaf, "sharding", None), rank_submeshes[rank])
+        if target is None:
+            target = stage_shardings[rank]
+        leaf_shardings[rank][flat_idx] = target
+
     donate_nums = set(_normalize_argnums(donate_argnums, len(args))) if donate_argnums is not None else set()
+    donatable_nums = donate_nums & batch_nums
     donate_invars_per_logical: dict[int, set[int]] = {i: set() for i in range(n_logical)}
     if donate_nums:
         for donate_num in donate_nums:
@@ -1143,7 +1344,7 @@ def _build_schedule_plan(
                     "Static arguments are compile-time constants and cannot be donated."
                 )
         start_end = global_ranges
-        for donate_num in donate_nums:
+        for donate_num in donatable_nums:
             dstart, dend = start_end[donate_num]
             for dyn_idx, global_idx in dynamic_flat_to_global_flat.items():
                 if dstart <= global_idx < dend:
@@ -1155,6 +1356,38 @@ def _build_schedule_plan(
                     if len(used_by) == 1:
                         logical, invar_pos = used_by[0]
                         donate_invars_per_logical[logical].add(invar_pos)
+
+    def _bwd_out_shardings_for(
+        logical: int, loc: tuple[int, int], consts: tuple[Any, ...]
+    ) -> tuple[Any, tuple[Any, ...]]:
+        """Build ``jax.jit(out_shardings=...)`` for one stage backward."""
+        rank = loc[0]
+        stage_mesh = rank_submeshes[rank]
+        const_grad_shardings = tuple(_schedule_grad_target_for_value(value, stage_mesh) for value in consts)
+        invar_grad_shardings: list[Any | None] = []
+        for source_kind, source_a, _source_b in invar_sources[logical]:
+            if source_kind == "body_invar":
+                flat_idx = dynamic_flat_to_global_flat[source_a]
+                invar_grad_shardings.append(
+                    _schedule_grad_target_for_flat_leaf(
+                        value=flat_args[flat_idx],
+                        rank=rank,
+                        flat_idx=flat_idx,
+                        leaf_shardings=leaf_shardings,
+                        rank_submeshes=rank_submeshes,
+                    )
+                )
+            else:
+                invar_grad_shardings.append(None)
+        return const_grad_shardings, tuple(invar_grad_shardings)
+
+    def _terminal_out_shardings_for(
+        logical: int,
+        loc: tuple[int, int],
+        consts: tuple[Any, ...],
+    ) -> tuple[Any | None, tuple[tuple[Any, ...], tuple[Any, ...]]]:
+        """Build ``jax.jit(out_shardings=...)`` for the terminal loss stage."""
+        return None, _bwd_out_shardings_for(logical, loc, consts)
 
     per_loc_consts: dict[tuple[int, int], tuple[Any, ...]] = {}
     const_indices_per_loc: dict[tuple[int, int], tuple[int, ...]] = {}
@@ -1193,18 +1426,52 @@ def _build_schedule_plan(
         cluster_jaxprs_per_loc[loc] = filtered_cluster
         donate_positions = tuple(1 + pos for pos in sorted(donate_invars_per_logical[logical]))
         fwd_jits[loc] = _make_fwd_jit(filtered_cluster, donate_argnums=donate_positions)
+        bwd_out_shardings = _bwd_out_shardings_for(logical, loc, placed_consts)
 
         if loc != terminal_loc:
-            bwd_jits[loc] = _make_bwd_jit(filtered_cluster, n_invars, donate_argnums=donate_positions)
-            bwd_i_jits[loc] = _make_bwd_i_jit(filtered_cluster, n_invars, donate_argnums=donate_positions)
-            bwd_w_jits[loc] = _make_bwd_w_jit(filtered_cluster, n_invars, donate_argnums=donate_positions)
+            bwd_jits[loc] = _make_bwd_jit(
+                filtered_cluster,
+                n_invars,
+                donate_argnums=donate_positions,
+                out_shardings=bwd_out_shardings,
+            )
+            bwd_i_jits[loc] = _make_bwd_i_jit(
+                filtered_cluster,
+                n_invars,
+                donate_argnums=donate_positions,
+                out_shardings=bwd_out_shardings[1],
+            )
+            bwd_w_jits[loc] = _make_bwd_w_jit(
+                filtered_cluster,
+                n_invars,
+                donate_argnums=donate_positions,
+                out_shardings=bwd_out_shardings[0],
+            )
         else:
             bwd_jits[loc] = None
             bwd_i_jits[loc] = None
             bwd_w_jits[loc] = None
-            terminal_jit = _make_terminal_jit(filtered_cluster, n_invars, donate_argnums=donate_positions)
+            terminal_jit = _make_terminal_jit(
+                filtered_cluster,
+                n_invars,
+                donate_argnums=donate_positions,
+                out_shardings=_terminal_out_shardings_for(logical, loc, placed_consts),
+            )
 
     assert terminal_jit is not None
+
+    n_flat = len(flat_args)
+    dynamic_mask = [False] * n_flat
+    for argnum in dynamic_argnums:
+        start, end = global_ranges[argnum]
+        for i in range(start, end):
+            dynamic_mask[i] = True
+    microbatch_mask = [False] * n_flat
+    for argnum in batch_nums:
+        start, end = global_ranges[argnum]
+        for i, leaf in enumerate(flat_args[start:end], start=start):
+            if _has_microbatch_axis(leaf):
+                microbatch_mask[i] = True
 
     vbwd_jits: dict[tuple[int, int], Callable[..., Any]] = {}
     if schedule.lazy_bwd_batching:
@@ -1214,17 +1481,20 @@ def _build_schedule_plan(
             n_invars = n_invars_per_loc[loc]
             n_outs = len(clusters[logical].outvars)
             bwd = bwd_jits[loc]
-            vbwd = jax.jit(jax.vmap(bwd, in_axes=(None,) + (0,) * n_invars + (0,) * n_outs))
+            in_axes = (
+                (None,)
+                + _schedule_invar_microbatch_axes(
+                    invar_sources,
+                    dynamic_flat_to_global_flat,
+                    microbatch_mask,
+                    logical,
+                )
+                + (0,) * n_outs
+            )
+            vbwd = jax.jit(jax.vmap(bwd, in_axes=in_axes))
             vbwd_jits[loc] = vbwd
 
     grid = _build_schedule_grid(schedule, n)
-
-    n_flat = len(flat_args)
-    dynamic_mask = [False] * n_flat
-    for argnum in dynamic_argnums:
-        start, end = global_ranges[argnum]
-        for i in range(start, end):
-            dynamic_mask[i] = True
 
     return {
         "n": n,
@@ -1252,14 +1522,33 @@ def _build_schedule_plan(
         "edge_shardings": edge_shardings,
         "mpmd_mesh": mpmd_mesh,
         "dynamic_mask": dynamic_mask,
+        "microbatch_mask": microbatch_mask,
+        "batch_argnums": tuple(sorted(batch_nums)),
         "n_flat": n_flat,
-        "flat_args": flat_args,
+        "flat_args": flat_arg_templates,
         "const_idx_to_flat_idx": const_idx_to_flat_idx,
         "dynamic_flat_to_global_flat": dynamic_flat_to_global_flat,
         "leaf_shardings": leaf_shardings,
         "leaf_stage_owners": leaf_stage_owners,
         "clusters": clusters,
     }
+
+
+def _schedule_invar_microbatch_axes(
+    invar_sources: list,
+    dynamic_flat_to_global_flat: dict[int, int],
+    microbatch_mask: list[bool],
+    logical: int,
+) -> tuple[int | None, ...]:
+    """Return vmap axes for one logical stage's runtime invars."""
+    axes: list[int | None] = []
+    for source_kind, source_a, _source_b in invar_sources[logical]:
+        if source_kind == "body_invar":
+            flat_idx = dynamic_flat_to_global_flat[source_a]
+            axes.append(0 if microbatch_mask[flat_idx] else None)
+        else:
+            axes.append(0)
+    return tuple(axes)
 
 
 def _schedule_per_call_consts(plan: dict[str, Any], args: tuple[Any, ...]) -> dict[tuple[int, int], tuple[Any, ...]]:
@@ -1323,12 +1612,15 @@ def _dispatch_gpipe_fwd(
     mpmd_mesh = plan["mpmd_mesh"]
     per_loc_consts = _schedule_per_call_consts(plan, args)
     dynamic_mask = plan["dynamic_mask"]
+    microbatch_mask = plan.get("microbatch_mask", dynamic_mask)
     dynamic_flat_to_global_flat = plan["dynamic_flat_to_global_flat"]
+    leaf_shardings = plan["leaf_shardings"]
+    leaf_stage_owners = plan["leaf_stage_owners"]
     flat_args = jax.tree.leaves(args)
 
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args):
-        if dynamic_mask[i]:
+        if microbatch_mask[i]:
             mb_args.append(_microbatch(arg, m))
         else:
             mb_args.append(arg)
@@ -1349,8 +1641,17 @@ def _dispatch_gpipe_fwd(
                 if source_kind == "body_invar":
                     flat_idx = dynamic_flat_to_global_flat[source_a]
                     val = mb_args[flat_idx]
-                    if dynamic_mask[flat_idx]:
+                    if microbatch_mask[flat_idx]:
                         val = val[mb]
+                    val = _place_schedule_dynamic_invar(
+                        val,
+                        rank=rank,
+                        flat_idx=flat_idx,
+                        leaf_shardings=leaf_shardings,
+                        leaf_stage_owners=leaf_stage_owners,
+                        stage_shardings=stage_shardings,
+                        rank_submeshes=rank_submeshes,
+                    )
                     invars.append(val)
                 elif source_kind == "cluster_out":
                     producer_loc = loc_for_logical[source_a]
@@ -1408,6 +1709,7 @@ def _dispatch_gpipe_bwd(
     mpmd_mesh = plan["mpmd_mesh"]
     per_loc_consts = saved.get("per_loc_consts", plan["per_loc_consts"])
     dynamic_mask = plan["dynamic_mask"]
+    microbatch_mask = plan.get("microbatch_mask", dynamic_mask)
     const_idx_to_flat_idx = plan["const_idx_to_flat_idx"]
     dynamic_flat_to_global_flat = plan["dynamic_flat_to_global_flat"]
     n_flat = plan["n_flat"]
@@ -1459,7 +1761,7 @@ def _dispatch_gpipe_bwd(
                 if flat_idx is None:
                     continue
                 grad = g_invars[invar_idx]
-                if dynamic_mask[flat_idx]:
+                if microbatch_mask[flat_idx]:
                     if flat_idx not in grad_accums:
                         grad_accums[flat_idx] = [None] * m
                     grad_accums[flat_idx][mb] = grad
@@ -1505,7 +1807,7 @@ def _dispatch_gpipe_bwd(
     for i in range(n_flat):
         if i in grad_accums:
             grad = grad_accums[i]
-            if dynamic_mask[i]:
+            if microbatch_mask[i]:
                 if isinstance(grad, list):
                     template = next(g for g in grad if g is not None)
                     for mb in range(m):
@@ -1517,7 +1819,7 @@ def _dispatch_gpipe_bwd(
             else:
                 final_grads.append(grad)
         else:
-            final_grads.append(jnp.zeros_like(flat_args[i]))
+            final_grads.append(_zeros_like_template(flat_args[i]))
 
     return tuple(final_grads)
 
@@ -1548,16 +1850,19 @@ def _dispatch_schedule_faithful_serial(
     mpmd_mesh = plan["mpmd_mesh"]
     per_loc_consts = _schedule_per_call_consts(plan, args)
     dynamic_mask = plan["dynamic_mask"]
+    microbatch_mask = plan.get("microbatch_mask", dynamic_mask)
     const_idx_to_flat_idx = plan["const_idx_to_flat_idx"]
     dynamic_flat_to_global_flat = plan["dynamic_flat_to_global_flat"]
     n_flat = plan["n_flat"]
     flat_args = plan["flat_args"]
+    leaf_shardings = plan["leaf_shardings"]
+    leaf_stage_owners = plan["leaf_stage_owners"]
     lazy_bwd_batching = plan["schedule"].lazy_bwd_batching
 
     flat_args_live = jax.tree.leaves(args)
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args_live):
-        if dynamic_mask[i]:
+        if microbatch_mask[i]:
             mb_args.append(_microbatch(arg, m))
         else:
             mb_args.append(arg)
@@ -1587,8 +1892,17 @@ def _dispatch_schedule_faithful_serial(
                     if source_kind == "body_invar":
                         flat_idx = dynamic_flat_to_global_flat[source_a]
                         val = mb_args[flat_idx]
-                        if dynamic_mask[flat_idx]:
+                        if microbatch_mask[flat_idx]:
                             val = val[mb]
+                        val = _place_schedule_dynamic_invar(
+                            val,
+                            rank=rank,
+                            flat_idx=flat_idx,
+                            leaf_shardings=leaf_shardings,
+                            leaf_stage_owners=leaf_stage_owners,
+                            stage_shardings=stage_shardings,
+                            rank_submeshes=rank_submeshes,
+                        )
                         invars.append(val)
                     elif source_kind == "cluster_out":
                         producer_loc = loc_for_logical[source_a]
@@ -1681,7 +1995,7 @@ def _dispatch_schedule_faithful_serial(
                         if flat_idx is None:
                             continue
                         grad = g_invars[invar_idx]
-                        if dynamic_mask[flat_idx]:
+                        if microbatch_mask[flat_idx]:
                             if flat_idx not in grad_accums:
                                 grad_accums[flat_idx] = [None] * m
                             grad_accums[flat_idx][mb] = grad
@@ -1770,7 +2084,7 @@ def _dispatch_schedule_faithful_serial(
                         if flat_idx is None:
                             continue
                         grad = g_invars[invar_idx]
-                        if dynamic_mask[flat_idx]:
+                        if microbatch_mask[flat_idx]:
                             if flat_idx not in grad_accums:
                                 grad_accums[flat_idx] = [None] * m
                             grad_accums[flat_idx][mb] = grad
@@ -1812,13 +2126,22 @@ def _dispatch_schedule_faithful_serial(
                         else:
                             slots[producer_out_idx] = _add_grad(slots[producer_out_idx], cot)
             else:
+                in_axes = _schedule_invar_microbatch_axes(
+                    invar_sources,
+                    dynamic_flat_to_global_flat,
+                    microbatch_mask,
+                    logical,
+                )
                 invars_stack = []
-                for invar_idx in range(len(invar_sources[logical])):
-                    stacked = jnp.stack(
-                        [saved_inputs[(rank, loc[1], mb)][invar_idx] for mb in mbs],
-                        axis=0,
-                    )
-                    invars_stack.append(stacked)
+                for invar_idx, axis in enumerate(in_axes):
+                    if axis is None:
+                        invars_stack.append(saved_inputs[(rank, loc[1], mbs[0])][invar_idx])
+                    else:
+                        stacked = jnp.stack(
+                            [saved_inputs[(rank, loc[1], mb)][invar_idx] for mb in mbs],
+                            axis=0,
+                        )
+                        invars_stack.append(stacked)
 
                 n_outs = len(saved_outputs[(rank, loc[1], mbs[0])])
                 cots_stack = []
@@ -1866,7 +2189,7 @@ def _dispatch_schedule_faithful_serial(
                     if flat_idx is None:
                         continue
                     grad = g_invars[invar_idx]
-                    if dynamic_mask[flat_idx]:
+                    if microbatch_mask[flat_idx]:
                         if flat_idx not in grad_accums:
                             grad_accums[flat_idx] = [None] * m
                         for idx, mb in enumerate(mbs):
@@ -1925,7 +2248,7 @@ def _dispatch_schedule_faithful_serial(
                     is_leaf=_is_leaf,
                 )
                 grad = terminal_grad if grad is None else _add_grad(grad, terminal_grad)
-            if dynamic_mask[i]:
+            if microbatch_mask[i]:
                 if isinstance(grad, list):
                     template = next(g for g in grad if g is not None)
                     for mb in range(m):
@@ -1937,7 +2260,7 @@ def _dispatch_schedule_faithful_serial(
             else:
                 final_grads.append(grad)
         else:
-            final_grads.append(jnp.zeros_like(flat_args[i]))
+            final_grads.append(_zeros_like_template(flat_args[i]))
 
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     return (mean_loss if return_loss else None), tuple(final_grads)
@@ -2480,20 +2803,23 @@ def _dispatch_schedule_fused_async(
     mpmd_mesh = plan["mpmd_mesh"]
     per_loc_consts = _schedule_per_call_consts(plan, args)
     dynamic_mask = plan["dynamic_mask"]
+    microbatch_mask = plan.get("microbatch_mask", dynamic_mask)
     const_idx_to_flat_idx = plan["const_idx_to_flat_idx"]
     dynamic_flat_to_global_flat = plan["dynamic_flat_to_global_flat"]
     n_flat = plan["n_flat"]
     flat_args = plan["flat_args"]
+    leaf_shardings = plan["leaf_shardings"]
+    leaf_stage_owners = plan["leaf_stage_owners"]
     const_indices_per_loc = plan["const_indices_per_loc"]
     n_invars_per_loc = plan["n_invars_per_loc"]
-    cluster_jaxprs_per_loc = plan.get("cluster_jaxprs_per_loc", {})
+    plan.get("cluster_jaxprs_per_loc", {})
     cache_terminal_grads = True
     eager_terminal_bwd = True
 
     flat_args_live = jax.tree.leaves(args)
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args_live):
-        if dynamic_mask[i]:
+        if microbatch_mask[i]:
             mb_args.append(_microbatch(arg, m))
         else:
             mb_args.append(arg)
@@ -2545,8 +2871,17 @@ def _dispatch_schedule_fused_async(
             if source_kind == "body_invar":
                 flat_idx = dynamic_flat_to_global_flat[source_a]
                 val = mb_args[flat_idx]
-                if dynamic_mask[flat_idx]:
+                if microbatch_mask[flat_idx]:
                     val = val[mb]
+                val = _place_schedule_dynamic_invar(
+                    val,
+                    rank=rank,
+                    flat_idx=flat_idx,
+                    leaf_shardings=leaf_shardings,
+                    leaf_stage_owners=leaf_stage_owners,
+                    stage_shardings=stage_shardings,
+                    rank_submeshes=rank_submeshes,
+                )
                 invars.append(val)
             elif source_kind == "cluster_out":
                 producer_loc = loc_for_logical[source_a]
@@ -2701,7 +3036,7 @@ def _dispatch_schedule_fused_async(
                     if flat_idx is None:
                         continue
                     grad = g_invars[invar_idx]
-                    if dynamic_mask[flat_idx]:
+                    if microbatch_mask[flat_idx]:
                         if flat_idx not in grad_accums:
                             grad_accums[flat_idx] = [None] * m
                         grad_accums[flat_idx][mb] = grad
@@ -2898,15 +3233,11 @@ def _dispatch_schedule_fused_async(
             recv_cots.get(bwd_key),
             saved_outputs[bwd_key],
         )
-        cluster_jaxpr = cluster_jaxprs_per_loc.get(loc)
-        if cluster_jaxpr is None:
-            fused_jit = _get_schedule_fused_fwd_bwd_jit(
-                fwd_jits[loc],
-                bwd_jits[loc],
-                n_invars_per_loc[loc],
-            )
-        else:
-            fused_jit = _get_schedule_direct_fused_fwd_bwd_jit(cluster_jaxpr, n_invars_per_loc[loc])
+        fused_jit = _get_schedule_fused_fwd_bwd_jit(
+            fwd_jits[loc],
+            bwd_jits[loc],
+            n_invars_per_loc[loc],
+        )
         with rank_submeshes[rank]:
             fwd_outs, g_consts, g_bwd_invars = _stage_call(
                 rank,
@@ -3193,7 +3524,7 @@ def _dispatch_schedule_fused_async(
     for i in range(n_flat):
         if i in grad_accums:
             grad = grad_accums.get(i)
-            if dynamic_mask[i]:
+            if microbatch_mask[i]:
                 if isinstance(grad, list):
                     template = next(g for g in grad if g is not None)
                     for mb in range(m):
@@ -3205,7 +3536,7 @@ def _dispatch_schedule_fused_async(
             else:
                 final_grads.append(grad)
         else:
-            final_grads.append(jnp.zeros_like(flat_args[i]))
+            final_grads.append(_zeros_like_template(flat_args[i]))
 
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     plan["last_schedule_runtime_stats"] = stats_collector.as_dict(deps, units)
@@ -3237,9 +3568,12 @@ def _schedule_forward(plan: dict[str, Any], *args: Any) -> jax.Array:
 def _schedule_forward_fwd(plan: dict[str, Any], *args: Any) -> tuple[jax.Array, dict[str, Any]]:
     """Custom-VJP forward rule: returns ``(loss, residuals)``.
 
-    The residuals dict captures every per-microbatch activation needed
-    by :func:`_schedule_forward_bwd` so the backward pass can run the
-    pipeline cotangent sweep without re-tracing.
+    Under autodiff we run the schedule-faithful forward+backward
+    dispatcher immediately and stash the resulting flat cotangents as
+    residuals. This makes ``jax.grad`` / ``jax.value_and_grad`` on a
+    schedule-driven ``sxjit`` function use the same Kimi/1F1B grid as
+    :func:`sxgrad` and :func:`sxvalue_and_grad`, instead of falling back
+    to the older all-forward/all-backward GPipe custom-VJP path.
 
     Args:
         plan: Dispatch plan from :func:`_build_schedule_plan`.
@@ -3249,24 +3583,30 @@ def _schedule_forward_fwd(plan: dict[str, Any], *args: Any) -> tuple[jax.Array, 
         ``(loss, saved)`` — the forward output plus the residuals
         consumed by the backward rule.
     """
-    loss, saved = _dispatch_gpipe_fwd(plan, args)
-    return loss, saved
+    loss, flat_grads = _dispatch_schedule_faithful(plan, args, return_loss=True)
+    leaf_ranges = _arg_leaf_ranges(args)
+    packed_grads = tuple(
+        jax.tree.unflatten(jax.tree.structure(arg), list(flat_grads[start:end]))
+        for arg, (start, end) in zip(args, leaf_ranges, strict=True)
+    )
+    return loss, packed_grads
 
 
-def _schedule_forward_bwd(plan: dict[str, Any], saved: dict[str, Any], g: Any) -> tuple[Any, ...]:
-    """Custom-VJP backward rule: replay the schedule and return arg cotangents.
+def _schedule_forward_bwd(plan: dict[str, Any], saved: tuple[Any, ...], g: Any) -> tuple[Any, ...]:
+    """Custom-VJP backward rule: return schedule-computed arg cotangents.
 
     Args:
         plan: Dispatch plan (non-differentiable).
-        saved: Residuals from :func:`_schedule_forward_fwd`.
+        saved: Packed per-argument gradients from :func:`_schedule_forward_fwd`.
         g: Cotangent of the scalar loss output (typically ``1.0``).
 
     Returns:
         Tuple of cotangents aligned with the differentiable
         positional arguments of :func:`_schedule_forward`.
     """
-    grads = _dispatch_gpipe_bwd(plan, saved, g)
-    return grads
+    del plan
+    cotangent = jnp.asarray(1.0, dtype=jnp.float32) if g is None else g
+    return jax.tree.map(lambda grad: _scale_grad(grad, cotangent), saved, is_leaf=_is_leaf)
 
 
 _schedule_forward.defvjp(_schedule_forward_fwd, _schedule_forward_bwd)
@@ -3393,6 +3733,7 @@ def sxjit(
     static_argnums: int | tuple[int, ...] | None = None,
     static_argnames: str | tuple[str, ...] | None = None,
     donate_argnums: int | tuple[int, ...] | None = None,
+    batch_argnums: int | tuple[int, ...] | None = None,
     in_shardings: Any | None = None,
     out_shardings: Any | None = None,
 ) -> Callable:
@@ -3450,6 +3791,10 @@ def sxjit(
             for large inputs that are only used by a single pipeline stage.
             An argument used by multiple stages cannot be donated safely and
             will be silently skipped.
+        batch_argnums: In schedule mode, which dynamic positional arguments
+            carry a leading batch axis that should be split into microbatches.
+            Dynamic arguments not listed here are passed whole to every
+            microbatch.
         in_shardings: Per-leaf input shardings as a pytree matching ``fn``'s
             args. ``None`` entries fall through to auto-inference from
             :class:`Module` logical axis annotations. If the entire argument
@@ -3465,6 +3810,8 @@ def sxjit(
         A wrapped callable with the same signature as ``fn``.
     """
     mpmd_mesh = resolve_mpmd_mesh(mesh)
+    if schedule is None and batch_argnums is not None:
+        raise ValueError("sxjit: batch_argnums is only meaningful with schedule=.")
 
     def decorator(fn: Callable) -> Callable:
         """Build the per-rank dispatch plan on first call, replay on subsequent calls."""
@@ -3490,18 +3837,14 @@ def sxjit(
             static_nums = set(_normalize_argnums(static_argnums, len(args)))
             donate_nums = set(_normalize_argnums(donate_argnums, len(args)))
             static_names = _normalize_argnames(static_argnames)
-            _state["result_treedef"] = _result_treedef_for_call(
-                fn,
-                args,
-                kwargs,
-                static_argnums,
-                static_argnames,
+
+            use_legacy_path = (
+                static_argnums is None and static_argnames is None and donate_argnums is None and batch_argnums is None
             )
 
-            use_legacy_path = static_argnums is None and static_argnames is None and donate_argnums is None
-
             if use_legacy_path:
-                closed_jaxpr = jax.make_jaxpr(fn)(*args, **kwargs)
+                closed_jaxpr, out_shape = jax.make_jaxpr(fn, return_shape=True)(*args, **kwargs)
+                _state["result_treedef"] = jax.tree_util.tree_structure(out_shape)
                 dynamic_flat_to_orig_flat = None
                 orig_flat_to_dynamic_flat = None
                 constvar_id_to_idx = None
@@ -3533,7 +3876,11 @@ def sxjit(
                     return fn(*full_args, **static_kwargs, **dyn_kwargs)
 
                 dynamic_args = tuple(args[i] for i in dynamic_nums)
-                closed_jaxpr = jax.make_jaxpr(_wrapper)(*dynamic_args, **dynamic_kwargs)
+                closed_jaxpr, out_shape = jax.make_jaxpr(_wrapper, return_shape=True)(
+                    *dynamic_args,
+                    **dynamic_kwargs,
+                )
+                _state["result_treedef"] = jax.tree_util.tree_structure(out_shape)
 
                 dynamic_flat_to_orig_flat: dict[int, int] = {}
                 orig_flat_to_dynamic_flat: dict[int, int] = {}
@@ -3561,7 +3908,7 @@ def sxjit(
             if pscan_eqns:
                 if not use_legacy_path:
                     raise NotImplementedError(
-                        "sxjit: static_argnums / donate_argnums are not yet supported with pscan paths."
+                        "sxjit: static_argnums / donate_argnums / batch_argnums are not yet supported with pscan paths."
                     )
                 if len(pscan_eqns) > 1:
                     raise NotImplementedError(
@@ -3591,6 +3938,7 @@ def sxjit(
                     rank_submeshes,
                     static_argnums,
                     donate_argnums,
+                    batch_argnums,
                 )
                 _state["schedule_plan"] = plan
                 return
@@ -3735,27 +4083,6 @@ def sxjit(
                 flat_args,
             )
 
-        # @erfanzar NOTE:
-        # Bug this fixes: the original ``wrapped(...)`` below traced once
-        # on the first call (``_build(args, kwargs)``) and then dispatched
-        # against any future inputs without re-checking shapes. Plain
-        # ``jax.jit`` re-traces automatically when leaf shapes change;
-        # this MPMD wrapper did not. So calling the same compiled
-        # function with a different input shape — e.g. eSurge's compile
-        # loop hitting ``[1/11]: 4 tokens`` then ``[2/11]: 8 tokens`` —
-        # silently reused the old jaxpr (which baked in shape ``(3, 4)``
-        # for ``expand_dims``) against the new ``(3, 8)`` input and blew
-        # up inside ``broadcast_in_dim``.
-        #
-        # Fix: key a per-shape cache of compiled-state snapshots by a
-        # signature derived from the input pytree treedef + leaf
-        # shape/dtype. ``_state`` itself remains the currently-active
-        # build (so closures captured by ``_build`` / ``_dispatch``
-        # continue to see the dict they always did) — we just swap its
-        # contents in/out from ``_state_cache`` as the input signature
-        # changes. Same shape repeated → cache hit, no rebuild.
-        # Alternating shapes → both cached, no rebuild on either side.
-
         def _shape_signature(args: tuple, kwargs: dict) -> tuple:
             """Build a hashable signature capturing pytree structure and leaf shape/dtype.
 
@@ -3796,6 +4123,8 @@ def sxjit(
                 del _state[k]
             if snapshot is not None:
                 _state.update(snapshot)
+            else:
+                _state["schedule_requested"] = schedule is not None
 
         def wrapped(*args, **kwargs):
             """The user-visible callable returned by :func:`sxjit`.
@@ -3811,8 +4140,6 @@ def sxjit(
             sig = _shape_signature(args, kwargs)
             cur_sig = _state.get(_SIG_KEY)
             if cur_sig != sig:
-                # Save the current build under its signature so it is
-                # reusable if the shape comes back later.
                 if cur_sig is not None and any(k in _state for k in _BUILT_KEYS):
                     _state_cache[cur_sig] = {k: v for k, v in _state.items()}
                 cached = _state_cache.get(sig)
@@ -4161,7 +4488,7 @@ def _place_static_args(
 
     1. Explicit ``assign_stage(...)`` ownership, when present.
     2. Explicit ``in_shardings`` override.
-    3. Already on the correct rank's devices — skip ``device_put``
+    3. Already on all correct rank devices — skip ``device_put``
        (preserves carry state like KV cache pages).
     4. Inferred from :class:`Module` logical axis annotations.
     5. Fallback: replicated on the rank's sub-mesh.
@@ -4185,7 +4512,7 @@ def _place_static_args(
             leaf = flat_init[idx]
             if idx in explicit_in_sh:
                 placed[(ri, idx)] = jax.device_put(leaf, explicit_in_sh[idx])
-            elif hasattr(leaf, "devices") and set(leaf.devices()).issubset(rank_devices):
+            elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
                 placed[(ri, idx)] = leaf
             elif idx in leaf_shardings[ri]:
                 placed[(ri, idx)] = jax.device_put(leaf, leaf_shardings[ri][idx])
@@ -4228,7 +4555,7 @@ def _assemble_invars(
                 leaf = flat_args[orig_idx]
                 if orig_idx in explicit_in_sh:
                     invars.append(jax.device_put(leaf, explicit_in_sh[orig_idx]))
-                elif hasattr(leaf, "devices") and set(leaf.devices()).issubset(rank_devices):
+                elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
                     invars.append(leaf)
                 else:
                     invars.append(jax.device_put(leaf, my_sh))
@@ -4770,18 +5097,22 @@ def _microbatch(x: jax.Array, m: int) -> jax.Array:
     """Reshape a ``(B, ...)`` array into ``(m, B // m, ...)`` microbatches.
 
     The leading batch axis is split into ``m`` microbatches of equal
-    size; ``B`` must be evenly divisible by ``m``.
+    size; ``B`` must be evenly divisible by ``m``. Non-array or scalar
+    leaves are returned unchanged as a safety net.
 
     Args:
         x: Input array with leading batch dimension.
         m: Number of microbatches.
 
     Returns:
-        A new array shaped ``(m, B // m, *x.shape[1:])``.
+        A new array shaped ``(m, B // m, *x.shape[1:])``, or ``x`` itself
+        if it has no batch dimension.
 
     Raises:
         ValueError: If ``B`` is not a multiple of ``m``.
     """
+    if not _has_microbatch_axis(x):
+        return x
     b = x.shape[0]
     if b % m:
         raise ValueError(f"Batch size {b} not divisible by number of microbatches {m}.")

@@ -135,7 +135,7 @@ def compile_ranked_executables(
     pipeline stage's computation. The schedule tells us which stages
     each rank runs and in what order. The returned per-rank callable
     wraps every stage call for that rank into a single :func:`jax.jit`,
-    cutting dispatch from ``O(T × n)`` to ``O(n)`` per step.
+    cutting dispatch from ``O(T x n)`` to ``O(n)`` per step.
 
     The per-rank program signature is::
 
@@ -169,7 +169,7 @@ def compile_ranked_executables(
     n_logical = n_stages * V
 
     if len(clusters) != n_logical:
-        raise ValueError(f"Expected {n_logical} clusters for {n_stages} stages × V={V}; got {len(clusters)}.")
+        raise ValueError(f"Expected {n_logical} clusters for {n_stages} stages x V={V}; got {len(clusters)}.")
 
     stage_fns: list[Callable[..., Any]] = []
     for cluster in clusters:

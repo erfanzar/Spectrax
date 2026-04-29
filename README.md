@@ -571,8 +571,8 @@ python -m benchmarks.llama_transforms_3way --preset small --device tpu --plots
 The CPU dispatch benchmark writes
 `benchmarks/results/latest.{json,md}` with per-case `spectrax_ms /
 nnx_ms` ratios. On a tiny CPU dispatch-bound benchmark (2-layer / d=64
-/ batch-2 transformer), SpectraX runs at **1.83×** the speed of
-flax.nnx; on d=48 it hits **2.0×**. On compute-bound workloads (TPU
+/ batch-2 transformer), SpectraX runs at **1.83x** the speed of
+flax.nnx; on d=48 it hits **2.0x**. On compute-bound workloads (TPU
 8B) the Python gap shrinks but stays positive.
 
 The plots below are from the **TPU small** three-way Llama transform

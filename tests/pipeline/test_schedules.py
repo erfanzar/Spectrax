@@ -34,6 +34,41 @@ def _count_phase(grid, n, phase):
     return per_stage
 
 
+def _iter_actions_in_cell(cell):
+    if cell is None:
+        return ()
+    if isinstance(cell, FusedTask):
+        return (cell.fwd, cell.bwd)
+    return (cell,)
+
+
+def _count_phase_including_fused(grid, n, phase):
+    """Count actions of a specific phase per physical stage, including fused cells."""
+    per_stage = [0] * n
+    for row in grid:
+        for s, cell in enumerate(row):
+            for action in _iter_actions_in_cell(cell):
+                if action.phase == phase:
+                    per_stage[s] += 1
+    return per_stage
+
+
+def _has_cross_rank_fwd_bwd_overlap(grid):
+    """Return whether any row has FWD and BWD-family work on different ranks."""
+    for row in grid:
+        fwd_ranks = set()
+        bwd_ranks = set()
+        for rank, cell in enumerate(row):
+            for action in _iter_actions_in_cell(cell):
+                if action.phase == Phase.FWD:
+                    fwd_ranks.add(rank)
+                elif action.phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
+                    bwd_ranks.add(rank)
+        if any(fwd_rank != bwd_rank for fwd_rank in fwd_ranks for bwd_rank in bwd_ranks):
+            return True
+    return False
+
+
 def _actions_monotonic_in_microbatch(grid, n, phase):
     """Return True iff microbatch indices for ``phase`` at each stage are non-decreasing."""
     per_stage_mbs = [[] for _ in range(n)]
@@ -117,6 +152,10 @@ class TestStd1F1B:
         """When ``M < n_stages`` the 1F1B steady state cannot form."""
         with pytest.raises(ValueError, match="microbatches >= n_stages"):
             Std1F1B(microbatches=2).build(n_stages=4)
+
+    def test_has_cross_rank_forward_backward_overlap(self):
+        """Std1F1B must not collapse into all-forward then all-backward GPipe."""
+        assert _has_cross_rank_fwd_bwd_overlap(Std1F1B(microbatches=8).build(n_stages=4))
 
 
 class TestZeroBubbleH1:
@@ -246,6 +285,10 @@ class TestEager1F1B:
         assert Eager1F1B(microbatches=8).peak_activations(4) == 7
         assert Eager1F1B(microbatches=3).peak_activations(4) == 3
 
+    def test_has_cross_rank_forward_backward_overlap(self):
+        """Eager1F1B keeps true 1F1B overlap after its longer warmup."""
+        assert _has_cross_rank_fwd_bwd_overlap(Eager1F1B(microbatches=8).build(n_stages=4))
+
 
 class TestDualPipeV:
     """Tests for the DualPipeV V-shaped schedule."""
@@ -326,6 +369,19 @@ class TestInterleavedGPipe:
         assert first_bwd_t is not None
         assert first_bwd_t >= last_fwd_t
 
+    def test_loop_and_contiguous_layouts_assign_same_logical_set(self):
+        """Virtual layouts may change ownership order but never lose logical stages."""
+        loop = InterleavedGPipe(microbatches=4, virtual_stages=2, stage_layout="loop")
+        contiguous = InterleavedGPipe(microbatches=4, virtual_stages=2, stage_layout="contiguous")
+        n = 4
+
+        loop_order = [loop.logical_at(rank, virt, n) for rank in range(n) for virt in range(2)]
+        contiguous_order = [contiguous.logical_at(rank, virt, n) for rank in range(n) for virt in range(2)]
+
+        assert sorted(loop_order) == list(range(8))
+        assert sorted(contiguous_order) == list(range(8))
+        assert loop_order != contiguous_order
+
 
 class TestInterleaved1F1BPlusOne:
     """Tests for the +1-warmup interleaved 1F1B variant."""
@@ -401,6 +457,30 @@ class TestKimiK2:
                     assert times[(logical, Phase.FWD, mb)] > times[(logical - 1, Phase.FWD, mb)]
                 if logical + 1 < n_logical:
                     assert times[(logical, Phase.BWD, mb)] > times[(logical + 1, Phase.BWD, mb)]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "n_stages", "microbatches", "virtual_stages", "bwd_phases"),
+    [
+        (GPipe(microbatches=8), 4, 8, 1, (Phase.BWD,)),
+        (Std1F1B(microbatches=8), 4, 8, 1, (Phase.BWD,)),
+        (Eager1F1B(microbatches=8), 4, 8, 1, (Phase.BWD,)),
+        (ZeroBubbleH1(microbatches=8), 4, 8, 1, (Phase.BWD_I, Phase.BWD_W)),
+        (InterleavedH1(microbatches=8, virtual_stages=2), 4, 8, 2, (Phase.BWD,)),
+        (Interleaved1F1BPlusOne(microbatches=8, virtual_stages=2), 4, 8, 2, (Phase.BWD,)),
+        (InterleavedGPipe(microbatches=8, virtual_stages=2), 4, 8, 2, (Phase.BWD,)),
+        (KimiK2(microbatches=8, virtual_stages=2, extra_warmup=1), 4, 8, 2, (Phase.BWD,)),
+        (DualPipeV(microbatches=8), 4, 8, 2, (Phase.BWD,)),
+    ],
+)
+def test_all_schedulers_emit_expected_physical_work(schedule, n_stages, microbatches, virtual_stages, bwd_phases):
+    """Every scheduler emits the right amount of work for each physical rank."""
+    grid = schedule.build(n_stages)
+    expected = [microbatches * virtual_stages] * n_stages
+
+    assert _count_phase_including_fused(grid, n_stages, Phase.FWD) == expected
+    for phase in bwd_phases:
+        assert _count_phase_including_fused(grid, n_stages, phase) == expected
 
 
 class TestFusedTask:

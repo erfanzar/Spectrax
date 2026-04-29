@@ -501,7 +501,7 @@ def _run_single_positional_body(
 ) -> Any:
     """Specialized trace body for one positional Module and no kwargs.
 
-    Roughly 2× faster than the general path on the dispatch hot path —
+    Roughly 2x faster than the general path on the dispatch hot path —
     a single :func:`bind` instead of a tuple, no kwargs handling, no
     splicing of module-shaped placeholders. Used by
     :func:`make_pure_single_positional` and

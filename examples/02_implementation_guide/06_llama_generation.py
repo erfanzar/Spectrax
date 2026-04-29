@@ -12,7 +12,7 @@ Same ``Llama3.forward`` handles training AND generation:
 
 The decode loop calls ``spx.run`` per token. SpecTrax caches the
 jit + placed state so steady-state dispatch is ~3ms/tok (322 tok/s
-on 4× v5p, Llama 3.2 3B, bs=1).
+on 4x v5p, Llama 3.2 3B, bs=1).
 
 Requires ``transformers``, ``safetensors``, ``HF_TOKEN`` env var.
 

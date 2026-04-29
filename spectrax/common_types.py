@@ -46,7 +46,7 @@ Public surface:
   compared with ``is``) and ``EMPTY_VAL`` (the class itself, kept
   for ``isinstance`` checks).
 * **Numeric constants** — ``DEFAULT_MASK_VALUE``, the standard fill
-  for masked attention logits (``-0.7 × float32_max``, chosen to
+  for masked attention logits (``-0.7 x float32_max``, chosen to
   avoid NaN-on-fully-masked-row while staying well clear of overflow).
 """
 

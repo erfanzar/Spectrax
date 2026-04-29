@@ -13,12 +13,12 @@ cross-rank transport via :func:`jax.lax.ppermute`.
 * **Python-unrolled** (default when ``use_scan=False``): each time step
   is a separate HLO block with its own ``lax.cond`` + ``ppermute``.
   Fast compile at small scale; OOMs at 8B+ with virtual stages because
-  the HLO graph grows linearly with ``T × n_actions``.
+  the HLO graph grows linearly with ``T x n_actions``.
 
 * **Scan-based** (``use_scan=True``): the schedule is encoded as
   integer arrays and ``lax.scan`` loops over time steps. ONE copy of
   the body in HLO regardless of ``T`` → compiles at any scale. Dynamic
-  dispatch inside the scan via ``lax.switch`` over phase × ``lax.cond``
+  dispatch inside the scan via ``lax.switch`` over phase x ``lax.cond``
   over rank. No ``value_and_grad`` over the scan (explicit ``fwd_fn``
   + ``bwd_fn`` avoids the autograd-through-scan memory blowup).
 """

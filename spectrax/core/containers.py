@@ -21,6 +21,7 @@ from typing import Any, ClassVar, TypeVar, overload
 import jax
 import jax.numpy as jnp
 
+from ..sharding.mesh import current_mesh
 from .graph import GraphDef, ModuleNode, VarNode, iter_variables
 from .module import Module, Opaque, _bump_graph_epoch, _graph_epoch
 from .paths import str_to_path
@@ -369,9 +370,6 @@ def _stage_place_trace_carry(layer: Module, carry: Any) -> Any:
     stage_mesh = None
     for _path, var in iter_variables(layer):
         value = getattr(var, "value", None)
-        # Skip tracers — Tracer.sharding triggers ``find_progenitors`` over
-        # the entire jaxpr, which is O(jaxpr-size) per call (deadly here
-        # because we iterate every variable on the layer).
         if isinstance(value, jax.core.Tracer):
             sharding = None
         else:
@@ -387,8 +385,6 @@ def _stage_place_trace_carry(layer: Module, carry: Any) -> Any:
         return _device_put_first_carry_leaf(carry, stage_mesh)
 
     try:
-        from ..sharding.mesh import current_mesh
-
         mesh = current_mesh()
     except Exception:
         return carry

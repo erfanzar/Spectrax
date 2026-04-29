@@ -357,7 +357,7 @@ def _topology_order_mpmd_axis(jax_mesh: Mesh, mpmd_axis: str | None) -> Mesh:
     Wraps :func:`_topology_mpmd_order`: if the helper returns a
     non-trivial permutation, the device array is re-sliced along
     ``mpmd_axis`` and a fresh :class:`jax.sharding.Mesh` is built
-    (cached by ``id(jax_mesh) × mpmd_axis`` so subsequent calls
+    (cached by ``id(jax_mesh) x mpmd_axis`` so subsequent calls
     return the same mesh object). Otherwise the original mesh is
     returned unchanged.
     """

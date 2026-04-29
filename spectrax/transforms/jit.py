@@ -125,6 +125,7 @@ def jit(
     static_argnames: str | Iterable[str] | None = None,
     donate_argnums: int | Sequence[int] | None = None,
     donate_argnames: str | Iterable[str] | None = None,
+    batch_argnums: int | Sequence[int] | None = None,
     keep_unused: bool = False,
     device: Any = None,
     backend: str | None = None,
@@ -143,7 +144,7 @@ def jit(
         schedule: Optional MPMD schedule, forwarded only when ``mesh`` is
             MPMD.
         in_shardings, out_shardings, static_argnums, static_argnames,
-            donate_argnums, donate_argnames, keep_unused, device,
+            donate_argnums, donate_argnames, batch_argnums, keep_unused, device,
             backend, inline, compiler_options: Forwarded verbatim to
             :func:`jax.jit`.
 
@@ -164,6 +165,7 @@ def jit(
             static_argnames=static_argnames,
             donate_argnums=donate_argnums,
             donate_argnames=donate_argnames,
+            batch_argnums=batch_argnums,
             keep_unused=keep_unused,
             device=device,
             backend=backend,
@@ -190,11 +192,14 @@ def jit(
             static_argnums=_normalize_argnums_for_sxjit(static_argnums),
             static_argnames=_normalize_argnames_for_sxjit(static_argnames),
             donate_argnums=_normalize_argnums_for_sxjit(donate_argnums),
+            batch_argnums=_normalize_argnums_for_sxjit(batch_argnums),
             in_shardings=None if in_shardings is _UNSET else in_shardings,
             out_shardings=None if out_shardings is _UNSET else out_shardings,
         )
     if schedule is not None:
         raise ValueError("spx.jit(..., schedule=...) requires an MPMD mesh.")
+    if batch_argnums is not None:
+        raise ValueError("spx.jit(..., batch_argnums=...) requires an MPMD mesh with schedule=.")
 
     mutable_sel = resolve_mutable(mutable)
 

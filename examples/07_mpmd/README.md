@@ -10,7 +10,7 @@ under SPMD or MPMD depending on the mesh.
 | [`02_inference_forward.py`](02_inference_forward.py)     | `mode='forward'` inference — same model, same mesh, no grads.                                            |
 | [`03_spmd_vs_mpmd.py`](03_spmd_vs_mpmd.py)               | Same model run under two meshes (no PP vs PP=2). Losses match — numerical parity of the unified runtime. |
 | [`04_decode_loop.py`](04_decode_loop.py)                 | Greedy autoregressive decode via repeated `mode='forward'` calls.                                        |
-| [`05_pp_fsdp_tp.py`](05_pp_fsdp_tp.py)                   | 3-D mesh (pp=2 × tp=2) composing pipeline with tensor-parallel FSDP.                                     |
+| [`05_pp_fsdp_tp.py`](05_pp_fsdp_tp.py)                   | 3-D mesh (pp=2 x tp=2) composing pipeline with tensor-parallel FSDP.                                     |
 | [`06_all_schedulers.py`](06_all_schedulers.py)           | Run the same model under all 9 pipeline schedules and compare losses.                                    |
 | [`07_fused_tasks.py`](07_fused_tasks.py)                 | `fuse_1f1b=True` steady-state fusion — same loss, fewer dispatches.                                      |
 | [`08_pp_stage_assignment.py`](08_pp_stage_assignment.py) | Manual `pp_stage` annotation to override automatic stage placement.                                      |

@@ -240,7 +240,10 @@ def _make_fwd_jit(cluster_jaxpr: Jaxpr, donate_argnums: tuple[int, ...] = ()) ->
 
 
 def _make_bwd_jit(
-    cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[int, ...] = ()
+    cluster_jaxpr: Jaxpr,
+    n_invars: int,
+    donate_argnums: tuple[int, ...] = (),
+    out_shardings: Any | None = None,
 ) -> Callable[..., tuple[Any, tuple[Any, ...]]]:
     """Return ``@jax.jit`` VJP callable for a non-terminal cluster.
 
@@ -281,13 +284,19 @@ def _make_bwd_jit(
         g_invars = tuple(grads[1:])
         return g_consts, g_invars
 
+    jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
-        return jax.jit(bwd, donate_argnums=donate_argnums)
-    return jax.jit(bwd)
+        jit_kwargs["donate_argnums"] = donate_argnums
+    if out_shardings is not None:
+        jit_kwargs["out_shardings"] = out_shardings
+    return jax.jit(bwd, **jit_kwargs)
 
 
 def _make_bwd_i_jit(
-    cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[int, ...] = ()
+    cluster_jaxpr: Jaxpr,
+    n_invars: int,
+    donate_argnums: tuple[int, ...] = (),
+    out_shardings: Any | None = None,
 ) -> Callable[..., tuple[Any, ...]]:
     """Return a ``@jax.jit`` VJP callable that yields only input cotangents.
 
@@ -323,12 +332,20 @@ def _make_bwd_i_jit(
         grads = vjp_fn(tuple(cotangents))
         return tuple(grads[1:])
 
+    jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
-        return jax.jit(bwd_i, donate_argnums=donate_argnums)
-    return jax.jit(bwd_i)
+        jit_kwargs["donate_argnums"] = donate_argnums
+    if out_shardings is not None:
+        jit_kwargs["out_shardings"] = out_shardings
+    return jax.jit(bwd_i, **jit_kwargs)
 
 
-def _make_bwd_w_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[int, ...] = ()) -> Callable[..., Any]:
+def _make_bwd_w_jit(
+    cluster_jaxpr: Jaxpr,
+    n_invars: int,
+    donate_argnums: tuple[int, ...] = (),
+    out_shardings: Any | None = None,
+) -> Callable[..., Any]:
     """Return ``@jax.jit`` VJP callable for weight/const gradients only."""
 
     def bwd_w(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> Any:
@@ -358,12 +375,20 @@ def _make_bwd_w_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[i
         grads = vjp_fn(tuple(cotangents))
         return grads[0]
 
+    jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
-        return jax.jit(bwd_w, donate_argnums=donate_argnums)
-    return jax.jit(bwd_w)
+        jit_kwargs["donate_argnums"] = donate_argnums
+    if out_shardings is not None:
+        jit_kwargs["out_shardings"] = out_shardings
+    return jax.jit(bwd_w, **jit_kwargs)
 
 
-def _make_terminal_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tuple[int, ...] = ()) -> Callable[..., Any]:
+def _make_terminal_jit(
+    cluster_jaxpr: Jaxpr,
+    n_invars: int,
+    donate_argnums: tuple[int, ...] = (),
+    out_shardings: Any | None = None,
+) -> Callable[..., Any]:
     """Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
 
     Signature: ``(consts, *invars) -> (loss, (g_consts, g_invars))``.
@@ -408,9 +433,12 @@ def _make_terminal_jit(cluster_jaxpr: Jaxpr, n_invars: int, donate_argnums: tupl
         g_invars = tuple(grads[1:])
         return loss, (g_consts, g_invars)
 
+    jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
-        return jax.jit(term, donate_argnums=donate_argnums)
-    return jax.jit(term)
+        jit_kwargs["donate_argnums"] = donate_argnums
+    if out_shardings is not None:
+        jit_kwargs["out_shardings"] = out_shardings
+    return jax.jit(term, **jit_kwargs)
 
 
 def _build_logical_locs(

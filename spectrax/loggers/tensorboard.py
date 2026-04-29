@@ -13,11 +13,13 @@ import typing as tp
 import zlib
 
 import numpy as np
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from spectrax.serialization._fs import _get_fs, joinpath, mkdir
 
 from .base import ArrayLike, BaseBackend, Scalar
 
+_ProtoCache: dict[str, tp.Any] = {}
 
 def _masked_crc(data: bytes) -> int:
     crc = zlib.crc32(data) & 0xFFFFFFFF
@@ -32,14 +34,12 @@ def _write_record(f: tp.BinaryIO, data: bytes) -> None:
     f.write(struct.pack("<I", _masked_crc(data)))
 
 
-_ProtoCache: dict[str, tp.Any] = {}
 
 
 def _get_protos() -> dict[str, tp.Any]:
     if _ProtoCache:
         return _ProtoCache
 
-    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
     pool = descriptor_pool.DescriptorPool()
     file_proto = descriptor_pb2.FileDescriptorProto()

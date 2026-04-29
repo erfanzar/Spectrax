@@ -12,6 +12,7 @@ and reconstructing nested dictionaries from checkpoint indexes.
 
 import json
 import os
+import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -22,7 +23,6 @@ from jax import tree_util as jtu
 from jax._src.tree_util import DictKey, FlattenedIndexKey, GetAttrKey, SequenceKey
 from jax.experimental.array_serialization import serialization as array_ser
 from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding, SingleDeviceSharding
-from jaxtyping import PyTree
 
 from spectrax._internal.logging import get_logger
 from spectrax._version import __version__
@@ -32,6 +32,8 @@ from . import _fs, fsspec_utils
 logger = get_logger(__name__)
 
 GLOBAL_CHECKPOINT_TIMEOUT = int(os.getenv("GLOBAL_CHECKPOINT_TIMEOUT", "400"))
+
+PyTree = typing.TypeVar("PyTree")
 
 __all__ = [
     "is_array_like",

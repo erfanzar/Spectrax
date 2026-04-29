@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "spectrax-lib"
-version = "0.0.4"
+version = "0.0.5"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "SpectraX: a JAX-only neural-network library with a True MPMD pipeline parallelism for JAX — with an eager module API."
 readme = "README.md"
@@ -33,7 +33,7 @@ dependencies = [
 	"treescope>=0.1.7",
 	"tensorstore>=0.1.76",
 	"fsspec[http]>=2024.2,<2026",
-	"protobuf>=7.34.1",
+	"protobuf>=5.29.6,<7",
 ]
 
 [project.urls]

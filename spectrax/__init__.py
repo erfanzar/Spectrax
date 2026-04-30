@@ -165,6 +165,7 @@ from .runtime import (
     sxgrad,
     sxjit,
     sxstage_iter,
+    sxstage_region,
     sxvalue_and_grad,
 )
 from .sharding import (
@@ -328,6 +329,7 @@ __all__ = [
     "sxgrad",
     "sxjit",
     "sxstage_iter",
+    "sxstage_region",
     "sxvalue_and_grad",
     "to_jax_mesh",
     "tree_state",

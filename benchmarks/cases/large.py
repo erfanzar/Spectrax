@@ -22,6 +22,11 @@ from .. import models
 
 
 def build():
+    """Build large-model benchmark cases (~1B-param transformer).
+
+    Returns:
+        Dictionary mapping case name to ``(spectrax_fn, nnx_fn)`` pairs.
+    """
     cases: dict[str, tuple[Callable, Callable]] = {}
 
     spx_mdl, x = models.spx_transformer_1b()
@@ -29,10 +34,12 @@ def build():
 
     @spx.jit
     def spx_fwd(m, x):
+        """Jitted spectrax forward pass."""
         return m(x)
 
     @nnx.jit
     def nnx_fwd(m, x):
+        """Jitted nnx forward pass."""
         return m(x)
 
     jax.block_until_ready(spx_fwd(spx_mdl, x))
@@ -45,14 +52,20 @@ def build():
 
     @spx.jit
     def spx_step(m, x):
+        """Jitted spectrax training step."""
+
         def loss(m, x):
+            """Scalar loss: sum of model output."""
             return m(x).sum()
 
         return spx.grad(loss)(m, x)
 
     @nnx.jit
     def nnx_step(m, x):
+        """Jitted nnx training step."""
+
         def loss(m, x):
+            """Scalar loss: sum of model output."""
             return m(x).sum()
 
         return nnx.grad(loss)(m, x)
@@ -69,11 +82,15 @@ def build():
 
     @spx.jit(mutable="fp8_meta")
     def spx_fp8_fwd(m, x):
+        """Jitted FP8 forward pass."""
         return m(x)
 
     @spx.jit(mutable="fp8_meta")
     def spx_fp8_step(m, x):
+        """Jitted FP8 training step."""
+
         def loss(m, x):
+            """Scalar loss: sum of model output."""
             return m(x).sum()
 
         return spx.grad(loss)(m, x)

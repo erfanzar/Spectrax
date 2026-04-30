@@ -202,6 +202,7 @@ class TestAsyncCheckpointManager:
         mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
 
         def negate(arr, key):
+            """Negate the input."""
             return -arr
 
         loaded, _ = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model", callback=negate)

@@ -265,7 +265,11 @@ class _ScanSegment:
 
     @property
     def length(self) -> int:
-        """Number of layers covered by this scan segment (``stop - start``)."""
+        """Number of layers covered by this scan segment (``stop - start``).
+
+        Returns:
+            The segment length as an ``int``.
+        """
         return self.stop - self.start
 
 
@@ -789,7 +793,15 @@ class _ListContainer(Module):
         return iter(self._spx_items)
 
     def append(self, value: Any) -> None:
-        """Append ``value``, validating its type first."""
+        """Append ``value``, validating its type first.
+
+        Args:
+            value: The item to append. Must pass the subclass's
+                :meth:`_validate_item` check.
+
+        Returns:
+            ``None``.
+        """
         self._validate_item(value)
         self._spx_items.append(value)
         object.__setattr__(self, "_spx_scan_plan_cache", None)
@@ -797,7 +809,15 @@ class _ListContainer(Module):
         _bump_graph_epoch()
 
     def extend(self, values: Iterable[Any]) -> None:
-        """Append every item from ``values``."""
+        """Append every item from ``values``.
+
+        Args:
+            values: An iterable of items to append. Each item is
+                validated via :meth:`_validate_item`.
+
+        Returns:
+            ``None``.
+        """
         for v in values:
             self.append(v)
 
@@ -845,7 +865,15 @@ class ModuleList(_ListContainer):
             raise TypeError(f"ModuleList accepts Modules only, got {type(value).__name__}")
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Always raises — :class:`ModuleList` is not a callable layer."""
+        """Always raises — :class:`ModuleList` is not a callable layer.
+
+        Returns:
+            Never returns; always raises :class:`RuntimeError`.
+
+        Raises:
+            RuntimeError: Always, because :class:`ModuleList` cannot be
+                called directly.
+        """
         raise RuntimeError("ModuleList is not callable; iterate or index it.")
 
     def __getitem__(self, idx: int | slice) -> Any:
@@ -951,11 +979,18 @@ class ModuleList(_ListContainer):
         must share compatible state topology; safe per-layer static
         differences such as ``layer_idx`` are collapsed into one template
         graph.
+
+        Returns:
+            A :class:`StackedModuleList` wrapping the same items.
         """
         return StackedModuleList(self._spx_items)
 
     def as_stacked(self) -> StackedModuleList:
-        """Alias for :meth:`stack` for call sites that prefer adjective naming."""
+        """Alias for :meth:`stack` for call sites that prefer adjective naming.
+
+        Returns:
+            A :class:`StackedModuleList` wrapping the same items.
+        """
         return self.stack()
 
     def fori_loop(self, fn, init_carry):
@@ -1205,7 +1240,15 @@ class StackedModuleList(Module):
         return bind(gdef, state)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Always raises — :class:`StackedModuleList` is not callable."""
+        """Always raises — :class:`StackedModuleList` is not callable.
+
+        Returns:
+            Never returns; always raises :class:`RuntimeError`.
+
+        Raises:
+            RuntimeError: Always, because :class:`StackedModuleList`
+                cannot be called directly.
+        """
         raise RuntimeError("StackedModuleList is not callable; iterate, index, or scan it.")
 
     def scan(self, fn, init_carry, *, trace: bool = False, unroll: int | None = None):
@@ -1345,7 +1388,15 @@ class ParameterList(_ListContainer):
             raise TypeError(f"ParameterList accepts Parameters only, got {type(value).__name__}")
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Always raises — :class:`ParameterList` is not a callable layer."""
+        """Always raises — :class:`ParameterList` is not a callable layer.
+
+        Returns:
+            Never returns; always raises :class:`RuntimeError`.
+
+        Raises:
+            RuntimeError: Always, because :class:`ParameterList` cannot be
+                called directly.
+        """
         raise RuntimeError("ParameterList is not callable.")
 
 
@@ -1407,15 +1458,28 @@ class ModuleDict(Module):
         return iter(self._spx_items)
 
     def keys(self) -> Iterable[str]:
-        """Return the dict's keys."""
+        """Return the dict's keys.
+
+        Returns:
+            An iterable of the string keys stored in the dict.
+        """
         return self._spx_items.keys()
 
     def values(self) -> Iterable[Module]:
-        """Return the dict's values."""
+        """Return the dict's values.
+
+        Returns:
+            An iterable of the :class:`~spectrax.Module` values stored
+            in the dict.
+        """
         return self._spx_items.values()
 
     def items(self) -> Iterable[tuple[str, Module]]:
-        """Return the dict's ``(key, value)`` pairs."""
+        """Return the dict's ``(key, value)`` pairs.
+
+        Returns:
+            An iterable of ``(key, module)`` tuples.
+        """
         return self._spx_items.items()
 
     def _spx_graph_children(self) -> Iterator[tuple[str, Module | Variable]]:
@@ -1427,5 +1491,13 @@ class ModuleDict(Module):
         return {}
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        """Always raises — :class:`ModuleDict` is not a callable layer."""
+        """Always raises — :class:`ModuleDict` is not a callable layer.
+
+        Returns:
+            Never returns; always raises :class:`RuntimeError`.
+
+        Raises:
+            RuntimeError: Always, because :class:`ModuleDict` cannot be
+                called directly.
+        """
         raise RuntimeError("ModuleDict is not callable; index by key.")

@@ -265,6 +265,14 @@ def _time_case(fn: Any, warmup: int, iters: int) -> dict[str, float]:
     n = len(times)
 
     def pct(p: float) -> float:
+        """Return the ``p``-th percentile of the sorted times in milliseconds.
+
+        Args:
+            p: Percentile in ``[0, 1]``.
+
+        Returns:
+            Timing value at the requested percentile.
+        """
         idx = min(n - 1, max(0, int(p * n)))
         return times[idx]
 
@@ -391,6 +399,15 @@ def _jax_scan_forward(params: Any, x: jax.Array, cfg: LlamaBenchConfig) -> jax.A
     cos, sin = _rope_freqs(x.shape[1], cfg.head_dim, cfg.rope_theta, x.dtype)
 
     def body(carry: jax.Array, layer_params: Any) -> tuple[jax.Array, None]:
+        """Single scan step: apply one layer block.
+
+        Args:
+            carry: Input activation tensor.
+            layer_params: Parameter dict for this layer.
+
+        Returns:
+            ``(output, None)`` tuple for scan carry.
+        """
         return _jax_block_apply(layer_params, carry, cfg, cos, sin), None
 
     return jax.lax.scan(body, x, params)[0]
@@ -437,6 +454,15 @@ def _jax_fori_loop_forward(block: dict[str, jax.Array], x: jax.Array, cfg: Llama
     cos, sin = _rope_freqs(x.shape[1], cfg.head_dim, cfg.rope_theta, x.dtype)
 
     def body(_i: int, carry: jax.Array) -> jax.Array:
+        """One fori_loop step: apply the block.
+
+        Args:
+            _i: Loop index (unused).
+            carry: Input activation tensor.
+
+        Returns:
+            Output activation tensor.
+        """
         return _jax_block_apply(block, carry, cfg, cos, sin)
 
     return jax.lax.fori_loop(0, cfg.n_layers, body, x)
@@ -447,10 +473,26 @@ def _jax_while_loop_forward(block: dict[str, jax.Array], x: jax.Array, cfg: Llam
     cos, sin = _rope_freqs(x.shape[1], cfg.head_dim, cfg.rope_theta, x.dtype)
 
     def cond(carry: tuple[jax.Array, jax.Array]) -> jax.Array:
+        """Check whether the loop counter is still below ``cfg.n_layers``.
+
+        Args:
+            carry: ``(i, x)`` tuple.
+
+        Returns:
+            Boolean scalar.
+        """
         i, _x = carry
         return i < cfg.n_layers
 
     def body(carry: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+        """One while_loop step: increment counter and apply the block.
+
+        Args:
+            carry: ``(i, x)`` tuple.
+
+        Returns:
+            ``(i + 1, block(x))`` tuple.
+        """
         i, x_in = carry
         return i + 1, _jax_block_apply(block, x_in, cfg, cos, sin)
 
@@ -461,6 +503,12 @@ class NnxLlamaBlock(nnx.Module):
     """One Llama block in Flax NNX."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, rngs: nnx.Rngs):
+        """Initialize GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            cfg: Benchmark configuration.
+            rngs: PRNG source for parameter init.
+        """
         self.d_model = cfg.d_model
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
@@ -478,6 +526,16 @@ class NnxLlamaBlock(nnx.Module):
         self.down = nnx.Linear(cfg.ffn, cfg.d_model, rngs=rngs, **lin)
 
     def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+        """Run pre-norm GQA+RoPE attention followed by pre-norm SwiGLU FFN.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         h = self.norm1(x)
         q = self.q(h).reshape(b, t, self.n_heads, self.head_dim)
@@ -502,11 +560,25 @@ class NnxLlamaLoopModel(nnx.Module):
     """NNX Llama body using a Python loop across blocks."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Create ``n_layers`` blocks in an :class:`nnx.List`.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed; incremented per block.
+        """
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
         self.blocks = nnx.List([NnxLlamaBlock(cfg, rngs=nnx.Rngs(seed + i)) for i in range(cfg.n_layers)])
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Run every block sequentially with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
         for block in self.blocks:
             x = block(x, cos, sin)
@@ -517,21 +589,37 @@ class NnxLlamaScanModel(nnx.Module):
     """NNX Llama body using ``nnx.scan`` over stacked blocks."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Stack ``n_layers`` blocks via vmap and scan them over the input.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed.
+        """
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
 
         @nnx.split_rngs(splits=cfg.n_layers)
         @nnx.vmap(in_axes=(0,), out_axes=0)
         def build(rngs: nnx.Rngs) -> NnxLlamaBlock:
+            """Create one NnxLlamaBlock under split RNGs."""
             return NnxLlamaBlock(cfg, rngs=rngs)
 
         self.blocks = build(nnx.Rngs(seed))
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Run the scanned block stack on ``x``.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
 
         @nnx.scan(in_axes=(nnx.Carry, None, None, 0), out_axes=nnx.Carry)
         def body(carry: jax.Array, cos: jax.Array, sin: jax.Array, block: NnxLlamaBlock) -> jax.Array:
+            """Single scan step: apply one block."""
             return block(carry, cos, sin)
 
         return body(x, cos, sin, self.blocks)
@@ -544,11 +632,25 @@ class NnxLlamaRematModel(nnx.Module):
     """NNX Llama body with rematerialized block calls."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Create ``n_layers`` blocks in an :class:`nnx.List`.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed; incremented per block.
+        """
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
         self.blocks = nnx.List([NnxLlamaBlock(cfg, rngs=nnx.Rngs(seed + i)) for i in range(cfg.n_layers)])
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        """Run every block with rematerialized forward calls.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
         for block in self.blocks:
             x = _NNX_REMAT_BLOCK(block, x, cos, sin)
@@ -559,6 +661,12 @@ class SpxLlamaBlock(spx.Module):
     """One Llama block in spectrax."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, rngs: spx.Rngs):
+        """Initialize GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            cfg: Benchmark configuration.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.d_model = cfg.d_model
         self.n_heads = cfg.n_heads
@@ -577,6 +685,16 @@ class SpxLlamaBlock(spx.Module):
         self.down = nn.Linear(cfg.ffn, cfg.d_model, **lin)
 
     def forward(self, x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
+        """Run pre-norm GQA+RoPE attention followed by pre-norm SwiGLU FFN.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         h = self.norm1(x)
         q = self.q(h).reshape(b, t, self.n_heads, self.head_dim)
@@ -601,12 +719,26 @@ class SpxLlamaLoopModel(spx.Module):
     """spectrax Llama body using a Python loop."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Create ``n_layers`` blocks in a :class:`nn.ModuleList`.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed; incremented per block.
+        """
         super().__init__()
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
         self.blocks = nn.ModuleList([SpxLlamaBlock(cfg, rngs=spx.Rngs(seed + i)) for i in range(cfg.n_layers)])
 
     def forward(self, x: jax.Array) -> jax.Array:
+        """Run every block sequentially with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
         for block in self.blocks:
             x = block(x, cos, sin)
@@ -617,12 +749,26 @@ class SpxLlamaScanModel(spx.Module):
     """spectrax Llama body using pre-stacked ``ModuleList.scan``."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Create ``n_layers`` blocks in a stacked :class:`nn.ModuleList`.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed; incremented per block.
+        """
         super().__init__()
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
         self.blocks = nn.ModuleList([SpxLlamaBlock(cfg, rngs=spx.Rngs(seed + i)) for i in range(cfg.n_layers)]).stack()
 
     def forward(self, x: jax.Array) -> jax.Array:
+        """Run blocks via :meth:`ModuleList.scan` with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
         return self.blocks.scan(lambda block, carry: block(carry, cos, sin), x)
 
@@ -634,12 +780,26 @@ class SpxLlamaRematModel(spx.Module):
     """spectrax Llama body with rematerialized block calls."""
 
     def __init__(self, cfg: LlamaBenchConfig, *, seed: int = 0):
+        """Create ``n_layers`` blocks in a :class:`nn.ModuleList`.
+
+        Args:
+            cfg: Benchmark configuration.
+            seed: Base PRNG seed; incremented per block.
+        """
         super().__init__()
         self.head_dim = cfg.head_dim
         self.rope_theta = cfg.rope_theta
         self.blocks = nn.ModuleList([SpxLlamaBlock(cfg, rngs=spx.Rngs(seed + i)) for i in range(cfg.n_layers)])
 
     def forward(self, x: jax.Array) -> jax.Array:
+        """Run every block with rematerialized forward calls.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         cos, sin = _rope_freqs(x.shape[1], self.head_dim, self.rope_theta, x.dtype)
         for block in self.blocks:
             x = _SPX_REMAT_BLOCK(block, x, cos, sin)
@@ -659,12 +819,42 @@ def _build_jax_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
     tangent_x = jnp.ones_like(x)
 
     def loop_loss(params: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the raw-JAX loop model.
+
+        Args:
+            params: Raw-JAX parameter pytree.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(_jax_loop_forward(params, xb, cfg), yb)
 
     def scan_loss(params: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the raw-JAX scan model.
+
+        Args:
+            params: Raw-JAX parameter pytree.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(_jax_scan_forward(params, xb, cfg), yb)
 
     def remat_loss(params: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the raw-JAX remat model.
+
+        Args:
+            params: Raw-JAX parameter pytree.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(_jax_remat_forward(params, xb, cfg), yb)
 
     jit_forward = jax.jit(lambda params, xb: _jax_loop_forward(params, xb, cfg))
@@ -679,6 +869,15 @@ def _build_jax_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
     )
 
     def _vjp_only(params: Any, xb: jax.Array) -> Any:
+        """VJP of ``loop_loss`` w.r.t. ``params``.
+
+        Args:
+            params: Raw-JAX parameter pytree.
+            xb: Input batch.
+
+        Returns:
+            Gradient pytree for ``params``.
+        """
         out, pullback = jax.vjp(lambda p, x_: loop_loss(p, x_, y), params, xb)
         return pullback(jnp.array(1.0, dtype=out.dtype))[0]
 
@@ -722,41 +921,139 @@ def _build_nnx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
     tangent_x = jnp.ones_like(x)
 
     def loop_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the NNX loop model.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     def scan_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the NNX scan model.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     def remat_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the NNX remat model.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     @nnx.jit
     def jit_forward(model: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX forward pass.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+
+        Returns:
+            Model output tensor.
+        """
         return model(xb)
 
     @nnx.jit
     def grad_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted NNX grad training step.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Gradient state.
+        """
         return nnx.grad(loop_loss)(model, xb, yb)
 
     @nnx.jit
     def value_and_grad_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted NNX value_and_grad training step.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return nnx.value_and_grad(loop_loss)(model, xb, yb)
 
     @nnx.jit
     def jvp_loss(model: Any, xb: jax.Array, model_t: Any, xb_t: jax.Array) -> Any:
+        """Jitted NNX JVP of the training loss.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            model_t: Tangent for the model.
+            xb_t: Tangent for the input.
+
+        Returns:
+            JVP result.
+        """
         return nnx.jvp(lambda m, x_: loop_loss(m, x_, y), (model, xb), (model_t, xb_t), graph_updates=False)
 
     @nnx.jit
     def vjp_loss(model: Any, xb: jax.Array) -> Any:
+        """Jitted NNX VJP of the training loss.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+
+        Returns:
+            VJP result.
+        """
         out, pullback = nnx.vjp(lambda m, x_: loop_loss(m, x_, y), model, xb, graph_updates=False)
         return pullback(jnp.array(1.0, dtype=out.dtype))[0]
 
     @nnx.jit
     def vmap_forward(model: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX batched forward via vmap.
+
+        Args:
+            model: NNX model.
+            xb: Batched input.
+
+        Returns:
+            Batched output.
+        """
         return nnx.vmap(lambda m, x1: m(x1[None, ...])[0], in_axes=(None, 0))(model, xb)
 
     @nnx.jit
     def cond_forward(true_block: Any, false_block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX cond forward.
+
+        Args:
+            true_block: Branch taken when predicate is true.
+            false_block: Branch taken when predicate is false.
+            xb: Input batch.
+
+        Returns:
+            Output tensor from the selected branch.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
         return nnx.cond(
             _cond_pred(xb),
@@ -769,6 +1066,17 @@ def _build_nnx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @nnx.jit
     def switch_forward(first: Any, second: Any, third: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX switch forward across three branches.
+
+        Args:
+            first: First branch block.
+            second: Second branch block.
+            third: Third branch block.
+            xb: Input batch.
+
+        Returns:
+            Output tensor from the selected branch.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
         branches = [
             lambda a, b, c, carry: a(carry, cos, sin),
@@ -779,22 +1087,43 @@ def _build_nnx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @nnx.jit
     def fori_loop_forward(block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX fori_loop forward.
+
+        Args:
+            block: Block module to repeat.
+            xb: Input batch.
+
+        Returns:
+            Output tensor after ``cfg.n_layers`` iterations.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
 
         def body(_i: int, carry: jax.Array) -> jax.Array:
+            """One fori_loop step: apply ``block`` with RoPE."""
             return block(carry, cos, sin)
 
         return nnx.fori_loop(0, cfg.n_layers, body, xb)
 
     @nnx.jit
     def while_loop_forward(block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted NNX while_loop forward.
+
+        Args:
+            block: Block module to repeat.
+            xb: Input batch.
+
+        Returns:
+            Output tensor after ``cfg.n_layers`` iterations.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
 
         def cond(carry: tuple[jax.Array, jax.Array]) -> jax.Array:
+            """Check whether the loop counter is still below ``cfg.n_layers``."""
             i, _x = carry
             return i < cfg.n_layers
 
         def body(carry: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            """One while_loop step: increment counter and apply ``block``."""
             i, x_in = carry
             return i + 1, block(x_in, cos, sin)
 
@@ -802,10 +1131,30 @@ def _build_nnx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @nnx.jit
     def scan_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted NNX scan training step.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return nnx.value_and_grad(scan_loss)(model, xb, yb)
 
     @nnx.jit
     def remat_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted NNX remat training step.
+
+        Args:
+            model: NNX model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return nnx.value_and_grad(remat_loss)(model, xb, yb)
 
     return {
@@ -839,41 +1188,139 @@ def _build_spx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
     tangent_x = jnp.ones_like(x)
 
     def loop_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the spectrax loop model.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     def scan_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the spectrax scan model.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     def remat_loss(model: Any, xb: jax.Array, yb: jax.Array) -> jax.Array:
+        """MSE loss for the spectrax remat model.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Scalar MSE.
+        """
         return _loss(model(xb), yb)
 
     @spx.jit
     def jit_forward(model: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax forward pass.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+
+        Returns:
+            Model output tensor.
+        """
         return model(xb)
 
     @spx.jit
     def grad_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted spectrax grad training step.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            Gradient state.
+        """
         return spx.grad(loop_loss)(model, xb, yb)
 
     @spx.jit
     def value_and_grad_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted spectrax value_and_grad training step.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return spx.value_and_grad(loop_loss)(model, xb, yb)
 
     @spx.jit
     def jvp_loss(model: Any, xb: jax.Array, model_t: Any, xb_t: jax.Array) -> Any:
+        """Jitted spectrax JVP of the training loss.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            model_t: Tangent for the model.
+            xb_t: Tangent for the input.
+
+        Returns:
+            JVP result.
+        """
         return spx.jvp(lambda m, x_: loop_loss(m, x_, y), (model, xb), (model_t, xb_t))
 
     @spx.jit
     def vjp_loss(model: Any, xb: jax.Array) -> Any:
+        """Jitted spectrax VJP of the training loss.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+
+        Returns:
+            VJP result.
+        """
         out, pullback = spx.vjp(lambda m, x_: loop_loss(m, x_, y), model, xb)
         return pullback(jnp.array(1.0, dtype=out.dtype))[0]
 
     @spx.jit
     def vmap_forward(model: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax batched forward via vmap.
+
+        Args:
+            model: spectrax model.
+            xb: Batched input.
+
+        Returns:
+            Batched output.
+        """
         return spx.vmap(lambda m, x1: m(x1[None, ...])[0], in_axes=(None, 0))(model, xb)
 
     @spx.jit
     def cond_forward(true_block: Any, false_block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax cond forward.
+
+        Args:
+            true_block: Branch taken when predicate is true.
+            false_block: Branch taken when predicate is false.
+            xb: Input batch.
+
+        Returns:
+            Output tensor from the selected branch.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
         return spx.cond(
             _cond_pred(xb),
@@ -886,6 +1333,17 @@ def _build_spx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @spx.jit
     def switch_forward(first: Any, second: Any, third: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax switch forward across three branches.
+
+        Args:
+            first: First branch block.
+            second: Second branch block.
+            third: Third branch block.
+            xb: Input batch.
+
+        Returns:
+            Output tensor from the selected branch.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
         branches = [
             lambda a, b, c, carry: a(carry, cos, sin),
@@ -896,22 +1354,43 @@ def _build_spx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @spx.jit
     def fori_loop_forward(block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax fori_loop forward.
+
+        Args:
+            block: Block module to repeat.
+            xb: Input batch.
+
+        Returns:
+            Output tensor after ``cfg.n_layers`` iterations.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
 
         def body(_i: int, blk: Any, carry: jax.Array) -> jax.Array:
+            """One fori_loop step: apply ``blk`` with RoPE."""
             return blk(carry, cos, sin)
 
         return spx.fori_loop(0, cfg.n_layers, body, block, xb)
 
     @spx.jit
     def while_loop_forward(block: Any, xb: jax.Array) -> jax.Array:
+        """Jitted spectrax while_loop forward.
+
+        Args:
+            block: Block module to repeat.
+            xb: Input batch.
+
+        Returns:
+            Output tensor after ``cfg.n_layers`` iterations.
+        """
         cos, sin = _rope_freqs(xb.shape[1], cfg.head_dim, cfg.rope_theta, xb.dtype)
 
         def cond(blk: Any, carry: tuple[jax.Array, jax.Array]) -> jax.Array:
+            """Check whether the loop counter is still below ``cfg.n_layers``."""
             i, _x = carry
             return i < cfg.n_layers
 
         def body(blk: Any, carry: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+            """One while_loop step: increment counter and apply ``blk``."""
             i, x_in = carry
             return i + 1, blk(x_in, cos, sin)
 
@@ -919,10 +1398,30 @@ def _build_spx_cases(cfg: LlamaBenchConfig) -> tuple[dict[str, Any], int]:
 
     @spx.jit
     def scan_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted spectrax scan training step.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return spx.value_and_grad(scan_loss)(model, xb, yb)
 
     @spx.jit
     def remat_train(model: Any, xb: jax.Array, yb: jax.Array) -> Any:
+        """Jitted spectrax remat training step.
+
+        Args:
+            model: spectrax model.
+            xb: Input batch.
+            yb: Target batch.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         return spx.value_and_grad(remat_loss)(model, xb, yb)
 
     return {
@@ -986,6 +1485,17 @@ def _generate_plots(payload: dict[str, Any], plots_dir: Path, tag: str) -> None:
     bar_h = 0.22
 
     def metric(lib: str, op: str, key: str) -> float:
+        """Return a numeric metric for a given library and operation.
+
+        Args:
+            lib: Library key (``"jax"``, ``"nnx"``, or ``"spx"``).
+            op: Operation name.
+            key: Payload key to extract (e.g. ``"median_ms"``).
+
+        Returns:
+            The metric as a positive ``float``, or ``nan`` if missing or
+            non-positive.
+        """
         value = ops[op].get(lib, {}).get(key, np.nan)
         try:
             value = float(value)
@@ -994,12 +1504,39 @@ def _generate_plots(payload: dict[str, Any], plots_dir: Path, tag: str) -> None:
         return value if value > 0 else float("nan")
 
     def values_for(lib: str, key: str) -> np.ndarray:
+        """Collect a metric across all operations for one library.
+
+        Args:
+            lib: Library key.
+            key: Payload key to extract.
+
+        Returns:
+            1-D array of metric values (``nan`` where missing).
+        """
         return np.asarray([metric(lib, op, key) for op in op_names], dtype=float)
 
     def positive(values: np.ndarray) -> np.ndarray:
+        """Filter to finite, strictly-positive values.
+
+        Args:
+            values: Input array.
+
+        Returns:
+            1-D array of positive finite values.
+        """
         return values[np.isfinite(values) & (values > 0)]
 
     def fmt_ms(value: float, _pos: float | None = None) -> str:
+        """Format a millisecond value for axis tick labels.
+
+        Args:
+            value: Duration in milliseconds.
+            _pos: Unused matplotlib position argument.
+
+        Returns:
+            Human-readable string such as ``"1.2s"``, ``"12ms"``, or
+            ``"0.5ms"``.
+        """
         if value >= 1000:
             return f"{value / 1000:.1f}s"
         if value >= 10:
@@ -1007,15 +1544,41 @@ def _generate_plots(payload: dict[str, Any], plots_dir: Path, tag: str) -> None:
         return f"{value:.2g}ms"
 
     def fmt_ratio(value: float, _pos: float | None = None) -> str:
+        """Format a ratio value for axis tick labels.
+
+        Args:
+            value: Ratio value.
+            _pos: Unused matplotlib position argument.
+
+        Returns:
+            String such as ``"1.5x"``.
+        """
         return f"{value:g}x"
 
     def new_fig(width: float, height: float):
+        """Create a styled matplotlib figure and axis.
+
+        Args:
+            width: Figure width in inches.
+            height: Figure height in inches.
+
+        Returns:
+            ``(fig, ax)`` tuple with paper/panel background colours applied.
+        """
         fig, ax = plt.subplots(figsize=(width, height), constrained_layout=True)
         fig.patch.set_facecolor(paper)
         ax.set_facecolor(panel)
         return fig, ax
 
     def polish_axis(ax: Any, *, xlabel: str, title: str, subtitle: str | None = None) -> None:
+        """Apply shared styling to a plot axis.
+
+        Args:
+            ax: Matplotlib axis object.
+            xlabel: Label for the x-axis.
+            title: Bold left-aligned title.
+            subtitle: Optional smaller subtitle above the title.
+        """
         ax.set_xlabel(xlabel, color=muted, labelpad=10)
         ax.set_title(title, loc="left", fontsize=16, fontweight="bold", color=ink, pad=18)
         if subtitle:
@@ -1029,6 +1592,12 @@ def _generate_plots(payload: dict[str, Any], plots_dir: Path, tag: str) -> None:
         ax.set_axisbelow(True)
 
     def save(fig: Any, path: str) -> None:
+        """Save a figure to disk and close it.
+
+        Args:
+            fig: Matplotlib figure object.
+            path: Destination file path.
+        """
         fig.savefig(path, dpi=240, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
         print(f"  plot: {path}")

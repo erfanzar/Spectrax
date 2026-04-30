@@ -22,6 +22,7 @@ from .markers import (
     sxexit_loop,
     sxloop,
     sxstage_iter,
+    sxstage_region,
 )
 from .per_rank import (
     compile_per_rank_bwd,
@@ -80,6 +81,7 @@ __all__ = [
     "sxjit",
     "sxloop",
     "sxstage_iter",
+    "sxstage_region",
     "sxvalue_and_grad",
     "treduce",
     "treduce_i",

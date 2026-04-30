@@ -22,10 +22,12 @@ class _Accum(Module):
     acc: Buffer
 
     def __init__(self) -> None:
+        """Initialize with acc."""
         super().__init__()
         self.acc = Buffer(jnp.zeros((), dtype=jnp.float32), kind="batch_stats")
 
     def forward(self, x):
+        """Run the forward pass."""
         self.acc.value = self.acc.value + 1.0
         return x + self.acc.value
 
@@ -48,6 +50,7 @@ def test_eval_shape_accepts_module_keyword_arg():
     x = jax.ShapeDtypeStruct((2, 4), jnp.float32)
 
     def fn(x, *, mod):
+        """Helper function."""
         return mod(x)
 
     out = spx.eval_shape(fn, x, mod=m)

@@ -152,6 +152,14 @@ def scan(
         any collections, the final carry for those collections is
         written back to ``init_module`` in place; otherwise the module
         is left untouched (and any mutation raises).
+
+    Raises:
+        TypeError: If ``init_module`` is not a :class:`~spectrax.Module`.
+        ValueError: If the invariant portion of the state changes
+            structurally across iterations.
+        IllegalMutationError: If a direct write to the live module
+            occurs on the readonly fast path, or if a mutation lands
+            outside the ``mutable`` selector.
     """
     mutable_sel = resolve_mutable(mutable)
     if not isinstance(init_module, Module):

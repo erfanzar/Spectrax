@@ -61,6 +61,7 @@ def test_marker_carries_edge_sharding_metadata():
     """``sxstage_iter(..., sharding=...)`` stores a boundary transfer spec."""
 
     def model(x):
+        """Model factory helper."""
         h = x * 2
         h = sxstage_iter(h, stage=0, sharding=PartitionSpec(("fsdp", "sp"), "tp"))
         return h + 1
@@ -246,6 +247,7 @@ def test_mpmd_loop_scan_over_sequence():
     weights = jnp.ones((3, 4, 4))
 
     def body(carry, w):
+        """Loop body function."""
         return jnp.dot(carry, w), None
 
     x = jnp.ones((4, 4))
@@ -259,6 +261,7 @@ def test_mpmd_loop_length_only():
     w = jnp.ones((4, 4)) * 2
 
     def body(carry, _):
+        """Loop body function."""
         return jnp.dot(carry, w), None
 
     x = jnp.ones((4, 4))
@@ -272,9 +275,11 @@ def test_mpmd_loop_grad():
     weights = jnp.ones((2, 4, 4))
 
     def body(carry, w):
+        """Loop body function."""
         return jnp.dot(carry, w), None
 
     def f(x):
+        """Helper function."""
         out, _ = sxloop(body, x, weights)
         return out.sum()
 
@@ -301,6 +306,7 @@ def test_mpmd_enter_exit_loop_grad():
     """Grad flows through enter/exit markers as identities."""
 
     def f(x):
+        """Helper function."""
         x = sxenter_loop(x, name="loop")
         x = x**2
         x = sxexit_loop(x, name="loop")
@@ -315,6 +321,7 @@ def test_mpmd_enter_exit_loop_under_jit():
 
     @jax.jit
     def f(x):
+        """Helper function."""
         x = sxenter_loop(x, name="loop")
         x = x * 3
         x = sxexit_loop(x, name="loop")
@@ -328,6 +335,7 @@ def test_cluster_jaxpr_preserves_loop_markers():
     """Loop markers are kept inside clusters (not stripped like stage markers)."""
 
     def model(x):
+        """Model factory helper."""
         x = sxenter_loop(x, name="layer_loop")
         x = x * 2
         x = sxexit_loop(x, name="layer_loop")

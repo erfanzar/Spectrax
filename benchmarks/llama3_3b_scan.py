@@ -86,6 +86,15 @@ class Llama3BlockNNX(nnx.Module):
     """One Llama 3 transformer block in Flax NNX."""
 
     def __init__(self, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads (GQA).
+            rngs: PRNG source for parameter init.
+        """
         self.d = d
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
@@ -103,6 +112,16 @@ class Llama3BlockNNX(nnx.Module):
         self.down = nnx.Linear(ffn, d, rngs=rngs, **lin)
 
     def __call__(self, x, cos, sin):
+        """Run pre-norm GQA+RoPE attention followed by pre-norm SwiGLU FFN.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         h = self.norm1(x)
         q = self.q(h).reshape(b, t, self.n_heads, self.head_dim)
@@ -130,21 +149,41 @@ class Llama3ModelNNXScan(nnx.Module):
     """NNX Llama 3B using ``nnx.vmap`` + ``nnx.scan`` over blocks."""
 
     def __init__(self, n_layers, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Stack ``n_layers`` blocks via vmap and scan them over the input.
+
+        Args:
+            n_layers: Number of transformer blocks.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         self.head_dim = d // n_heads
 
         @nnx.split_rngs(splits=n_layers)
         @nnx.vmap(in_axes=(0,), out_axes=0)
         def create_block(rngs):
+            """Create one Llama3BlockNNX under split RNGs."""
             return Llama3BlockNNX(d, ffn, n_heads, n_kv_heads, rngs=rngs)
 
         self.blocks = create_block(rngs)
 
     def __call__(self, x):
+        """Run the scanned block stack on ``x``.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         cos, sin = _rope_freqs(t, self.head_dim)
 
         @nnx.scan(in_axes=(nnx.Carry, None, None, 0), out_axes=nnx.Carry)
         def forward(x, cos, sin, block):
+            """Single scan step: apply one block."""
             return block(x, cos, sin)
 
         return forward(x, cos, sin, self.blocks)
@@ -154,10 +193,28 @@ class Llama3ModelNNXLoop(nnx.Module):
     """NNX Llama 3B using a plain Python ``for`` loop over blocks."""
 
     def __init__(self, n_layers, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Create ``n_layers`` blocks in an :class:`nnx.List`.
+
+        Args:
+            n_layers: Number of transformer blocks.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         self.head_dim = d // n_heads
         self.blocks = nnx.List([Llama3BlockNNX(d, ffn, n_heads, n_kv_heads, rngs=nnx.Rngs(i)) for i in range(n_layers)])
 
     def __call__(self, x):
+        """Run every block sequentially with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         cos, sin = _rope_freqs(t, self.head_dim)
         for blk in self.blocks:
@@ -169,6 +226,15 @@ class Llama3BlockSPX(spx.Module):
     """One Llama 3 transformer block in spectrax."""
 
     def __init__(self, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads (GQA).
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.d = d
         self.n_heads = n_heads
@@ -187,6 +253,16 @@ class Llama3BlockSPX(spx.Module):
         self.down = nn.Linear(ffn, d, **lin)
 
     def forward(self, x, cos, sin):
+        """Run pre-norm GQA+RoPE attention followed by pre-norm SwiGLU FFN.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         h = self.norm1(x)
         q = self.q(h).reshape(b, t, self.n_heads, self.head_dim)
@@ -214,12 +290,30 @@ class Llama3ModelSPXLoop(spx.Module):
     """SPX Llama 3B using a plain Python ``for`` loop (baseline)."""
 
     def __init__(self, n_layers, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Create ``n_layers`` blocks in a :class:`nn.ModuleList`.
+
+        Args:
+            n_layers: Number of transformer blocks.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.blocks = nn.ModuleList(
             [Llama3BlockSPX(d, ffn, n_heads, n_kv_heads, rngs=spx.Rngs(i)) for i in range(n_layers)]
         )
 
     def forward(self, x):
+        """Run every block sequentially with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         head_dim = self.blocks[0].head_dim
         cos, sin = _rope_freqs(t, head_dim)
@@ -232,17 +326,36 @@ class Llama3ModelSPXForiLoop(spx.Module):
     """SPX Llama 3B using ``spx.fori_loop`` with ``m.blocks[i]``."""
 
     def __init__(self, n_layers, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Create ``n_layers`` blocks in a :class:`nn.ModuleList`.
+
+        Args:
+            n_layers: Number of transformer blocks.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.blocks = nn.ModuleList(
             [Llama3BlockSPX(d, ffn, n_heads, n_kv_heads, rngs=spx.Rngs(i)) for i in range(n_layers)]
         )
 
     def forward(self, x):
+        """Run blocks via :func:`spx.fori_loop` with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         head_dim = self.blocks[0].head_dim
         cos, sin = _rope_freqs(t, head_dim)
 
         def body(i, m, x):
+            """One fori_loop step: apply block ``i``."""
             return m.blocks[i](x, cos, sin)
 
         return spx.fori_loop(0, len(self.blocks), body, self, x, mutable=())
@@ -273,10 +386,21 @@ def bench_nnx_scan(cfg: Llama3Config, iters: int):
     model = Llama3ModelNNXScan(cfg.n_layers, cfg.d_model, cfg.ffn, cfg.n_heads, cfg.n_kv_heads, rngs=rngs)
 
     def loss_fn(model, x, y):
+        """MSE loss between ``model(x)`` and ``y``."""
         return _loss_fn(model(x), y)
 
     @nnx.jit
     def step(model, x, y):
+        """One jitted training step: forward, loss, grad.
+
+        Args:
+            model: NNX model.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         loss, grads = nnx.value_and_grad(loss_fn)(model, x, y)
         return loss, grads
 
@@ -303,10 +427,21 @@ def bench_nnx_loop(cfg: Llama3Config, iters: int):
     model = Llama3ModelNNXLoop(cfg.n_layers, cfg.d_model, cfg.ffn, cfg.n_heads, cfg.n_kv_heads, rngs=rngs)
 
     def loss_fn(model, x, y):
+        """MSE loss between ``model(x)`` and ``y``."""
         return _loss_fn(model(x), y)
 
     @nnx.jit
     def step(model, x, y):
+        """One jitted training step: forward, loss, grad.
+
+        Args:
+            model: NNX model.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
         loss, grads = nnx.value_and_grad(loss_fn)(model, x, y)
         return loss, grads
 
@@ -331,6 +466,16 @@ class Llama3ModelSPXScan(spx.Module):
     """SPX Llama 3B using ``ModuleList.scan`` inside ``forward``."""
 
     def __init__(self, n_layers, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Create ``n_layers`` blocks in a :class:`nn.ModuleList`.
+
+        Args:
+            n_layers: Number of transformer blocks.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.blocks = nn.ModuleList(
             [Llama3BlockSPX(d, ffn, n_heads, n_kv_heads, rngs=spx.Rngs(i)) for i in range(n_layers)]
@@ -338,6 +483,14 @@ class Llama3ModelSPXScan(spx.Module):
         self.head_dim = d // n_heads
 
     def forward(self, x):
+        """Run blocks via :meth:`ModuleList.scan` with shared RoPE tables.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         cos, sin = _rope_freqs(t, self.head_dim)
         return self.blocks.scan(lambda blk, x: blk(x, cos, sin), x)
@@ -350,7 +503,19 @@ def bench_spx_scan(cfg: Llama3Config, iters: int):
 
     @spx.jit
     def step(model, x, y):
+        """One jitted training step: forward, loss, grad.
+
+        Args:
+            model: spectrax model.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
+
         def loss_fn(m, x, y):
+            """MSE loss between ``m(x)`` and ``y``."""
             return _loss_fn(m(x), y)
 
         return spx.value_and_grad(loss_fn)(model, x, y)
@@ -379,7 +544,19 @@ def bench_spx_loop(cfg: Llama3Config, iters: int):
 
     @spx.jit
     def step(model, x, y):
+        """One jitted training step: forward, loss, grad.
+
+        Args:
+            model: spectrax model.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
+
         def loss_fn(m, x, y):
+            """MSE loss between ``m(x)`` and ``y``."""
             return _loss_fn(m(x), y)
 
         return spx.value_and_grad(loss_fn)(model, x, y)
@@ -408,7 +585,19 @@ def bench_spx_fori_loop(cfg: Llama3Config, iters: int):
 
     @spx.jit
     def step(model, x, y):
+        """One jitted training step: forward, loss, grad.
+
+        Args:
+            model: spectrax model.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            ``(loss, grads)`` tuple.
+        """
+
         def loss_fn(m, x, y):
+            """MSE loss between ``m(x)`` and ``y``."""
             return _loss_fn(m(x), y)
 
         return spx.value_and_grad(loss_fn)(model, x, y)

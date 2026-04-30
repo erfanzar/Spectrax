@@ -107,6 +107,7 @@ def test_rngs_missing_named_key_advances_state_under_jit():
 
     @spx.jit(mutable="rng")
     def draw(rngs):
+        """Draw a random sample."""
         return jax.random.key_data(rngs.key("custom"))
 
     k1 = draw(r)

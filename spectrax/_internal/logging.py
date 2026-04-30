@@ -2,7 +2,14 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""logging infrastructure with colored output and once-only deduplication."""
+"""Logging infrastructure with colored output and once-only deduplication.
+
+Provides :class:`LazyLogger`, :class:`ProgressLogger`, and :func:`get_logger`
+for SpectraX's internal and user-facing logging needs. All formatters add
+ANSI colours when ``stdout`` is a TTY; non-primary JAX processes
+automatically have their log level raised to ``WARNING`` to reduce noise
+in distributed training.
+"""
 
 from __future__ import annotations
 
@@ -64,9 +71,22 @@ _logged_once: set[tuple[str, ...]] = set()
 
 
 class ColorFormatter(logging.Formatter):
-    """Custom logging formatter that adds color to log output."""
+    """Custom logging formatter that adds color to log output.
+
+    Formats each record as ``(HH:MM:SS name) message`` with the level name
+    padded to 8 characters and coloured according to :data:`LEVEL_COLORS`.
+    Multi-line messages are indented so every line carries the header.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
+        """Format *record* with ANSI colours and a timestamp header.
+
+        Args:
+            record: The log record to format.
+
+        Returns:
+            The formatted log line (or lines) as a single string.
+        """
         orig_levelname = record.levelname
         color = LEVEL_COLORS.get(record.levelname, COLORS["RESET"])
         record.levelname = f"{color}{record.levelname:<8}{COLORS['RESET']}"
@@ -89,6 +109,13 @@ class LazyLogger:
     """
 
     def __init__(self, name: str, level: int | None = None):
+        """Create a lazy logger.
+
+        Args:
+            name: Logger name (forwarded to :func:`logging.getLogger`).
+            level: Initial log level. ``None`` means read from the
+                ``LOGGING_LEVEL_ED`` environment variable (default ``INFO``).
+        """
         if level is None:
             level = _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
         if isinstance(level, str):
@@ -101,13 +128,16 @@ class LazyLogger:
 
     @property
     def level(self):
+        """int: The effective log level for this logger."""
         return self._level
 
     @property
     def name(self):
+        """str: The logger name."""
         return self._name
 
     def _ensure_initialized(self) -> None:
+        """Lazy-initialize the underlying :class:`logging.Logger`."""
         if self._logger is not None:
             return
 
@@ -133,6 +163,19 @@ class LazyLogger:
 
     @staticmethod
     def _make_hashable(value: tp.Any) -> tp.Any:
+        """Return a hashable stand-in for *value*, falling back to ``repr``.
+
+        Used by :meth:`_log_once` so non-hashable args (e.g. lists, dicts)
+        can still participate in deduplication keys.
+
+        Args:
+            value: Any Python object.
+
+        Returns:
+            A hashable proxy — the original object if it is already
+            hashable, otherwise ``(type(value), repr(value))`` or
+            ``(type(value), id(value))`` as last resort.
+        """
         try:
             hash(value)
         except Exception:
@@ -143,6 +186,17 @@ class LazyLogger:
         return value
 
     def _log_once(self, level: int, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Log *message* at *level* only if the exact call has not been seen before.
+
+        The deduplication key covers the level name, message template, and
+        every positional arg (made hashable via :meth:`_make_hashable`).
+
+        Args:
+            level: Python logging level constant (e.g. ``logging.INFO``).
+            message: Format string.
+            *args: Positional args forwarded to :meth:`logging.Logger.log`.
+            **kwargs: Keyword args forwarded to :meth:`logging.Logger.log`.
+        """
         safe_args = tuple(self._make_hashable(arg) for arg in args)
         message_key = (logging.getLevelName(level), message, *safe_args)
         with self._logged_once_lock:
@@ -152,30 +206,52 @@ class LazyLogger:
                 self._logger.log(level, message, *args, **kwargs)
 
     def debug_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Log a ``DEBUG`` message once (deduplicated)."""
         self._log_once(logging.DEBUG, message, *args, **kwargs)
 
     def info_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Log an ``INFO`` message once (deduplicated)."""
         self._log_once(logging.INFO, message, *args, **kwargs)
 
     def warn_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Log a ``WARNING`` message once (deduplicated)."""
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
     def warning_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Alias for :meth:`warn_once`."""
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
     def error_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Log an ``ERROR`` message once (deduplicated)."""
         self._log_once(logging.ERROR, message, *args, **kwargs)
 
     def clear_once_cache(self) -> None:
+        """Clear the global once-only deduplication cache.
+
+        After calling this, every subsequent ``*_once`` call will emit its
+        message again (until the next deduplication).
+        """
         with self._logged_once_lock:
             _logged_once.clear()
 
     def __getattr__(self, name: str) -> tp.Callable:
+        """Dynamically resolve logging methods on first access.
+
+        Args:
+            name: Attribute name being accessed.
+
+        Returns:
+            A callable that delegates to the underlying ``logging.Logger``.
+
+        Raises:
+            AttributeError: If ``name`` is not a known logging method or level.
+        """
         if name in ("exception", "log"):
             method_name = name
 
             @wraps(getattr(logging.Logger, method_name))
             def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+                """Delegate to the underlying logger method."""
                 self._ensure_initialized()
                 return getattr(self._logger, method_name)(*args, **kwargs)
 
@@ -188,6 +264,7 @@ class LazyLogger:
 
                 @wraps(getattr(logging.Logger, method_name))
                 def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+                    """Delegate to the named level method of the underlying logger."""
                     self._ensure_initialized()
                     return getattr(self._logger, method_name)(*args, **kwargs)
 
@@ -195,6 +272,7 @@ class LazyLogger:
 
             @wraps(logging.Logger.log)
             def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+                """Log at the dynamically-resolved level."""
                 self._ensure_initialized()
                 return self._logger.log(level, *args, **kwargs)
 
@@ -204,14 +282,34 @@ class LazyLogger:
 
 
 def get_logger(name: str, level: int | None = None) -> LazyLogger:
-    """Create a lazy logger that only initializes when first used."""
+    """Create a lazy logger that only initializes when first used.
+
+    Args:
+        name: Logger name.
+        level: Optional initial level. ``None`` → ``LOGGING_LEVEL_ED`` env.
+
+    Returns:
+        A :class:`LazyLogger` instance.
+    """
     return LazyLogger(name, level)
 
 
 class ProgressLogger:
-    """A progress logger that displays updating progress bars and messages."""
+    """A progress logger that displays updating progress bars and messages.
+
+    On a TTY the bar overwrites the same line; in a pipe or file the
+    percentage is emitted as ordinary log lines via :func:`get_logger`.
+    Use as a context manager for automatic completion logging.
+    """
 
     def __init__(self, name: str = "Progress", logger_instance: LazyLogger | None = None):
+        """Create a progress logger.
+
+        Args:
+            name: Display name printed next to the timestamp.
+            logger_instance: Optional :class:`LazyLogger` for non-TTY output.
+                When ``None``, a logger named ``name`` is created.
+        """
         self.name = name
         self.use_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
         self.start_time = time.time()
@@ -227,6 +325,16 @@ class ProgressLogger:
         show_eta: bool = True,
         extra_info: str = "",
     ) -> None:
+        """Render a progress bar for *current* out of *total*.
+
+        Args:
+            current: Completed items so far.
+            total: Total items expected.
+            message: Optional text displayed after the percentage.
+            bar_width: Width of the Unicode bar in characters.
+            show_eta: Whether to estimate and print remaining time.
+            extra_info: Optional trailing text (appended after ETA).
+        """
         if total <= 0:
             return
 
@@ -263,6 +371,11 @@ class ProgressLogger:
             self._logger.info(f"{progress_pct:.1f}% - {message}")
 
     def update_simple(self, message: str) -> None:
+        """Print a simple rotating message (no percentage bar).
+
+        Args:
+            message: The message to display.
+        """
         timestamp = time.strftime("%H:%M:%S")
         full_message = f"({timestamp} {self.name}) {message}"
 
@@ -275,6 +388,12 @@ class ProgressLogger:
             self._logger.info(message)
 
     def complete(self, message: str | None = None, show_time: bool = True) -> None:
+        """Finalize the progress line and print elapsed time.
+
+        Args:
+            message: Completion text. ``None`` → ``"Completed"``.
+            show_time: Whether to append the elapsed duration.
+        """
         if message is None:
             message = "Completed"
 
@@ -301,9 +420,11 @@ class ProgressLogger:
             self._logger.info(full_message)
 
     def __enter__(self):
+        """Context-manager entry — returns ``self``."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context-manager exit — auto-completes if no exception was raised."""
         if exc_type is None:
             self.complete()
         return False

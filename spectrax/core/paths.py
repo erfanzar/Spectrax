@@ -107,12 +107,28 @@ def _decode_component(c: str) -> PathComponent:
 
 
 def is_prefix(prefix: Path, full: Path) -> bool:
-    """Return ``True`` iff ``prefix`` is a prefix of ``full``."""
+    """Return ``True`` iff ``prefix`` is a prefix of ``full``.
+
+    Args:
+        prefix: The candidate prefix path.
+        full: The path to test against.
+
+    Returns:
+        ``True`` when every component of ``prefix`` matches the
+        corresponding leading components of ``full``.
+    """
     return len(prefix) <= len(full) and full[: len(prefix)] == prefix
 
 
 def join(*paths: Iterable[PathComponent]) -> Path:
-    """Concatenate any number of component iterables into a single path."""
+    """Concatenate any number of component iterables into a single path.
+
+    Args:
+        *paths: Arbitrary iterables of :data:`PathComponent` values.
+
+    Returns:
+        A single :data:`Path` tuple containing all components in order.
+    """
     out: list[PathComponent] = []
     for p in paths:
         out.extend(p)

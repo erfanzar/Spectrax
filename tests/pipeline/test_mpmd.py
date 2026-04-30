@@ -110,12 +110,14 @@ class _TpBlock(spx.Module):
     """Tiny block with TP-sharded parameter metadata for composite MPMD tests."""
 
     def __init__(self, scale: float):
+        """Initialize the instance."""
         super().__init__()
         base = jnp.arange(_D * _D, dtype=jnp.float32).reshape(_D, _D)
         self.weight = spx.Parameter((base + 1.0) * scale, axis_names=(None, "tp"))
         self.bias = spx.Parameter(jnp.zeros((_D,), dtype=jnp.float32), axis_names=("tp",))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x @ self.weight + self.bias
 
 
@@ -123,11 +125,13 @@ class _UnannotatedBlock(spx.Module):
     """Tiny block whose runtime value sharding is stronger than metadata."""
 
     def __init__(self, scale: float):
+        """Initialize the instance."""
         super().__init__()
         base = jnp.arange(_D * _D, dtype=jnp.float32).reshape(_D, _D)
         self.weight = spx.Parameter((base + 1.0) * scale)
 
     def forward(self, x):
+        """Run the forward pass."""
         return x @ self.weight
 
 
@@ -449,6 +453,7 @@ def _make_pipe_forward(mpmd_mesh, schedule_cls, static_argnums=(0, 1, 2, 3), mic
         static_argnums=static_argnums,
     )
     def pipe_forward(w0, b0, w1, b1, x, y):
+        """Pipelined forward implementation."""
         h = jnp.maximum(x @ w0 + b0, 0)
         h = sxstage_iter(h)
         h = jnp.maximum(h @ w1 + b1, 0)
@@ -458,6 +463,7 @@ def _make_pipe_forward(mpmd_mesh, schedule_cls, static_argnums=(0, 1, 2, 3), mic
 
 
 def _ref_forward_4stage(w0, b0, w1, b1, w2, b2, w3, b3, x, y):
+    """Reference 4-stage forward."""
     h = jnp.maximum(x @ w0 + b0, 0)
     h = jnp.maximum(h @ w1 + b1, 0)
     h = jnp.maximum(h @ w2 + b2, 0)
@@ -466,12 +472,15 @@ def _ref_forward_4stage(w0, b0, w1, b1, w2, b2, w3, b3, x, y):
 
 
 def _make_pipe_forward_4stage(mpmd_mesh, schedule_cls, *, microbatches=_M, **schedule_kwargs):
+    """Create pipelined 4-stage forward."""
+
     @sxjit(
         mesh=mpmd_mesh,
         schedule=schedule_cls(microbatches=microbatches, **schedule_kwargs),
         static_argnums=tuple(range(8)),
     )
     def pipe_forward(w0, b0, w1, b1, w2, b2, w3, b3, x, y):
+        """Pipelined forward implementation."""
         h = jnp.maximum(x @ w0 + b0, 0)
         h = sxstage_iter(h)
         h = jnp.maximum(h @ w1 + b1, 0)
@@ -498,6 +507,7 @@ def pipe_args():
 
 @pytest.fixture
 def pipe_args_4stage():
+    """Build args for 4-stage pipeline."""
     weights = []
     for i in range(4):
         weights.extend((jnp.ones((_D, _D)) * (i + 1), jnp.zeros((_D,))))
@@ -507,6 +517,7 @@ def pipe_args_4stage():
 
 
 def _grid_action_count(grid):
+    """Count actions in the schedule grid."""
     count = 0
     for row in grid:
         for cell in row:
@@ -517,6 +528,7 @@ def _grid_action_count(grid):
 
 
 def _assert_true_fused_async_mpmd(pipe_forward, *, n_ranks: int):
+    """Assert true fused async MPMD."""
     plan = pipe_forward._mpmd_state["schedule_plan"]
     stats = plan["last_schedule_runtime_stats"]
     units = _build_schedule_units_from_plan(plan)
@@ -549,6 +561,7 @@ def test_mpmd_jit_schedule_default_keeps_array_args_dynamic(mpmd_mesh, pipe_args
 
     @sxjit(mesh=mpmd_mesh, schedule=GPipe(microbatches=_M))
     def pipe_forward(stage0, stage1, x, y):
+        """Pipelined forward implementation."""
         h = stage0(x)
         h = sxstage_iter(h)
         h = stage1(h)
@@ -578,6 +591,7 @@ def test_mpmd_jit_schedule_batch_argnums_keeps_state_whole(mpmd_mesh):
         batch_argnums=(1,),
     )
     def pipe_forward(state, x):
+        """Pipelined forward implementation."""
         h = x + state["bias"]
         h = sxstage_iter(h)
         return (h + state["scale"] + state["step"].astype(jnp.float32) * 0.0).mean()
@@ -594,6 +608,7 @@ def test_mpmd_jit_schedule_batch_argnums_keeps_state_whole(mpmd_mesh):
 
 
 def test_schedule_const_placement_promotes_single_device_values_to_stage_submesh():
+    """Schedule const placement promotes single device values to stage submesh."""
     from spectrax.runtime.mpmd.runtime import _place_schedule_const_value
 
     devs = jax.devices()[:2]
@@ -626,6 +641,7 @@ def test_mpmd_jit_schedule_rebinds_live_weight_values(mpmd_mesh, pipe_args):
 
     @sxjit(mesh=mpmd_mesh, schedule=GPipe(microbatches=_M))
     def pipe_forward(stage0, stage1, x, y):
+        """Pipelined forward implementation."""
         h = stage0(x)
         h = sxstage_iter(h)
         h = stage1(h)
@@ -652,6 +668,7 @@ def test_mpmd_jit_schedule_preserves_tp_sharded_module_consts(pipe_args):
 
     @sxjit(mesh=mesh, schedule=GPipe(microbatches=_M))
     def pipe_forward(stage0, stage1, x, y):
+        """Pipelined forward implementation."""
         h = stage0(x)
         h = sxstage_iter(h)
         h = stage1(h)
@@ -697,6 +714,7 @@ def test_mpmd_jit_schedule_preserves_existing_nonreplicated_const_sharding(pipe_
 
     @sxjit(mesh=mesh, schedule=GPipe(microbatches=_M))
     def pipe_forward(stage0, stage1, x, y):
+        """Pipelined forward implementation."""
         h = stage0(x)
         h = sxstage_iter(h)
         h = stage1(h)
@@ -735,6 +753,7 @@ def test_mpmd_jit_schedule_virtual_stage_owners_follow_schedule(pipe_args):
 
     @sxjit(mesh=mesh, schedule=schedule)
     def pipe_forward(b0, b1, b2, b3, x, y):
+        """Pipelined forward implementation."""
         h = b0(x)
         h = sxstage_iter(h)
         h = b1(h)
@@ -782,6 +801,7 @@ def test_mpmd_jit_schedule_accepts_physical_owner_stage_metadata(pipe_args):
 
     @sxjit(mesh=mesh, schedule=schedule)
     def pipe_forward(b0, b1, b2, b3, x, y):
+        """Pipelined forward implementation."""
         h = b0(x)
         h = sxstage_iter(h)
         h = b1(h)
@@ -835,6 +855,7 @@ def test_mpmd_jit_schedule_value_and_grad_repacks_multileaf_arg(mpmd_mesh, pipe_
     params = jax.tree.map(lambda leaf: jax.device_put(leaf, full_replicated), params)
 
     def ref_forward(p, x, y):
+        """Reference forward implementation."""
         h = jnp.maximum(x @ p["s0"]["w"] + p["s0"]["b"], 0)
         h = jnp.maximum(h @ p["s1"]["w"] + p["s1"]["b"], 0)
         return ((h - y) ** 2).mean()
@@ -846,6 +867,7 @@ def test_mpmd_jit_schedule_value_and_grad_repacks_multileaf_arg(mpmd_mesh, pipe_
         batch_argnums=(1, 2),
     )
     def pipe_forward(p, x, y):
+        """Pipelined forward implementation."""
         h = jnp.maximum(x @ p["s0"]["w"] + p["s0"]["b"], 0)
         h = sxstage_iter(h)
         h = jnp.maximum(h @ p["s1"]["w"] + p["s1"]["b"], 0)
@@ -1031,6 +1053,7 @@ def test_mpmd_grad_requires_schedule(mpmd_mesh, pipe_args):
 
     @sxjit(mesh=mpmd_mesh)
     def fwd_only(w0, b0, w1, b1, x, y):
+        """fwd_only helper."""
         h = jnp.maximum(x @ w0 + b0, 0)
         h = sxstage_iter(h)
         h = jnp.maximum(h @ w1 + b1, 0)

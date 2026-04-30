@@ -38,11 +38,13 @@ class IndexedBlock(Module):
     _spx_scan_safe_static_fields = frozenset({"layer_idx"})
 
     def __init__(self, layer_idx: int):
+        """Initialize with layer_idx, weight."""
         super().__init__()
         self.layer_idx = layer_idx
         self.weight = Parameter(jnp.asarray(float(layer_idx + 1), dtype=jnp.float32))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x + self.weight.value
 
 
@@ -50,11 +52,13 @@ class StaticScaleBlock(Module):
     """Tiny module whose static scale changes computation."""
 
     def __init__(self, scale: int):
+        """Initialize with scale, weight."""
         super().__init__()
         self.scale = scale
         self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x * self.scale + self.weight.value
 
 
@@ -62,10 +66,12 @@ class HeterogeneousA(Module):
     """First heterogeneous module shape for segmented scan tests."""
 
     def __init__(self):
+        """Initialize with weight."""
         super().__init__()
         self.weight = Parameter(jnp.ones((1,)))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x * self.weight.value
 
 
@@ -73,10 +79,12 @@ class HeterogeneousB(Module):
     """Second heterogeneous module shape for segmented scan tests."""
 
     def __init__(self):
+        """Initialize with other."""
         super().__init__()
         self.other = Parameter(jnp.ones((1,)))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x + self.other.value
 
 
@@ -84,6 +92,7 @@ class MutatingOpaqueImpl:
     """Opaque helper that records runtime-only attributes."""
 
     def __init__(self):
+        """Initialize with scale."""
         self.scale = 1.0
 
 
@@ -91,11 +100,13 @@ class OpaqueMutationBlock(Module):
     """Block whose opaque helper mutates during forward."""
 
     def __init__(self):
+        """Initialize with impl, weight."""
         super().__init__()
         self.impl = spx.Opaque(MutatingOpaqueImpl())
         self.weight = Parameter(jnp.asarray(1.0, dtype=jnp.float32))
 
     def forward(self, x):
+        """Run the forward pass."""
         self.impl.RuntimeOnlyType = type(self)
         return x + self.weight.value * self.impl.scale
 
@@ -311,6 +322,7 @@ def test_stacked_modulelist_scan_trace_matches_scan_under_jit():
     x = jnp.ones((2, 4))
 
     def run(stacked_layers, xb):
+        """Run helper."""
         scanned = stacked_layers.scan(lambda layer, carry: layer(carry), xb)
         traced = stacked_layers.scan(lambda layer, carry: layer(carry), xb, trace=True)
         return scanned, traced
@@ -325,6 +337,7 @@ def test_stacked_modulelist_is_trainable_pytree():
     x = jnp.ones((2, 4))
 
     def loss(stacked_layers, xb):
+        """Compute the loss."""
         return stacked_layers.scan(lambda layer, carry: layer(carry), xb).sum()
 
     value, grads = spx.value_and_grad(loss)(layers, x)
@@ -346,19 +359,27 @@ def test_stacked_modulelist_rejects_heterogeneous_graphs():
     """Stacked scans require identical per-layer graph definitions."""
 
     class A(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with weight."""
             super().__init__()
             self.weight = Parameter(jnp.ones((1,)))
 
         def forward(self, x):
+            """Run the forward pass."""
             return x * self.weight.value
 
     class B(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with other."""
             super().__init__()
             self.other = Parameter(jnp.ones((1,)))
 
         def forward(self, x):
+            """Run the forward pass."""
             return x + self.other.value
 
     with pytest.raises(ValueError, match="compatible graph topology"):

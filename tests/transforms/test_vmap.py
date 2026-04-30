@@ -35,6 +35,7 @@ def test_vmap_decorator_form():
 
     @spx.vmap(in_axes=(None, 0))
     def fn(m, x):
+        """Helper function."""
         return m(x)
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -53,6 +54,7 @@ def test_vmap_axis_name_reducer():
     import jax
 
     def meaner(m, x):
+        """Compute the mean."""
         y = m(x)
         return jax.lax.pmean(y, axis_name="batch")
 

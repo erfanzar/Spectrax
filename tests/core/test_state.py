@@ -160,6 +160,7 @@ def test_map_path_aware_callback_receives_dotted_path():
     seen: list[str] = []
 
     def annotate(path, value):
+        """Annotation helper."""
         seen.append(path)
         return f"{path}={value}"
 
@@ -175,6 +176,7 @@ def test_map_optional_path_callback_receives_dotted_path():
     seen: list[tuple[str, int | None]] = []
 
     def annotate(path, value=None):
+        """Annotation helper."""
         seen.append((path, value))
         return f"{path}={value}"
 

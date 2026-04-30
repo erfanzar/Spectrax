@@ -31,11 +31,29 @@ from spectrax.runtime.types.stage import PipelineStage
 
 
 def _median(xs: list[float]) -> float:
+    """Return the median of ``xs``.
+
+    Args:
+        xs: List of float timings.
+
+    Returns:
+        Median value.
+    """
     s = sorted(xs)
     return s[len(s) // 2]
 
 
 def _dummy_batch(batch: int, d: int, step: int):
+    """Return a deterministic ``(x, y)`` float32 batch for ``step``.
+
+    Args:
+        batch: Batch size.
+        d: Feature dimension.
+        step: Step index used to fold the PRNG key.
+
+    Returns:
+        ``(x, y)`` tuple of random float32 tensors.
+    """
     key = jax.random.fold_in(jax.random.PRNGKey(0), step)
     kx, ky = jax.random.split(key)
     x = jax.random.normal(kx, (batch, d), dtype=jnp.float32)
@@ -44,7 +62,16 @@ def _dummy_batch(batch: int, d: int, step: int):
 
 
 def build_params(n_stages: int, d: int, key: jax.Array):
-    """Return a flat tuple of (W, b) pairs — one per stage."""
+    """Return a flat tuple of (W, b) pairs — one per stage.
+
+    Args:
+        n_stages: Number of pipeline stages.
+        d: Feature dimension.
+        key: JAX PRNG key.
+
+    Returns:
+        Flat tuple of weight and bias arrays.
+    """
     params = []
     for _i in range(n_stages):
         k1, k2, key = jax.random.split(key, 3)
@@ -54,7 +81,14 @@ def build_params(n_stages: int, d: int, key: jax.Array):
 
 
 def mlp_forward(*params_and_data):
-    """Reference forward: params = (W0,b0,W1,b1,...) then x, y."""
+    """Reference forward: params = (W0,b0,W1,b1,...) then x, y.
+
+    Args:
+        *params_and_data: Flat parameter sequence followed by ``x`` and ``y``.
+
+    Returns:
+        Scalar MSE loss.
+    """
     *params, x, y = params_and_data
     h = x
     for i in range(0, len(params), 2):
@@ -70,6 +104,14 @@ def bench_mpmd_jit(params, d: int, n_stages: int, batch: int, mb: int, schedule,
 
     @sxjit(mesh=mesh, schedule=schedule)
     def forward(*args):
+        """MPMD forward: apply MLP stages, compute MSE loss.
+
+        Args:
+            *args: Flat parameter sequence followed by ``x`` and ``y``.
+
+        Returns:
+            Scalar MSE loss.
+        """
         *stage_params, x, y = args
         h = x
         for i in range(0, len(stage_params), 2):
@@ -106,7 +148,19 @@ def bench_spmd(params, d: int, n_stages: int, batch: int, mb: int, schedule, ite
     mesh = MpMdMesh(Mesh(devices, axis_names=("pp",)), "pp")
 
     def make_stage_fn(w, b):
+        """Create a stage function for SPMD pipeline_call."""
+
         def stage_fn(params, state, x):
+            """One pipeline stage: ReLU linear transform.
+
+            Args:
+                params: ``(w, b)`` tuple.
+                state: Unused stage state.
+                x: Input tensor.
+
+            Returns:
+                ``(output, state)`` tuple.
+            """
             w, b = params
             return jnp.maximum(x @ w + b, 0), state
 
@@ -119,6 +173,15 @@ def bench_spmd(params, d: int, n_stages: int, batch: int, mb: int, schedule, ite
     )
 
     def loss_fn(out, target):
+        """MSE loss for the final stage output.
+
+        Args:
+            out: Model output tensor.
+            target: Target tensor.
+
+        Returns:
+            Scalar MSE.
+        """
         return jnp.mean((out - target) ** 2)
 
     x, y = _dummy_batch(batch, d, 0)
@@ -179,6 +242,7 @@ def bench_single_device(params, d: int, batch: int, iters: int):
 
 
 def main(argv: list[str] | None = None):
+    """CLI entry point — parse args, run benchmarks, print table."""
     parser = argparse.ArgumentParser(description="sxjit vs SPMD benchmark")
     parser.add_argument("--n-stages", type=int, default=4)
     parser.add_argument("--d-model", type=int, default=512)

@@ -140,6 +140,13 @@ def _expand_mesh_axis(axis: str | tuple[str | None, ...] | None) -> tuple[str, .
     element tuple, and a tuple is returned with ``None`` entries
     filtered out. Used to normalize the result of a logical->mesh
     rule lookup before re-packaging into a partition spec.
+
+    Args:
+        axis: A mesh-axis name, a tuple of names (with possible
+            ``None`` entries), or ``None``.
+
+    Returns:
+        A tuple of concrete mesh-axis strings (no ``None`` entries).
     """
     if axis is None:
         return ()
@@ -158,6 +165,14 @@ def _resolve_axis_name(
     axis) recurse, concatenate, and trim back to a string when only
     one mesh axis survives. ``None`` and empty results collapse to
     ``None`` (replicated).
+
+    Args:
+        axis: A single logical axis name or a tuple of fused names.
+        mesh_map: Mapping from logical axis name to physical mesh
+            axis specification.
+
+    Returns:
+        The resolved mesh-axis entry, or ``None`` for replication.
     """
     if axis is None:
         return None
@@ -182,5 +197,14 @@ def _resolve_axis_names(
     axis_names: AxisNames,
     mesh_map: Mapping[str, str | tuple[str | None, ...] | None],
 ) -> tuple[MeshAxisEntry, ...]:
-    """Vector form of :func:`_resolve_axis_name` over a per-dim axis tuple."""
+    """Vector form of :func:`_resolve_axis_name` over a per-dim axis tuple.
+
+    Args:
+        axis_names: Per-dimension logical axis annotations.
+        mesh_map: Mapping from logical axis name to physical mesh
+            axis specification.
+
+    Returns:
+        A tuple of resolved mesh-axis entries, one per dimension.
+    """
     return tuple(_resolve_axis_name(axis, mesh_map) for axis in axis_names)

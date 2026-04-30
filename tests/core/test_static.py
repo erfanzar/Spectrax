@@ -97,6 +97,8 @@ def test_is_static_scalar_rejects_arbitrary_object():
     """Arbitrary user objects are not static."""
 
     class Bag:
+        """Fixture class for testing."""
+
         pass
 
     assert not is_static_scalar(Bag())

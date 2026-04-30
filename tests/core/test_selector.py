@@ -145,11 +145,13 @@ def test_apply_deduplicates_shared_variables():
         """Module with a tied parameter."""
 
         def __init__(self):
+            """Initialize with a, b."""
             super().__init__()
             self.a = Parameter(jnp.zeros(2))
             self.b = self.a
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = Tied()
@@ -216,6 +218,7 @@ def test_as_selector_callable_becomes_variable_predicate():
     """A callable becomes a variable predicate."""
 
     def pred(v, p):
+        """Predicate helper."""
         return True
 
     s = as_selector(pred)
@@ -232,6 +235,7 @@ def test_selector_predicate_exception_wraps_as_selector_error(fixture):
     """If a predicate raises, the error is wrapped in :class:`SelectorError`."""
 
     def bad(_v, _p):
+        """Bad input helper."""
         raise RuntimeError("oops")
 
     with pytest.raises(SelectorError):

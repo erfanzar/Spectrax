@@ -142,6 +142,7 @@ class TestTreeDeserializeLeaves:
         tree_serialize_leaves(tmp_checkpoint_dir, tree, prefix="model")
 
         def double(arr, key):
+            """Double the input."""
             return arr * 2
 
         result = tree_deserialize_leaves(
@@ -158,63 +159,78 @@ class TestSerializationHelpers:
     """Tests for individual helper functions in serialization.py."""
 
     def test_join_key_both_none(self):
+        """Join key both none."""
         assert join_key(None, None) == ""
 
     def test_join_key_prefix_only(self):
+        """Join key prefix only."""
         assert join_key("model", None) == "model"
 
     def test_join_key_key_only(self):
+        """Join key key only."""
         assert join_key(None, "weight") == "weight"
 
     def test_join_key_both(self):
+        """Join key both."""
         assert join_key("model", "weight") == "model.weight"
 
     def test_is_array_like_array(self):
+        """Is array like array."""
         assert is_array_like(jnp.ones(2)) is True
 
     def test_is_array_like_scalar(self):
+        """Is array like scalar."""
         assert is_array_like(42) is False
 
     def test_is_array_like_string(self):
+        """Is array like string."""
         assert is_array_like("hello") is False
 
     def test_leaf_key_paths_simple_dict(self):
+        """Leaf key paths simple dict."""
         tree = {"a": 1, "b": 2}
         result = leaf_key_paths(tree, prefix="model")
         assert result == {"a": "model.a", "b": "model.b"}
 
     def test_leaf_key_paths_nested(self):
+        """Leaf key paths nested."""
         tree = {"layer": {"w": 1, "b": 2}}
         result = leaf_key_paths(tree, prefix="model")
         assert result == {"layer": {"w": "model.layer.w", "b": "model.layer.b"}}
 
     def test_leaf_key_paths_empty_prefix(self):
+        """Leaf key paths empty prefix."""
         tree = {"a": 1}
         result = leaf_key_paths(tree, prefix="")
         assert result == {"a": "a"}
 
     def test_fs_paths_from_key_paths(self):
+        """Fs paths from key paths."""
         tree = {"a": "model.a", "b": {"c": "model.b.c"}}
         result = _fs_paths_from_key_paths("/ckpt", tree)
         assert result == {"a": "/ckpt/model/a", "b": {"c": "/ckpt/model/b/c"}}
 
     def test_fully_replicated_sharding_with_mesh(self, mesh):
+        """Fully replicated sharding with mesh."""
         sh = _fully_replicated_sharding(mesh)
         assert isinstance(sh, NamedSharding)
         assert sh.spec == PartitionSpec()
 
     def test_fully_replicated_sharding_no_mesh(self):
+        """Fully replicated sharding no mesh."""
         sh = _fully_replicated_sharding(None)
         from jax.sharding import SingleDeviceSharding
 
         assert isinstance(sh, SingleDeviceSharding)
 
     def test_sharding_from_leaf_with_sharding(self, mesh):
+        """Sharding from leaf with sharding."""
         arr = jax.device_put(jnp.ones(2), NamedSharding(mesh, PartitionSpec()))
         sh = _sharding_from_leaf(arr, mesh)
         assert sh == arr.sharding
 
     def test_sharding_from_leaf_array(self, mesh):
+        """Sharding from leaf array."""
         arr = jnp.ones(2)
         sh = _sharding_from_leaf(arr, mesh)
         from jax.sharding import SingleDeviceSharding
@@ -222,11 +238,13 @@ class TestSerializationHelpers:
         assert isinstance(sh, (NamedSharding, SingleDeviceSharding))
 
     def test_sharding_from_leaf_scalar(self, mesh):
+        """Sharding from leaf scalar."""
         sh = _sharding_from_leaf(3.14, mesh)
         assert isinstance(sh, NamedSharding)
         assert sh.spec == PartitionSpec()
 
     def test_sharding_from_leaf_unknown(self, mesh):
+        """Sharding from leaf unknown."""
         sh = _sharding_from_leaf("hello", mesh)
         assert sh is None
 

@@ -102,6 +102,7 @@ def test_dense_general_gradient_flows():
     x = jnp.ones((1, 2))
 
     def loss(W):
+        """Compute the loss."""
         layer.weight.value = W
         return layer(x).sum()
 

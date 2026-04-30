@@ -51,7 +51,7 @@ def join_key(prefix: str | None, k: str | None) -> str:
         k: Optional key string.
 
     Returns:
-        Joined string with dot separator, or empty string if both are None.
+        Joined string with dot separator, or empty string if both are ``None``.
     """
     if not k:
         return prefix or ""
@@ -61,9 +61,9 @@ def join_key(prefix: str | None, k: str | None) -> str:
 def _keyentry_to_str(path_elem: Any) -> str:
     """Convert a JAX tree path element to a string representation.
 
-    Handles various JAX tree path element types including DictKey, SequenceKey,
-    GetAttrKey, and FlattenedIndexKey. Falls back to string conversion and
-    cleaning for unknown types.
+    Handles various JAX tree path element types including ``DictKey``,
+    ``SequenceKey``, ``GetAttrKey``, and ``FlattenedIndexKey``. Falls back
+    to string conversion and cleaning for unknown types.
 
     Args:
         path_elem: A JAX tree path element.
@@ -99,8 +99,9 @@ def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[A
     """Create dotted key paths for each leaf in a pytree.
 
     Returns a pytree of the same structure where each leaf is replaced by its
-    key path (prefixed by `prefix` if provided). Uses jax.tree_util.tree_flatten_with_path
-    for robust handling of dicts, sequences, dataclasses, namedtuples, and custom PyTree nodes.
+    key path (prefixed by *prefix* if provided). Uses
+    :func:`jax.tree_util.tree_flatten_with_path` for robust handling of dicts,
+    sequences, dataclasses, namedtuples, and custom PyTree nodes.
 
     Args:
         pytree: The pytree to create key paths for.
@@ -108,11 +109,20 @@ def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[A
         is_leaf: Optional function to determine if a node is a leaf.
 
     Returns:
-        PyTree with same structure where leaves are replaced by their dotted key paths.
+        PyTree with same structure where leaves are replaced by their dotted
+        key paths.
     """
     path_value_pairs, treedef = jtu.tree_flatten_with_path(pytree, is_leaf=is_leaf)
 
     def path_to_str(path: Sequence[Any]) -> str:
+        """Convert a JAX tree path to a dotted string.
+
+        Args:
+            path: Sequence of key entries from ``jax.tree_util``.
+
+        Returns:
+            Dotted key path string.
+        """
         if not path:
             return prefix or ""
         parts = [_keyentry_to_str(pe) for pe in path]
@@ -125,25 +135,27 @@ def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[A
 def is_array_like(x: Any) -> bool:
     """Check if an object is array-like.
 
-    Minimal check similar to equinox.is_array_like, checking for shape and dtype attributes.
+    Minimal check similar to ``equinox.is_array_like``, checking for ``shape``
+    and ``dtype`` attributes.
 
     Args:
         x: Object to check.
 
     Returns:
-        True if object has both shape and dtype attributes, False otherwise.
+        ``True`` if the object has both ``shape`` and ``dtype`` attributes,
+        ``False`` otherwise.
     """
     return hasattr(x, "shape") and hasattr(x, "dtype")
 
 
 def _is_none(x):
-    """Check if a value is None.
+    """Check if a value is ``None``.
 
     Args:
         x: Value to check.
 
     Returns:
-        True if x is None, False otherwise.
+        ``True`` if *x* is ``None``, ``False`` otherwise.
     """
     return x is None
 
@@ -165,17 +177,19 @@ def tree_serialize_leaves(
     Args:
         checkpoint_dir: Directory to save the checkpoint.
         pytree: PyTree structure containing arrays to serialize.
-        manager: Optional GlobalAsyncCheckpointManager. If None, creates a new one.
-        prefix: Optional prefix for organizing arrays (e.g., 'model', 'optimizer').
+        manager: Optional :class:`GlobalAsyncCheckpointManager`. If ``None``,
+            creates a new one.
+        prefix: Optional prefix for organizing arrays (e.g., ``"model"``,
+            ``"optimizer"``).
         commit_callback: Optional callback to run after committing the checkpoint.
         write_index: Whether to write an index file for the checkpoint.
 
     Returns:
-        None
+        ``None``
 
     Note:
-        Uses a unified index file (tensorstore_index.json) that supports multiple
-        prefixes in version 2.0 format.
+        Uses a unified index file (``tensorstore_index.json``) that supports
+        multiple prefixes in version 2.0 format.
     """
     if manager is None:
         manager = array_ser.GlobalAsyncCheckpointManager(timeout_secs=GLOBAL_CHECKPOINT_TIMEOUT)
@@ -191,6 +205,8 @@ def tree_serialize_leaves(
 
     @dataclass
     class Pair:
+        """Simple pair of a filesystem path and a pytree leaf."""
+
         path: str
         leaf: Any
 
@@ -257,8 +273,9 @@ def tree_serialize_leaves(
 def _fs_paths_from_key_paths(checkpoint_dir, leaf_path):
     """Convert dotted key paths to filesystem paths for TensorStore serialization.
 
-    Takes a PyTree of dotted key paths (e.g., "model.layers.0.weight") and converts
-    each to a filesystem path by replacing dots with directory separators.
+    Takes a PyTree of dotted key paths (e.g., ``"model.layers.0.weight"``)
+    and converts each to a filesystem path by replacing dots with directory
+    separators.
 
     Args:
         checkpoint_dir: Base directory for checkpoint. All paths will be relative
@@ -278,6 +295,14 @@ def _fs_paths_from_key_paths(checkpoint_dir, leaf_path):
     """
 
     def path_from_key_path(key_path):
+        """Convert a dotted key path to a filesystem path under checkpoint_dir.
+
+        Args:
+            key_path: Dotted key path string.
+
+        Returns:
+            Absolute filesystem path for the key.
+        """
         path = checkpoint_dir
         for part in key_path.split("."):
             path = _fs.joinpath(path, part)
@@ -291,17 +316,18 @@ def _fully_replicated_sharding(mesh: Mesh | None) -> Sharding:
     """Create a fully replicated sharding for arrays.
 
     Creates a sharding specification that replicates data across all devices.
-    If a mesh is provided, uses NamedSharding with empty PartitionSpec.
-    Otherwise, falls back to single device sharding on the first device.
+    If a mesh is provided, uses :class:`NamedSharding` with an empty
+    :class:`PartitionSpec`. Otherwise, falls back to single-device sharding on
+    the first device.
 
     Args:
-        mesh: Optional JAX mesh for distributed computation. If None, uses
-            single device sharding on jax.devices()[0].
+        mesh: Optional JAX mesh for distributed computation. If ``None``, uses
+            single device sharding on ``jax.devices()[0]``.
 
     Returns:
-        Sharding specification that replicates data:
-        - NamedSharding with PartitionSpec() if mesh is provided
-        - SingleDeviceSharding if mesh is None
+        A :class:`jax.sharding.Sharding` that replicates data:
+        * :class:`NamedSharding` with :class:`PartitionSpec` ``()`` if *mesh* is provided
+        * :class:`SingleDeviceSharding` if *mesh* is ``None``
 
     Note:
         Fully replicated shardings are commonly used for small arrays that
@@ -317,22 +343,23 @@ def _sharding_from_leaf(leaf, mesh) -> Sharding | None:
     """Determine appropriate sharding for a leaf value in a PyTree.
 
     Examines a leaf value and returns the most appropriate sharding specification:
-    1. If the leaf already has a sharding attribute, use that
-    2. If it's an array-like object, use fully replicated sharding
-    3. If it's a scalar type, use fully replicated sharding
-    4. Otherwise, return None and log a warning
+
+    1. If the leaf already has a ``sharding`` attribute, use that.
+    2. If it is an array-like object, use fully replicated sharding.
+    3. If it is a scalar type, use fully replicated sharding.
+    4. Otherwise, return ``None`` and log a warning.
 
     Args:
         leaf: Leaf value from a pytree. Can be a JAX array, numpy array,
             scalar, or other types.
         mesh: JAX mesh for distributed computation. Used to create
-            NamedSharding for replicated arrays.
+            :class:`NamedSharding` for replicated arrays.
 
     Returns:
-        Appropriate Sharding for the leaf:
-        - The leaf's existing sharding if it has one
-        - Fully replicated sharding for arrays and scalars
-        - None for unknown types (logged as warning)
+        Appropriate :class:`jax.sharding.Sharding` for the leaf:
+        * The leaf's existing sharding if it has one
+        * Fully replicated sharding for arrays and scalars
+        * ``None`` for unknown types (logged as warning)
 
     Note:
         This function is used during checkpoint loading to determine how
@@ -364,16 +391,18 @@ def tree_deserialize_leaves(
     """Deserialize a PyTree of arrays from a TensorStore checkpoint.
 
     If pytree is provided, returns a pytree with the same structure as the template.
-    If pytree is None, discovers the structure from the checkpoint directory.
+    If pytree is ``None``, discovers the structure from the checkpoint directory.
 
     Args:
         checkpoint_dir: Directory containing the TensorStore checkpoint.
         mesh: Optional JAX mesh for distributed arrays.
-        manager: Optional GlobalAsyncCheckpointManager. If None, creates a new one.
-        prefix: Optional prefix to filter/load specific tree (e.g., 'model', 'optimizer').
-        sharding_rules: Sequence of (regex_pattern, NamedSharding) pairs for
+        manager: Optional :class:`GlobalAsyncCheckpointManager`. If ``None``,
+            creates a new one.
+        prefix: Optional prefix to filter/load specific tree (e.g., ``"model"``,
+            ``"optimizer"``).
+        sharding_rules: Sequence of ``(regex_pattern, NamedSharding)`` pairs for
             automatic sharding assignment based on key path matching.
-        shardings: sharding specifications matching checkpoint structure.
+        shardings: Sharding specifications matching checkpoint structure.
         callback: Optional callback to process each loaded array by key.
         chunk_size: Optional number of arrays to load per batch. If set, loads in
             chunks and waits between batches to reduce peak memory usage.

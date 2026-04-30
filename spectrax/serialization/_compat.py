@@ -51,11 +51,13 @@ def flatten_dict(
             raise TypeError(f"expected dict or Mapping; got {type(xs)}")
 
     def _key(path: tuple) -> tuple | str:
+        """Format *path* as a tuple or a ``sep``-joined string."""
         if sep is None:
             return path
         return sep.join(str(p) for p in path)
 
     def _flatten(obj: tp.Any, prefix: tuple) -> dict:
+        """Recursively flatten *obj*, emitting ``{_key(prefix): obj}`` at leaves."""
         if not isinstance(obj, dict) or (is_leaf and is_leaf(prefix, obj)):
             return {_key(prefix): obj}
         result: dict = {}

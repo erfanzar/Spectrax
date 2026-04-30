@@ -33,7 +33,7 @@ Top-level re-exports
 This module re-exports the MPMD entry points (:func:`sxcall`,
 :func:`sxjit`, :func:`sxgrad`, :func:`sxvalue_and_grad`,
 :func:`sxloop`, :func:`sxenter_loop`, :func:`sxexit_loop`,
-:func:`sxstage_iter`) and every schedule class plus the fusion
+:func:`sxstage_region`, :func:`sxstage_iter`) and every schedule class plus the fusion
 helpers, so users typically only need ``from spectrax.runtime import
 ...``.
 """
@@ -48,6 +48,7 @@ from .mpmd import (
     sxjit,
     sxloop,
     sxstage_iter,
+    sxstage_region,
     sxvalue_and_grad,
 )
 from .schedules import (
@@ -93,5 +94,6 @@ __all__ = (
     "sxjit",
     "sxloop",
     "sxstage_iter",
+    "sxstage_region",
     "sxvalue_and_grad",
 )

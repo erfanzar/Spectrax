@@ -30,10 +30,12 @@ class _Accum(Module):
     acc: Buffer
 
     def __init__(self) -> None:
+        """Initialize with acc."""
         super().__init__()
         self.acc = Buffer(jnp.zeros(()), kind="batch_stats")
 
     def forward(self, x):
+        """Run the forward pass."""
         return x
 
 
@@ -93,9 +95,11 @@ def test_while_loop_counter_no_mutation():
     m = Linear(2, 3, rngs=Rngs(0))
 
     def cond_fn(_mod, uc):
+        """Condition function."""
         return uc < 5
 
     def body_fn(_mod, uc):
+        """Body function for loop/cond."""
         return uc + 1
 
     final = while_loop(cond_fn, body_fn, m, 0)
@@ -107,6 +111,7 @@ def test_fori_loop_accumulates_counter():
     m = Linear(2, 3, rngs=Rngs(0))
 
     def body_fn(i, _mod, uc):
+        """Body function for loop/cond."""
         return uc + i
 
     total = fori_loop(0, 5, body_fn, m, jnp.int32(0))
@@ -118,6 +123,7 @@ def test_fori_loop_with_batch_stats_mutation():
     m = _Accum()
 
     def body(i, mod, uc):
+        """Loop body function."""
         mod.acc.value = mod.acc.value + jnp.float32(i)
         return uc + 1
 
@@ -131,6 +137,7 @@ def test_remat_scan_matches_scan_numerics():
     xs = jnp.arange(4 * 3.0).reshape((4, 3))
 
     def fn(mod, x):
+        """Helper function."""
         return mod(x)
 
     y_scan = scan(fn, m, xs)
@@ -144,17 +151,21 @@ def test_remat_scan_gradient_matches_scan():
     xs = jnp.ones((3, 2))
 
     def loss_plain(W):
+        """loss_plain helper."""
         m.weight.value = W
 
         def fn(mod, x):
+            """Helper function."""
             return mod(x).sum()
 
         return scan(fn, m, xs).sum()
 
     def loss_remat(W):
+        """loss_remat helper."""
         m.weight.value = W
 
         def fn(mod, x):
+            """Helper function."""
             return mod(x).sum()
 
         return remat_scan(fn, m, xs).sum()
@@ -170,10 +181,12 @@ def test_cond_carries_batch_stats_mutation_when_mutable():
     m = _Accum()
 
     def on_true(mod, x):
+        """True branch handler."""
         mod.acc.value = mod.acc.value + x
         return x
 
     def on_false(mod, _x):
+        """False branch handler."""
         return jnp.float32(0.0)
 
     cond(jnp.bool_(True), on_true, on_false, m, jnp.float32(3.0), mutable="batch_stats")
@@ -185,9 +198,11 @@ def test_while_loop_mutates_batch_stats_when_allowed():
     m = _Accum()
 
     def cond_fn(_mod, uc):
+        """Condition function."""
         return uc < 3
 
     def body_fn(mod, uc):
+        """Body function for loop/cond."""
         mod.acc.value = mod.acc.value + 1.0
         return uc + 1
 

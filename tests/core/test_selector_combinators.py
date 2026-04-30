@@ -27,6 +27,7 @@ class _Tower(Module):
     """Module with a Linear + BatchNorm submodule for selector testing."""
 
     def __init__(self, rngs):
+        """Initialize with fc, bn."""
         super().__init__()
         self.fc = Linear(4, 4, rngs=rngs)
         self.bn = BatchNorm1d(4)

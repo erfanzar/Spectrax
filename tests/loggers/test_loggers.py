@@ -16,7 +16,10 @@ from spectrax.loggers.base import _NullBackend
 
 
 class TestNullBackend:
+    """Fixture class for testing."""
+
     def test_null_backend_is_noop(self):
+        """Null backend is noop."""
         b = _NullBackend()
         b.log_scalar("x", 1.0, step=0)
         b.log_histogram("x", np.array([1, 2, 3]), step=0)
@@ -28,7 +31,10 @@ class TestNullBackend:
 
 
 class TestConsoleBackend:
+    """Fixture class for testing."""
+
     def test_console_scalar(self, capsys):
+        """Console scalar."""
         b = ConsoleBackend(prefix="[TEST]")
         b.log_scalar("loss", 0.5, step=10)
         captured = capsys.readouterr()
@@ -38,12 +44,14 @@ class TestConsoleBackend:
         assert "step=" in captured.out and "10" in captured.out
 
     def test_console_histogram_is_silently_ignored(self, capsys):
+        """Console histogram is silently ignored."""
         b = ConsoleBackend()
         b.log_histogram("weights", np.array([1.0, 2.0, 3.0]), step=5)
         captured = capsys.readouterr()
         assert captured.out == ""
 
     def test_console_image(self, capsys):
+        """Console image."""
         b = ConsoleBackend()
         b.log_image("img", np.zeros((64, 64, 3)), step=1)
         captured = capsys.readouterr()
@@ -52,6 +60,7 @@ class TestConsoleBackend:
         assert "(64, 64, 3)" in captured.out
 
     def test_console_text(self, capsys):
+        """Console text."""
         b = ConsoleBackend()
         b.log_text("sample", "hello world", step=2)
         captured = capsys.readouterr()
@@ -59,6 +68,7 @@ class TestConsoleBackend:
         assert "hello world" in captured.out
 
     def test_console_hparams(self, capsys):
+        """Console hparams."""
         b = ConsoleBackend()
         b.log_hparams({"lr": 0.001, "batch_size": 32})
         captured = capsys.readouterr()
@@ -71,22 +81,28 @@ class TestConsoleBackend:
 
 
 class TestLogger:
+    """Fixture class for testing."""
+
     def test_logger_with_no_backends_uses_null(self):
+        """Logger with no backends uses null."""
         logger = Logger([])
         logger.log_scalar("x", 1.0, step=0)
         logger.close()
 
     def test_logger_multiplexes(self, capsys):
+        """Logger multiplexes."""
         logger = Logger([ConsoleBackend(), ConsoleBackend()])
         logger.log_scalar("loss", 0.42, step=100)
         captured = capsys.readouterr()
         assert captured.out.count("loss") == 2
 
     def test_logger_context_manager(self):
+        """Logger context manager."""
         with Logger([ConsoleBackend()]) as logger:
             logger.log_scalar("x", 1.0, step=0)
 
     def test_logger_auto_flush(self):
+        """Logger auto flush."""
         backend = MagicMock()
         logger = Logger([backend], auto_flush=True)
         logger.log_scalar("x", 1.0, step=0)
@@ -94,6 +110,7 @@ class TestLogger:
         logger.close()
 
     def test_logger_no_auto_flush(self):
+        """Logger no auto flush."""
         backend = MagicMock()
         logger = Logger([backend], auto_flush=False)
         logger.log_scalar("x", 1.0, step=0)
@@ -101,6 +118,7 @@ class TestLogger:
         logger.close()
 
     def test_logger_closed_is_noop(self):
+        """Logger closed is noop."""
         backend = MagicMock()
         logger = Logger([backend])
         logger.close()
@@ -108,8 +126,13 @@ class TestLogger:
         backend.log_scalar.assert_not_called()
 
     def test_logger_handles_backend_exception(self, capsys):
+        """Logger handles backend exception."""
+
         class BrokenBackend(ConsoleBackend):
+            """Fixture class for testing."""
+
             def log_scalar(self, tag, value, step):
+                """Log a scalar value."""
                 raise RuntimeError("boom")
 
         logger = Logger([BrokenBackend()])
@@ -117,6 +140,7 @@ class TestLogger:
         logger.close()
 
     def test_logger_flush_and_close_called(self):
+        """Logger flush and close called."""
         backend = MagicMock()
         logger = Logger([backend], auto_flush=False)
         logger.flush()
@@ -125,6 +149,7 @@ class TestLogger:
         assert backend.close.call_count == 1
 
     def test_logger_all_methods_dispatch(self):
+        """Logger all methods dispatch."""
         backend = MagicMock()
         logger = Logger([backend], auto_flush=False)
         logger.log_scalar("s", 1.0, step=0)
@@ -162,6 +187,7 @@ class TestLogger:
         logger.close()
 
     def test_logger_log_table_console_is_silently_ignored(self, capsys):
+        """Logger log table console is silently ignored."""
         logger = Logger([ConsoleBackend()], auto_flush=False)
         logger.log_table("preview", ["step", "prompt"], [[1, "hello"], [2, "world"]], step=10)
         captured = capsys.readouterr()
@@ -170,7 +196,10 @@ class TestLogger:
 
 
 class TestTensorBoardBackend:
+    """Fixture class for testing."""
+
     def test_creates_log_dir(self, tmp_path):
+        """Creates log dir."""
         log_dir = tmp_path / "nested" / "tb"
         assert not log_dir.exists()
         backend = TensorBoardBackend(log_dir)
@@ -178,6 +207,7 @@ class TestTensorBoardBackend:
         backend.close()
 
     def test_writes_event_file(self, tmp_path):
+        """Writes event file."""
         backend = TensorBoardBackend(tmp_path)
         backend.log_scalar("loss", 0.5, step=10)
         backend.close()
@@ -187,6 +217,7 @@ class TestTensorBoardBackend:
         assert files[0].stat().st_size > 0
 
     def test_flush_and_close(self, tmp_path):
+        """Flush and close."""
         backend = TensorBoardBackend(tmp_path)
         backend.log_scalar("x", 1.0, step=0)
         backend.flush()
@@ -194,6 +225,7 @@ class TestTensorBoardBackend:
         assert backend._file is None or backend._file.closed
 
     def test_histogram(self, tmp_path):
+        """Histogram."""
         backend = TensorBoardBackend(tmp_path)
         backend.log_histogram("weights", np.random.default_rng(0).standard_normal(100), step=5)
         backend.close()
@@ -202,6 +234,7 @@ class TestTensorBoardBackend:
         assert files[0].stat().st_size > 0
 
     def test_text(self, tmp_path):
+        """Text."""
         backend = TensorBoardBackend(tmp_path)
         backend.log_text("sample", "hello world", step=1)
         backend.close()
@@ -211,12 +244,16 @@ class TestTensorBoardBackend:
 
 
 class TestWandBBackend:
+    """Fixture class for testing."""
+
     def test_requires_wandb(self):
+        """Requires wandb."""
         with patch("spectrax.loggers.wandb._WANDB_AVAILABLE", False):
             with pytest.raises(RuntimeError, match="WandBBackend requires wandb"):
                 WandBBackend()
 
     def test_logs_scalar(self):
+        """Logs scalar."""
         mock_run = MagicMock()
         mock_wandb = MagicMock()
         mock_wandb.run = mock_run
@@ -234,6 +271,7 @@ class TestWandBBackend:
                     backend.close()
 
     def test_histogram(self):
+        """Histogram."""
         mock_run = MagicMock()
         mock_wandb = MagicMock()
         mock_wandb.run = mock_run
@@ -248,6 +286,7 @@ class TestWandBBackend:
                 backend.close()
 
     def test_log_hparams(self):
+        """Log hparams."""
         mock_run = MagicMock()
         mock_wandb = MagicMock()
         mock_wandb.run = mock_run
@@ -262,6 +301,8 @@ class TestWandBBackend:
 
 
 class TestLoggerIntegration:
+    """Fixture class for testing."""
+
     def test_jax_array_histogram(self):
         """Histogram logging should accept JAX arrays."""
         backend = MagicMock()

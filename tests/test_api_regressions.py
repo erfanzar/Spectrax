@@ -17,6 +17,7 @@ class _Identity(spx.Module):
     """Small module for API validation tests."""
 
     def forward(self, x):
+        """Run the forward pass."""
         return x
 
 
@@ -24,10 +25,12 @@ class _Weighted(spx.Module):
     """Small stateful module for API state-placement regressions."""
 
     def __init__(self):
+        """Initialize with w."""
         super().__init__()
         self.w = spx.Parameter(jnp.asarray(1.0))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x * self.w.value
 
 
@@ -107,6 +110,7 @@ def test_mpmd_default_schedule_forwards_runtime_flags(monkeypatch):
     seen = {}
 
     def fake_sxcall(*_args, **kwargs):
+        """Fake sxcall for monkeypatching."""
         seen.update(kwargs)
         return "ok"
 

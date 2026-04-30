@@ -19,11 +19,13 @@ class _MLP(Module):
     """Small two-layer MLP for table tests."""
 
     def __init__(self, rngs):
+        """Initialize with fc1, fc2."""
         super().__init__()
         self.fc1 = Linear(4, 8, rngs=rngs)
         self.fc2 = Linear(8, 2, rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         return self.fc2(self.fc1(x))
 
 

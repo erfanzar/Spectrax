@@ -25,6 +25,17 @@ _KIND_COLORS: dict[str, str] = {
 
 
 def _fmt_number(v: float) -> str:
+    """Format a float compactly for console output.
+
+    Uses scientific notation for very large or very small values;
+    otherwise uses ``g`` formatting with up to 6 significant digits.
+
+    Args:
+        v: The number to format.
+
+    Returns:
+        A compact string representation.
+    """
     if abs(v) >= 1e4 or (abs(v) < 1e-3 and v != 0):
         return f"{v:.4e}"
     return f"{v:.6g}"
@@ -42,9 +53,22 @@ class ConsoleBackend(BaseBackend):
     """
 
     def __init__(self, prefix: str = ""):
+        """Initialize the console backend.
+
+        Args:
+            prefix: Optional string printed before every line.
+        """
         self._prefix = prefix
 
     def _print(self, kind: str, tag: str, value: str, step: int) -> None:
+        """Emit a single coloured log line to ``stdout``.
+
+        Args:
+            kind: Metric kind (e.g. ``"scalar"``, ``"image"``).
+            tag: Metric identifier.
+            value: Pre-formatted value string.
+            step: Training step.
+        """
         ts = datetime.now().strftime("%H:%M:%S")
         color = _KIND_COLORS.get(kind, COLORS["RESET"])
         reset = COLORS["RESET"]
@@ -60,6 +84,13 @@ class ConsoleBackend(BaseBackend):
         print(line, file=sys.stdout, flush=True)
 
     def log_scalar(self, tag: str, value: Scalar, step: int) -> None:
+        """Print a scalar to stdout with colour.
+
+        Args:
+            tag: Metric identifier.
+            value: Scalar numeric value.
+            step: Training step.
+        """
         self._print("scalar", tag, _fmt_number(float(value)), step)
 
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
@@ -67,15 +98,34 @@ class ConsoleBackend(BaseBackend):
         pass
 
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
+        """Print image shape and dtype to stdout.
+
+        Args:
+            tag: Image identifier.
+            image: Image array.
+            step: Training step.
+        """
         arr = np.asarray(image)
         val_str = f"shape={arr.shape}  dtype={arr.dtype}"
         self._print("image", tag, val_str, step)
 
     def log_text(self, tag: str, text: str, step: int) -> None:
+        """Print text to stdout, clipped to 120 characters.
+
+        Args:
+            tag: Text identifier.
+            text: String content.
+            step: Training step.
+        """
         clipped = text[:120] + ("…" if len(text) > 120 else "")
         self._print("text", tag, repr(clipped), step)
 
     def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+        """Print hyper-parameters as a key-value list.
+
+        Args:
+            hparams: Dictionary of hyper-parameters.
+        """
         ts = datetime.now().strftime("%H:%M:%S")
         color = _KIND_COLORS["hparams"]
         reset = COLORS["RESET"]
@@ -91,7 +141,9 @@ class ConsoleBackend(BaseBackend):
         pass
 
     def flush(self) -> None:
+        """No-op — stdout is already flushed per-line."""
         pass
 
     def close(self) -> None:
+        """No-op."""
         pass

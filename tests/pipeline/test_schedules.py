@@ -35,6 +35,7 @@ def _count_phase(grid, n, phase):
 
 
 def _iter_actions_in_cell(cell):
+    """Iterate actions in a schedule cell."""
     if cell is None:
         return ()
     if isinstance(cell, FusedTask):

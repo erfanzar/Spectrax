@@ -14,15 +14,20 @@ from spectrax.runtime.types import MpMdMesh
 
 
 class _Block(spx.Module):
+    """Helper block module for testing."""
+
     def __init__(self, d, *, rngs):
+        """Initialize with fc."""
         super().__init__()
         self.fc = nn.Linear(d, d, rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         return jax.nn.relu(self.fc(x))
 
 
 def _make_mesh(n=2):
+    """Create a test mesh."""
     devices = jax.devices()[:n] if len(jax.devices()) >= n else jax.devices() * n
     devices = devices[:n]
     return MpMdMesh(Mesh(np.array(devices), ("mpmd",)), "mpmd")
@@ -36,6 +41,7 @@ def test_static_argnums_basic():
 
     @sxjit(mesh=mesh, static_argnums=(2,))
     def forward(model, x, scale):
+        """Run the forward pass."""
         x = model[0].forward(x)
         x = sxstage_iter(x)
         x = model[1].forward(x)
@@ -56,6 +62,7 @@ def test_donate_argnums_basic():
 
     @sxjit(mesh=mesh, donate_argnums=(1,))
     def forward(model, x):
+        """Run the forward pass."""
         x = model[0].forward(x)
         x = sxstage_iter(x)
         x = model[1].forward(x)
@@ -76,6 +83,7 @@ def test_static_and_donate_combined():
 
     @sxjit(mesh=mesh, static_argnums=(2,), donate_argnums=(1,))
     def forward(model, x, scale):
+        """Run the forward pass."""
         x = model[0].forward(x)
         x = sxstage_iter(x)
         x = model[1].forward(x)
@@ -96,6 +104,7 @@ def test_legacy_path_still_works():
 
     @sxjit(mesh=mesh)
     def forward(model, x):
+        """Run the forward pass."""
         x = model[0].forward(x)
         x = sxstage_iter(x)
         x = model[1].forward(x)
@@ -114,6 +123,7 @@ def test_mpmd_call_static_targets():
     model = PipelineSequential(*[_Block(4, rngs=rngs) for _ in range(2)])
 
     def loss_fn(y, target):
+        """Compute the loss."""
         return ((y - target) ** 2).mean()
 
     x = jnp.ones((4, 4))
@@ -140,6 +150,7 @@ def test_mpmd_call_donate_targets():
     model = PipelineSequential(*[_Block(4, rngs=rngs) for _ in range(2)])
 
     def loss_fn(y, target):
+        """Compute the loss."""
         return ((y - target) ** 2).mean()
 
     x = jnp.ones((4, 4))
@@ -166,6 +177,7 @@ def test_mpmd_call_static_and_donate():
     model = PipelineSequential(*[_Block(4, rngs=rngs) for _ in range(2)])
 
     def loss_fn(y, target, scale):
+        """Compute the loss."""
         return ((y - target) ** 2).mean() * scale
 
     x = jnp.ones((4, 4))
@@ -216,6 +228,7 @@ def test_mpmd_call_train_donate_input_raises():
     model = PipelineSequential(*[_Block(4, rngs=rngs) for _ in range(2)])
 
     def loss_fn(y, target):
+        """Compute the loss."""
         return ((y - target) ** 2).mean()
 
     x = jnp.ones((4, 4))
@@ -243,6 +256,7 @@ def test_mpmd_call_static_input_raises():
     model = PipelineSequential(*[_Block(4, rngs=rngs) for _ in range(2)])
 
     def loss_fn(y, target):
+        """Compute the loss."""
         return ((y - target) ** 2).mean()
 
     x = jnp.ones((4, 4))

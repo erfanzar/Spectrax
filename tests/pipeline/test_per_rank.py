@@ -56,6 +56,7 @@ class TestCompilePerRankFwd:
         sch = GPipe(microbatches=4)
 
         def fwd(params, rest, x):
+            """Forward pass helper."""
             return x * params["w"]
 
         program = compile_per_rank_fwd(
@@ -76,6 +77,7 @@ class TestCompilePerRankFwd:
         sch = GPipe(microbatches=3)
 
         def fwd(params, rest, x):
+            """Forward pass helper."""
             del rest
             return jnp.stack([x.sum(), x.sum() * params["w"], x.mean()], axis=0)
 
@@ -115,6 +117,7 @@ class TestCompilePerRankBwd:
         sch = GPipe(microbatches=3)
 
         def bwd(params, rest, x, g_y):
+            """Backward pass helper."""
             return {"w": (x * g_y).sum()}, g_y * params["w"]
 
         program = compile_per_rank_bwd(
@@ -161,14 +164,17 @@ class TestRunGpipePerRank:
         sch = GPipe(microbatches=4)
 
         def fwd_fn(params, rest, x):
+            """Forward function helper."""
             return x * params["w"]
 
         def bwd_fn(params, rest, x, g_y):
+            """Backward function helper."""
             g_params = {"w": (x * g_y).sum()}
             g_x = g_y * params["w"]
             return g_params, g_x
 
         def loss_and_g_y(y, tgt):
+            """Compute the loss."""
             diff = y - tgt
             loss = 0.5 * jnp.sum(diff * diff)
             return loss, diff

@@ -49,6 +49,7 @@ def test_remat_decorator_form():
 
     @spx.remat
     def fn(m, x):
+        """Helper function."""
         return m(x)
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -66,11 +67,15 @@ def test_remat_module_class_accepts_unhashable_mutable_selector():
     """Class remat cache keys normalize list/dict selectors before hashing."""
 
     class Block(Module):
+        """Fixture block module for testing."""
+
         def __init__(self):
+            """Initialize with fc."""
             super().__init__()
             self.fc = Linear(4, 4, rngs=Rngs(0))
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.fc(x)
 
     remat_block = spx.remat(Block, mutable=["buffers"])
@@ -82,10 +87,12 @@ class StatefulRematModule(Module):
     """Module that uses string/boolean flags in its forward pass."""
 
     def __init__(self):
+        """Initialize with fc."""
         super().__init__()
         self.fc = Linear(4, 4, rngs=Rngs(0))
 
     def forward(self, x, *, mode: str = "train", output_attentions: bool = False):
+        """Run the forward pass."""
         y = self.fc(x)
         if mode == "eval":
             y = y * 0.5
@@ -100,6 +107,7 @@ def test_remat_auto_static_kwargs():
 
     @spx.remat
     def fn(model, x, *, mode, output_attentions):
+        """Helper function."""
         return model(x, mode=mode, output_attentions=output_attentions)
 
     x = jnp.ones((2, 4))
@@ -114,6 +122,7 @@ def test_remat_gradient_with_auto_static_kwargs():
 
     @spx.remat
     def loss(model, x, *, mode):
+        """Compute the loss."""
         return jnp.mean(model(x, mode=mode) ** 2)
 
     x = jnp.ones((2, 4))
@@ -126,11 +135,15 @@ def test_remat_module_class_with_auto_static_kwargs():
     """Wrapping a module class whose forward takes string kwargs works."""
 
     class Block(Module):
+        """Fixture block module for testing."""
+
         def __init__(self):
+            """Initialize with fc."""
             super().__init__()
             self.fc = Linear(4, 4, rngs=Rngs(0))
 
         def forward(self, x, *, mode: str = "train"):
+            """Run the forward pass."""
             return self.fc(x) * (0.5 if mode == "eval" else 1.0)
 
     RematBlock = spx.remat(Block)

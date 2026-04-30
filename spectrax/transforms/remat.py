@@ -120,6 +120,14 @@ def remat(
         mutable: Selector controlling writable collections.
         prevent_cse, policy, static_argnums: Forwarded verbatim to
             :func:`jax.checkpoint`.
+
+    Returns:
+        A wrapped function or a new :class:`~spectrax.Module` subclass
+        whose ``forward`` is checkpointed.
+
+    Raises:
+        TypeError: If ``prevent_cse`` is not a boolean, or if ``fn`` is
+            a class that is not a subclass of :class:`~spectrax.Module`.
     """
     if not isinstance(prevent_cse, bool):
         raise TypeError(f"prevent_cse must be a bool, got {type(prevent_cse).__name__}.")

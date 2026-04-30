@@ -50,6 +50,7 @@ def test_deferred_parameter_pytree_roundtrip_preserves_lazy_state():
     """Deferred variables should not lose their private shape/init state through pytrees."""
 
     def init(_rngs, shape, dtype):
+        """Initialization helper."""
         return jnp.ones(shape, dtype)
 
     v = DeferredParameter((None, 4), init, None, jnp.float32, axis_names=("batch", "hidden"))
@@ -127,6 +128,7 @@ def test_observer_exceptions_are_swallowed():
     v = Variable(jnp.zeros(()))
 
     def bad(_var, _old, _new):
+        """Bad input helper."""
         raise RuntimeError("boom")
 
     v.add_observer(bad)
@@ -140,6 +142,7 @@ def test_observer_removal():
     calls: list[int] = []
 
     def fn(_var, _o, _n):
+        """Helper function."""
         return calls.append(1)
 
     v.add_observer(fn)
@@ -406,6 +409,7 @@ def test_variable_jax_array_inside_jit():
 
     @jax.jit
     def f(x):
+        """Helper function."""
         a, b, c = jnp.split(x, 3)
         return a + b + c
 
@@ -418,6 +422,8 @@ def test_parameter_subclass_inherits_jax_array():
     """Subclasses of Variable (created after import) also get ``__jax_array__``."""
 
     class MyParam(Parameter):
+        """Fixture class for testing."""
+
         pass
 
     p = MyParam(jnp.ones(4))

@@ -122,12 +122,16 @@ def test_module_materialize_explicit():
     """``Module.materialize()`` initializes all deferred descendants."""
 
     class _Stack(spx.Module):
+        """Helper module for testing."""
+
         def __init__(self):
+            """Initialize with fc1, fc2."""
             super().__init__()
             self.fc1 = Linear(None, 5, rngs=Rngs(0))
             self.fc2 = Linear(None, 2, rngs=Rngs(1))
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.fc2(self.fc1(x))
 
     model = _Stack()
@@ -142,12 +146,16 @@ def test_sequential_init_materializes_deferred():
     """``sequential_init`` resolves deferred parameters and materializes them."""
 
     class _Net(spx.Module):
+        """Helper model module for testing."""
+
         def __init__(self):
+            """Initialize with fc1, fc2."""
             super().__init__()
             self.fc1 = Linear(None, 8, rngs=Rngs(0))
             self.fc2 = Linear(8, 1, rngs=Rngs(1))
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.fc2(self.fc1(x))
 
     model = _Net()

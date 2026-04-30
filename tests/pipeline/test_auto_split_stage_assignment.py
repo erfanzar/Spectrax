@@ -21,11 +21,13 @@ class _TaggedBlock(spx.Module):
     """Tiny block with a visible index and nested parameter path."""
 
     def __init__(self, idx: int, *, rngs: spx.Rngs):
+        """Initialize with idx, fc."""
         super().__init__()
         self.idx = idx
         self.fc = nn.Linear(4, 4, sharding=("fsdp", "tp"), rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         return self.fc(x)
 
 
@@ -33,12 +35,14 @@ class _TaggedStack(spx.Module):
     """``embed -> blocks[*] -> head`` stack used by split tests."""
 
     def __init__(self, n_blocks: int, *, rngs: spx.Rngs):
+        """Initialize with embed, blocks, head."""
         super().__init__()
         self.embed = nn.Linear(4, 4, sharding=("fsdp", "tp"), rngs=rngs)
         self.blocks = nn.ModuleList([_TaggedBlock(i, rngs=rngs) for i in range(n_blocks)])
         self.head = nn.Linear(4, 4, sharding=("fsdp", "tp"), rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         x = self.embed(x)
         for block in self.blocks:
             x = block(x)
@@ -46,6 +50,7 @@ class _TaggedStack(spx.Module):
 
 
 def _block_ids(stage: spx.Module) -> list[int]:
+    """Extract block IDs from a module."""
     return [block.idx for block in stage.blocks]
 
 

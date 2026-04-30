@@ -64,6 +64,12 @@ def resolve_class(qualified: str) -> type:
     module is treated as the module, and the remaining suffix is walked
     via attribute access.
 
+    Args:
+        qualified: Fully-qualified class name string.
+
+    Returns:
+        The resolved class object.
+
     Raises:
         ImportError: If no dotted prefix imports as a module or the
             attribute chain does not resolve.

@@ -72,13 +72,17 @@ def test_setattr_records_attr_order():
     """Attribute assignment order is recorded in ``_spx_attr_order``."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with x, y, z."""
             super().__init__()
             self.x = 1
             self.y = 2
             self.z = 3
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -89,12 +93,16 @@ def test_setattr_static_scalar_goes_to_static_dict():
     """Static scalars land in ``_spx_static``."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with dim, name."""
             super().__init__()
             self.dim = 8
             self.name = "test"
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -105,11 +113,15 @@ def test_setattr_module_child_not_in_static():
     """Module children are not recorded as static fields."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with leaf."""
             super().__init__()
             self.leaf = Leaf()
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.leaf(x)
 
     m = M()
@@ -120,11 +132,15 @@ def test_setattr_variable_child():
     """Variable children are in ``_spx_attr_order`` but not ``_spx_static``."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with p."""
             super().__init__()
             self.p = Parameter(jnp.zeros(1))
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -136,10 +152,14 @@ def test_setattr_auto_wraps_non_static_in_opaque():
     """Non-static non-Module non-Variable values are auto-wrapped in :class:`Opaque`."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -153,14 +173,20 @@ def test_setattr_hashable_object_defaults_to_opaque():
     """Config-like user objects should stay usable but out of static fields."""
 
     class Config:
+        """Simple configuration object for testing."""
+
         hidden_size = 128
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self, config):
+            """Initialize with config."""
             super().__init__()
             self.config = config
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     config = Config()
@@ -177,11 +203,15 @@ def test_setattr_private_bypasses_discipline():
     """Names starting with ``_`` are stored without type checks."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with ."""
             super().__init__()
             self._private = [1, 2, 3]
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -193,11 +223,15 @@ def test_setattr_explicit_static_stores_public_value():
     """``Static(value)`` tracks static metadata while exposing ``value`` publicly."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with activation."""
             super().__init__()
             self.activation = Static("gelu")
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -209,11 +243,15 @@ def test_setattr_opaque_escape_hatch():
     """``Opaque(value)`` bypasses the type check and is tracked separately."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with cb."""
             super().__init__()
             self.cb = Opaque(lambda y: y)
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -237,10 +275,14 @@ def test_setattr_policy_requires_policy_instance():
     """``.policy`` assignment requires :class:`Policy` or ``None``."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -256,11 +298,15 @@ def test_delattr_removes_from_tracking():
     """``__delattr__`` removes entries from attr_order / static / opaque."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with x."""
             super().__init__()
             self.x = 1
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -330,6 +376,8 @@ def test_forward_default_raises():
     """The base-class :meth:`forward` raises :class:`NotImplementedError`."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         pass
 
     m = M()
@@ -341,10 +389,14 @@ def test_pre_hook_can_rewrite_args():
     """A pre-hook returning ``(args, kwargs)`` overrides the call arguments."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x * 10
 
     m = M()
@@ -357,10 +409,14 @@ def test_post_hook_can_replace_output():
     """A post-hook returning non-``None`` replaces the module output."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -372,10 +428,14 @@ def test_post_hook_returning_none_is_passthrough():
     """A post-hook returning ``None`` leaves the output unchanged."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x + 1
 
     m = M()
@@ -390,10 +450,14 @@ def test_hook_handle_remove():
     """:meth:`Handle.remove` detaches a hook from its module's list."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -409,10 +473,14 @@ def test_hook_handle_remove_twice_is_noop():
     """Removing an already-removed handle does not raise."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -425,7 +493,10 @@ def test_register_context_scope_values_visible_and_removable():
     """Registered scope values are active for each forward call."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def forward(self, x):
+            """Run the forward pass."""
             return x + scope_get("bias")
 
     m = M()
@@ -442,17 +513,22 @@ def test_register_context_enters_keyword_context_manager_each_call():
     """Context-manager keyword values are both entered and scoped."""
 
     class CounterContext:
+        """Fixture class for testing."""
+
         def __init__(self):
+            """Initialize with depth, entered, exited."""
             self.depth = 0
             self.entered = 0
             self.exited = 0
 
         def __enter__(self):
+            """Enter the runtime context."""
             self.depth += 1
             self.entered += 1
             return self
 
         def __exit__(self, exc_type, exc, tb):
+            """Exit the runtime context."""
             self.depth -= 1
             self.exited += 1
             return False
@@ -460,7 +536,10 @@ def test_register_context_enters_keyword_context_manager_each_call():
     ctx = CounterContext()
 
     class M(Module):
+        """Fixture module for testing."""
+
         def forward(self, x):
+            """Run the forward pass."""
             assert ctx.depth == 1
             assert scope_get("mesh") is ctx
             return x + ctx.entered
@@ -481,6 +560,7 @@ def test_register_context_factory_creates_fresh_contexts():
 
     @contextlib.contextmanager
     def factory():
+        """Factory function for context managers."""
         events.append("enter")
         try:
             yield
@@ -488,7 +568,10 @@ def test_register_context_factory_creates_fresh_contexts():
             events.append("exit")
 
     class M(Module):
+        """Fixture module for testing."""
+
         def forward(self, x):
+            """Run the forward pass."""
             return x + len(events)
 
     m = M()
@@ -521,10 +604,14 @@ def test_output_dtype_policy_casts_result():
     """An ``output_dtype`` on the policy casts the forward output."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return jnp.asarray(x, dtype=jnp.float32)
 
     m = M()
@@ -576,10 +663,14 @@ def test_init_wraps_int_seed_as_rngs():
     """``init(int)`` wraps the seed into an :class:`Rngs` and attaches it."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     from spectrax.rng.rngs import Rngs
@@ -593,10 +684,14 @@ def test_init_replaces_existing_rngs_and_invalidates_graph():
     """A second ``init(seed)`` must not silently keep the first RNG module."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     from spectrax.core.graph import export
@@ -616,10 +711,14 @@ def test_init_without_rngs_does_not_attach():
     """``init()`` with ``rngs=None`` does not attach an ``rngs`` attribute."""
 
     class M(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
 
         def forward(self, x):
+            """Run the forward pass."""
             return x
 
     m = M()
@@ -710,11 +809,15 @@ def test_module_dict_setitem_invalidates_parent_export_cache():
     from spectrax.core.graph import export
 
     class HasDict(Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize with layers."""
             super().__init__()
             self.layers = ModuleDict({"a": Leaf()})
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.layers["a"](x)
 
     m = HasDict()

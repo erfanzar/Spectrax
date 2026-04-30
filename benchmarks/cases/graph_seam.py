@@ -19,10 +19,12 @@ def _cases_for(model_name: str, model_factory) -> dict[str, tuple[Callable, Call
     """Return ``{case_name: (setup_fn, spx_fn, nnx_fn)}`` for a given model."""
 
     def setup_spx():
+        """Build the spectrax model for this case."""
         mdl, _ = getattr(models, f"spx_{model_factory}")()
         return mdl
 
     def setup_nnx():
+        """Build the nnx model for this case."""
         mdl, _ = getattr(models, f"nnx_{model_factory}")()
         return mdl
 

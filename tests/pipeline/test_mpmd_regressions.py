@@ -29,9 +29,11 @@ class _FwdOnly(Schedule):
     """Tiny forward-only schedule for compiler shape tests."""
 
     def build(self, n_stages: int):
+        """Build helper."""
         return [[Action(Phase.FWD, microbatch=mb)] for mb in range(self.microbatches)]
 
     def peak_activations(self, n_stages: int) -> int:
+        """Peak activation helper."""
         return self.microbatches
 
 
@@ -58,6 +60,7 @@ def test_ranked_compiler_forward_outputs_can_change_shape():
     """Legacy rank programs must not assume stage output shape equals input shape."""
 
     def expand(x):
+        """Expand helper."""
         return jnp.stack([x, x + 1], axis=0)
 
     cluster = jax.make_jaxpr(expand)(jnp.asarray(1.0))
@@ -73,6 +76,7 @@ def test_ranked_compiler_bwd_uses_incoming_cotangent_for_param_grads():
     """BWD must seed param gradients with ``g_y``, not JAX's implicit scalar one."""
 
     def stage(w, x):
+        """Stage helper."""
         return w * x
 
     cluster = jax.make_jaxpr(stage)(jnp.asarray(2.0), jnp.asarray(3.0))
@@ -92,9 +96,11 @@ def test_run_ranked_pipeline_returns_mean_loss_and_mean_grads():
     """Legacy ranked pipeline helper should be numerically correct if used."""
 
     def stage(w, x):
+        """Stage helper."""
         return w * x
 
     def loss_fn(y, target):
+        """Compute the loss."""
         diff = y - target
         return 0.5 * jnp.sum(diff * diff)
 
@@ -176,6 +182,7 @@ def test_sxgrad_argnums_validation_happens_at_call_time():
     """Out-of-range ``argnums`` should raise a friendly ``ValueError``."""
 
     def plain(x):
+        """Plain reference implementation."""
         return x.sum()
 
     plain._mpmd_state = {"schedule_requested": True}
@@ -190,6 +197,7 @@ def test_sxvalue_and_grad_argnums_validation_happens_at_call_time():
     """``sxvalue_and_grad`` uses the same friendly bounds validation."""
 
     def plain(x):
+        """Plain reference implementation."""
         return x.sum()
 
     plain._mpmd_state = {"schedule_requested": True}

@@ -309,6 +309,9 @@ class Variable:
         storage is left untouched. Otherwise the value is stored and
         every registered :class:`~spectrax.typing.VariableObserver` is
         notified; observer exceptions are swallowed.
+
+        Args:
+            new: The new array value to store.
         """
         hook = _get_write_hook()
         if hook is not None and hook(self, new):
@@ -340,11 +343,19 @@ class Variable:
 
         Observers are not invoked under spectrax transforms (writes are
         redirected by the write hook before observers run).
+
+        Args:
+            fn: A callable ``(var, old, new) -> None`` to invoke on
+                every successful eager write.
         """
         self._observers.append(fn)
 
     def remove_observer(self, fn: VariableObserver) -> None:
-        """Unregister a previously-added observer (no-op if absent)."""
+        """Unregister a previously-added observer (no-op if absent).
+
+        Args:
+            fn: The callable previously passed to :meth:`add_observer`.
+        """
         if fn in self._observers:
             self._observers.remove(fn)
 
@@ -393,6 +404,17 @@ class Variable:
 
         Returns ``None`` when the variable has no stage hint or when an
         ``SpxMesh`` without an MPMD axis is supplied.
+
+        Args:
+            mesh_or_dim: The mesh or pipeline dimension to resolve
+                against.
+
+        Returns:
+            The zero-based physical stage rank, or ``None``.
+
+        Raises:
+            TypeError: If ``mesh_or_dim`` is not an ``int``, ``SpxMesh``,
+                or ``MpMdMesh``.
         """
         mpmd_dim: int | None
         if isinstance(mesh_or_dim, int):
@@ -421,6 +443,12 @@ class Variable:
         underlying ``jax_mesh`` for :class:`~spectrax.sharding.SpxMesh`).
         For MPMD meshes plus a stage-tagged variable, returns the owning
         stage sub-mesh.
+
+        Args:
+            mesh: A JAX mesh, ``SpxMesh``, or ``MpMdMesh``.
+
+        Returns:
+            The appropriate mesh for this variable's pipeline stage.
         """
         from ..runtime.types.mesh import MpMdMesh
         from ..sharding.mesh import SpxMesh
@@ -436,7 +464,15 @@ class Variable:
         return mesh
 
     def named_sharding(self, mesh: Any) -> Any:
-        """Resolve this variable's metadata to a ``NamedSharding``."""
+        """Resolve this variable's metadata to a ``NamedSharding``.
+
+        Args:
+            mesh: The mesh against which logical axis names are resolved.
+
+        Returns:
+            A :class:`jax.sharding.NamedSharding` instance, or ``None``
+            when the metadata contains no sharding information.
+        """
         from ..sharding.partition import named_sharding_for_variable
 
         return named_sharding_for_variable(self, mesh)
@@ -484,7 +520,14 @@ class Variable:
         return int(self.value.size)
 
     def astype(self, dtype: DType) -> Array:
-        """Return the value cast to ``dtype`` (not a Variable)."""
+        """Return the value cast to ``dtype`` (not a Variable).
+
+        Args:
+            dtype: Target JAX dtype.
+
+        Returns:
+            The stored array cast to ``dtype``.
+        """
         return jnp.asarray(self.value, dtype=dtype)
 
     def __getattr__(self, name: str) -> Any:
@@ -800,6 +843,9 @@ class DeferredParameter(Parameter):
             shape: Concrete shape tuple. Must have the same length as
                 the original ``shape_spec`` so the rank is preserved.
 
+        Returns:
+            ``None``.
+
         Raises:
             ValueError: If ``shape`` has a different rank than
                 ``shape_spec``.
@@ -817,6 +863,9 @@ class DeferredParameter(Parameter):
         result through :func:`_initialize_value`, so any active
         sharding metadata or placement hook is honored. Idempotent —
         repeated calls after the first materialization are no-ops.
+
+        Returns:
+            ``None``.
 
         Raises:
             RuntimeError: If :meth:`resolve_shape` has not yet been
@@ -847,7 +896,11 @@ class DeferredParameter(Parameter):
 
     @value.setter
     def value(self, new: ArrayLike) -> None:
-        """Write a real value into the variable and mark it as materialized."""
+        """Write a real value into the variable and mark it as materialized.
+
+        Args:
+            new: The new array value to store.
+        """
         self._deferred_materialized = True
         super(DeferredParameter, self.__class__).value.fset(self, new)
 
@@ -910,7 +963,19 @@ class DeferredBuffer(Buffer):
         return getattr(self, "_deferred_materialized", False)
 
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
-        """Set the concrete shape; rank must match the original ``shape_spec``."""
+        """Set the concrete shape; rank must match the original ``shape_spec``.
+
+        Args:
+            shape: Concrete shape tuple. Must have the same length as
+                the original ``shape_spec``.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            ValueError: If ``shape`` has a different rank than
+                ``shape_spec``.
+        """
         if self.is_materialized:
             return
         if len(shape) != len(self._deferred_shape_spec):
@@ -918,7 +983,15 @@ class DeferredBuffer(Buffer):
         self._deferred_resolved_shape = tuple(int(s) for s in shape)
 
     def materialize(self) -> None:
-        """Run the stored initializer and replace the placeholder buffer value."""
+        """Run the stored initializer and replace the placeholder buffer value.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            RuntimeError: If :meth:`resolve_shape` has not yet been
+                called.
+        """
         if self.is_materialized:
             return
         if getattr(self, "_deferred_resolved_shape", None) is None:
@@ -939,7 +1012,11 @@ class DeferredBuffer(Buffer):
 
     @value.setter
     def value(self, new: ArrayLike) -> None:
-        """Write a real value into the buffer and mark it as materialized."""
+        """Write a real value into the buffer and mark it as materialized.
+
+        Args:
+            new: The new array value to store.
+        """
         self._deferred_materialized = True
         super(DeferredBuffer, self.__class__).value.fset(self, new)
 

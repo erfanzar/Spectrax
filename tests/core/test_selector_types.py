@@ -119,7 +119,10 @@ def test_grad_wrt_class_returns_only_that_type():
 
     @spx.jit
     def step(m, x):
+        """Execute one training step and return the result."""
+
         def loss(m, x):
+            """Compute the loss."""
             return m(x)
 
         return spx.grad(loss, wrt=MyAdapterParam)(m, x)

@@ -30,7 +30,18 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 
 def init_block(key, d, ffn, n_heads, dtype=jnp.bfloat16):
-    """Return a dict of param arrays for one transformer block."""
+    """Return a dict of param arrays for one transformer block.
+
+    Args:
+        key: JAX PRNG key.
+        d: Model dimension.
+        ffn: FFN hidden dimension.
+        n_heads: Number of attention heads (used for scale validation).
+        dtype: Parameter dtype.
+
+    Returns:
+        Dictionary with ``qkv``, ``o``, ``fc1``, ``fc2`` weight arrays.
+    """
     k1, k2, k3, k4 = jax.random.split(key, 4)
     d // n_heads
     scale_qkv = jnp.asarray(1.0 / jnp.sqrt(d), dtype=dtype)
@@ -46,7 +57,16 @@ def init_block(key, d, ffn, n_heads, dtype=jnp.bfloat16):
 
 
 def block_apply(p, x, n_heads):
-    """Forward: pre-norm attention + pre-norm FFN with residuals."""
+    """Forward: pre-norm attention + pre-norm FFN with residuals.
+
+    Args:
+        p: Parameter dict for this block (``qkv``, ``o``, ``fc1``, ``fc2``).
+        x: Input tensor ``(b, t, d)``.
+        n_heads: Number of attention heads.
+
+    Returns:
+        Output tensor ``(b, t, d)``.
+    """
     b, t, d = x.shape
     head_dim = d // n_heads
     h = (x - x.mean(-1, keepdims=True)) / (x.std(-1, keepdims=True) + 1e-5)
@@ -65,7 +85,17 @@ def block_apply(p, x, n_heads):
 
 
 def stage_apply(stage_params, x, n_heads, n_blocks_per_stage):
-    """Apply one pipeline stage: ``n_blocks_per_stage`` sequential blocks."""
+    """Apply one pipeline stage: ``n_blocks_per_stage`` sequential blocks.
+
+    Args:
+        stage_params: Stacked params pytree with leading block axis.
+        x: Input tensor.
+        n_heads: Number of attention heads.
+        n_blocks_per_stage: How many blocks to run in this stage.
+
+    Returns:
+        Output tensor after all blocks.
+    """
     for b in range(n_blocks_per_stage):
         bp = jax.tree.map(lambda t, i=b: t[i], stage_params)
         x = block_apply(bp, x, n_heads)
@@ -81,6 +111,15 @@ def build_step(n_stages, n_blocks_per_stage, n_heads, microbatches):
     by indexing ``stacked_params[s]`` at static offset ``s`` — XLA
     places each indexed slice on the device that holds it and inserts
     the cross-stage transfer automatically.
+
+    Args:
+        n_stages: Number of pipeline stages.
+        n_blocks_per_stage: Blocks owned by each stage.
+        n_heads: Number of attention heads.
+        microbatches: Number of microbatches per step.
+
+    Returns:
+        A jitted ``step(stacked_params, xs, ys)`` function.
     """
 
     def loss_fn(out, y):
@@ -143,6 +182,13 @@ def init_stacked_params(cfg, key):
     Inner ``jax.tree.map`` call stacks per-stage blocks along the
     leading axis to shape ``(blocks, ...)``; the outer call stacks
     stages to shape ``(n_stages, blocks, ...)``.
+
+    Args:
+        cfg: :class:`Config` object with model/pipeline shape.
+        key: JAX PRNG key.
+
+    Returns:
+        Stacked parameter pytree.
     """
     keys = jax.random.split(key, cfg.n_stages * cfg.blocks_per_stage)
     keys = keys.reshape(cfg.n_stages, cfg.blocks_per_stage, 2)

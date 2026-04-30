@@ -189,6 +189,12 @@ class GraphDef:
     def canonical_path(self, ref_id: int) -> str:
         """Return the canonical dotted path for a normalized ``ref_id``.
 
+        Args:
+            ref_id: The normalized reference id to look up.
+
+        Returns:
+            The canonical dotted path string.
+
         Raises:
             KeyError: If ``ref_id`` does not appear in the graph-def.
         """
@@ -578,6 +584,9 @@ def update(module: Module, state: State) -> None:
     Args:
         module: The live module to mutate.
         state: A :class:`State` whose leaves provide the new values.
+
+    Returns:
+        ``None``.
     """
     for path, var in live_variables(module):
         new_val = _nested_get(state._data.get(var.kind, {}), str_to_path(path), None)
@@ -636,6 +645,12 @@ def live_variables(module: Module) -> list[tuple[str, Variable]]:
     Ordered by canonical path. Aliases (shared variables reached at
     multiple paths) are reported once under their canonical (first-seen)
     path.
+
+    Args:
+        module: The root module to traverse.
+
+    Returns:
+        A sorted list of ``(canonical_path, variable)`` pairs.
     """
     cache = module._spx_export_cache
     if cache is not None and cache[0] == _graph_epoch():
@@ -695,6 +710,9 @@ def iter_variables(
     Yields:
         ``(canonical_path, variable)`` tuples for each variable that
         matches the filter.
+
+    Returns:
+        An iterator over the matched variable pairs.
 
     Example::
 
@@ -796,6 +814,9 @@ def iter_modules(
     Yields:
         Either ``(canonical_path, module)`` tuples (``with_path=True``)
         or bare modules (``with_path=False``), one per unique module.
+
+    Returns:
+        An iterator over the matched modules.
 
     Raises:
         TypeError: When ``select`` is not a Module subclass, tuple of

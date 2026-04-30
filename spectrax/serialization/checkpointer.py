@@ -74,6 +74,24 @@ class Checkpointer:
         manager: AsyncCheckpointManager | None = None,
         delete_old_temp_checkpoints: bool = True,
     ) -> None:
+        """Create a :class:`Checkpointer`.
+
+        Args:
+            base_path: Root directory for all checkpoints.
+            save_interval: Time interval for temporary saves. ``None`` disables
+                time-based temporary checkpoints.
+            step_policies: Ordered sequence of :class:`CheckpointInterval`
+                policies. Must be sorted by ``until``; only the last may have
+                ``until=None``.
+            manager: Optional :class:`AsyncCheckpointManager`. A new one is
+                created if ``None``.
+            delete_old_temp_checkpoints: Whether to queue deletion of prior
+                temporary checkpoints found at startup.
+
+        Raises:
+            ValueError: If *step_policies* is not sorted by ``until`` or if a
+                non-final policy has ``until=None``.
+        """
         self.base_path = str(base_path)
         self.save_interval = save_interval
         self.step_policies = list(step_policies)
@@ -127,14 +145,19 @@ class Checkpointer:
     ) -> None:
         """Process a training step and save checkpoint if policies dictate.
 
+        Decides whether to save (and whether the save is permanent or
+        temporary) based on *step_policies* and *save_interval*. Broadcasts
+        the decision across all JAX processes so every rank agrees.
+
         Args:
             mesh: JAX mesh for distributed arrays.
-            pytree: Training state PyTree to save. Can be None if callbacks
+            pytree: Training state PyTree to save. Can be ``None`` if callbacks
                 handle saving externally.
-            force: If True, force a permanent checkpoint save regardless of policies.
+            force: If ``True``, force a permanent checkpoint save regardless of policies.
             step: Current training step number.
             true_callbacks: Optional callbacks executed when a save is triggered.
-            extras: Optional extra metadata.
+                Each receives ``(checkpoint_path, mesh, metadata_dict)``.
+            extras: Optional extra metadata written to the checkpoint.
             prefix: Prefix used when saving via ``save_pytree``. Ignored when
                 ``pytree is None``.
         """
@@ -177,6 +200,7 @@ class Checkpointer:
         self._last_temporary_checkpoint = full_path if not save_permanent else None
 
         def callback() -> None:
+            """Write metadata and clean up previous temporary checkpoint."""
             try:
                 _write_checkpoint_metadata(
                     full_path,
@@ -235,17 +259,19 @@ class Checkpointer:
 
         Args:
             tree: PyTree to save.
-            prefix: Namespace/prefix (e.g., "model", "tx").
+            prefix: Namespace/prefix (e.g., ``"model"``, ``"tx"``).
             step: Training step number for metadata.
             destination: Optional subdirectory under ``base_path``.
-            mesh: Optional JAX mesh.
             dtype: Optional dtype to cast floating point arrays to.
             extras: Optional extra metadata.
-            temporary: If True, mark as temporary in metadata.
+            temporary: If ``True``, mark as temporary in metadata.
             write_index: Whether to write the TensorStore index file.
 
         Returns:
             Full checkpoint directory path.
+
+        Raises:
+            ValueError: If *prefix* is empty or not a string.
         """
         if not prefix or not isinstance(prefix, str):
             raise ValueError("A non-empty string prefix is required")
@@ -297,19 +323,27 @@ class Checkpointer:
         Args:
             mesh: JAX Mesh for array sharding on load.
             prefix: Namespace/prefix used at save time.
-            path: Optional exact checkpoint directory.
-            discover_latest: If True, find the most recent checkpoint.
-            discover_raise: If True, raise when no checkpoint is found.
-            sharding_rules: Optional sequence of (regex_pattern, NamedSharding) pairs for sharding inference.
+            path: Optional exact checkpoint directory. If ``None`` and
+                *discover_latest* is ``True``, the most recent checkpoint
+                under ``base_path`` is used.
+            discover_latest: If ``True``, find the most recent checkpoint.
+            discover_raise: If ``True``, raise when no checkpoint is found.
+            sharding_rules: Optional sequence of ``(regex, NamedSharding)``
+                pairs for sharding inference.
             dtype: Optional dtype to cast loaded arrays to.
-            load_treedef: If False, flatten the loaded tree to a dotted-string dict.
-            callback: Optional per-array callback.
+            load_treedef: If ``False``, flatten the loaded tree to a
+                dotted-string dict.
+            callback: Optional per-array callback ``fn(array, key) -> array``.
             template: Optional template PyTree for shape coercion.
             strict_shapes: Whether to enforce exact shape matches.
             chunk_size: Optional batch size for array loading.
 
         Returns:
-            Tuple of (pytree, metadata).
+            Tuple of ``(pytree, metadata)``.
+
+        Raises:
+            FileNotFoundError: If no checkpoint is found and *discover_raise*
+                is ``True``.
         """
         root = path or self.base_path
         if discover_latest:
@@ -367,7 +401,11 @@ class Checkpointer:
         return pytree, extras
 
     def wait_until_finished(self) -> None:
-        """Block until all checkpoint operations complete."""
+        """Block until all checkpoint operations complete.
+
+        Includes both the async TensorStore writes and any background
+        checkpoint deletion jobs queued on process 0.
+        """
         self._manager.global_manager.wait_until_finished()
         if jax.process_index() == 0:
             while (
@@ -491,6 +529,14 @@ def find_latest_checkpoint(base_path: str) -> str | None:
         return None
 
     def sort_key(path: str):
+        """Return a sort key for a checkpoint path based on timestamp and step.
+
+        Args:
+            path: Checkpoint directory path.
+
+        Returns:
+            A tuple of ``(timestamp, step)`` for sorting.
+        """
         try:
             meta = read_checkpoint_metadata(path)
             ts = dt.datetime.fromisoformat(meta.get("timestamp", "1970-01-01T00:00:00"))

@@ -110,6 +110,7 @@ def test_dropout_constructor_rngs_advance_under_jit():
 
     @spx.jit(mutable="rng")
     def apply(module, x):
+        """Apply the module."""
         return module(x)
 
     x = jnp.ones((32,))

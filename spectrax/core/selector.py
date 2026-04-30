@@ -118,19 +118,52 @@ class Selector:
     combinator: str = "or"
 
     def at_instances_of(self, *types: type) -> Selector:
-        """Return a new selector that also requires module instance-of ``types``."""
+        """Return a new selector that also requires module instance-of ``types``.
+
+        Args:
+            *types: Module subclasses to match.
+
+        Returns:
+            A fresh :class:`Selector` with ``types`` added to
+            :attr:`module_types`.
+        """
         return replace(self, module_types=self.module_types + tuple(types))
 
     def not_instances_of(self, *types: type) -> Selector:
-        """Return a new selector that also excludes module instance-of ``types``."""
+        """Return a new selector that also excludes module instance-of ``types``.
+
+        Args:
+            *types: Module subclasses whose instances should be rejected.
+
+        Returns:
+            A fresh :class:`Selector` with ``types`` added to
+            :attr:`exclude_module_types`.
+        """
         return replace(self, exclude_module_types=self.exclude_module_types + tuple(types))
 
     def variables(self, *kinds: str) -> Selector:
-        """Return a new selector that also requires variable kind in ``kinds``."""
+        """Return a new selector that also requires variable kind in ``kinds``.
+
+        Args:
+            *kinds: Collection-name strings (e.g. ``"parameters"``,
+                ``"batch_stats"``) to accept.
+
+        Returns:
+            A fresh :class:`Selector` with ``kinds`` added to
+            :attr:`variable_kinds`.
+        """
         return replace(self, variable_kinds=self.variable_kinds + tuple(kinds))
 
     def exclude_variables(self, *kinds: str) -> Selector:
-        """Return a new selector that also excludes variable kinds in ``kinds``."""
+        """Return a new selector that also excludes variable kinds in ``kinds``.
+
+        Args:
+            *kinds: Collection-name strings to reject.
+
+        Returns:
+            A fresh :class:`Selector` with ``kinds`` added to
+            :attr:`exclude_kinds`.
+        """
         return replace(self, exclude_kinds=self.exclude_kinds + tuple(kinds))
 
     def of_type(self, *types: type) -> Selector:
@@ -184,7 +217,16 @@ class Selector:
         return replace(self, exclude_variable_types=self.exclude_variable_types + tuple(types))
 
     def at_path(self, *globs: str) -> Selector:
-        """Return a new selector that also requires the path to match ``globs``."""
+        """Return a new selector that also requires the path to match ``globs``.
+
+        Args:
+            *globs: Dotted path globs. ``*`` matches one segment;
+                ``**`` matches any number of segments.
+
+        Returns:
+            A fresh :class:`Selector` with ``globs`` added to
+            :attr:`path_globs`.
+        """
         return replace(self, path_globs=self.path_globs + tuple(globs))
 
     def where(self, pred: AnyPred) -> Selector:
@@ -194,6 +236,13 @@ class Selector:
         either a :class:`Module` or a :class:`Variable`; it must be
         tolerant of both. For strictly typed predicates prefer
         :meth:`where_module` / :meth:`where_variable`.
+
+        Args:
+            pred: A callable ``(target, path) -> bool``.
+
+        Returns:
+            A fresh :class:`Selector` with ``pred`` appended to both
+            predicate lists.
         """
         return replace(
             self,
@@ -202,11 +251,27 @@ class Selector:
         )
 
     def where_module(self, pred: ModulePred) -> Selector:
-        """Attach a module-only predicate."""
+        """Attach a module-only predicate.
+
+        Args:
+            pred: A callable ``(module, path) -> bool``.
+
+        Returns:
+            A fresh :class:`Selector` with ``pred`` appended to
+            :attr:`module_where`.
+        """
         return replace(self, module_where=(*self.module_where, pred))
 
     def where_variable(self, pred: VariablePred) -> Selector:
-        """Attach a variable-only predicate."""
+        """Attach a variable-only predicate.
+
+        Args:
+            pred: A callable ``(variable, path) -> bool``.
+
+        Returns:
+            A fresh :class:`Selector` with ``pred`` appended to
+            :attr:`variable_where`.
+        """
         return replace(self, variable_where=(*self.variable_where, pred))
 
     def __or__(self, other: Selector) -> Selector:
@@ -423,6 +488,9 @@ def select() -> Selector:
     Typical usage::
 
         spx.select().at_instances_of(nn.Linear).variables("parameters")
+
+    Returns:
+        A fresh empty :class:`Selector`.
     """
     return Selector()
 
@@ -439,6 +507,12 @@ def as_selector(x: SelectorSugar) -> Selector:
     * ``Iterable`` of strings and/or Variable subclasses — union filter.
     * Callable ``(v, path) -> bool`` — treated as a variable predicate.
     * ``None`` — returns a selector that matches nothing.
+
+    Args:
+        x: Any :data:`SelectorSugar` value.
+
+    Returns:
+        A :class:`Selector` representing the input.
 
     Raises:
         SelectorError: On an input that cannot be coerced.
@@ -477,7 +551,15 @@ def _never(_v: Variable, _p: str) -> bool:
 
 
 def all_of(*selectors: Selector) -> Selector:
-    """Intersection of many selectors. ``all_of()`` returns :data:`Everything`."""
+    """Intersection of many selectors. ``all_of()`` returns :data:`Everything`.
+
+    Args:
+        *selectors: Selectors to intersect.
+
+    Returns:
+        A :class:`Selector` matching variables that match *all* of the
+        input selectors.
+    """
     if not selectors:
         return Everything
     if len(selectors) == 1:
@@ -486,7 +568,15 @@ def all_of(*selectors: Selector) -> Selector:
 
 
 def any_of(*selectors: Selector) -> Selector:
-    """Union of many selectors. ``any_of()`` returns :data:`Nothing`."""
+    """Union of many selectors. ``any_of()`` returns :data:`Nothing`.
+
+    Args:
+        *selectors: Selectors to union.
+
+    Returns:
+        A :class:`Selector` matching variables that match *any* of the
+        input selectors.
+    """
     if not selectors:
         return Nothing
     if len(selectors) == 1:
@@ -495,7 +585,14 @@ def any_of(*selectors: Selector) -> Selector:
 
 
 def not_(selector: Selector) -> Selector:
-    """Equivalent to ``~selector``."""
+    """Equivalent to ``~selector``.
+
+    Args:
+        selector: The selector to negate.
+
+    Returns:
+        A :class:`Selector` whose variable match is inverted.
+    """
     return ~selector
 
 
@@ -539,7 +636,14 @@ def of_type(*types: type) -> Selector:
 
 
 def path_contains(substring: str) -> Selector:
-    """Return a selector matching variables whose canonical path contains ``substring``."""
+    """Return a selector matching variables whose canonical path contains ``substring``.
+
+    Args:
+        substring: The substring to search for in each variable path.
+
+    Returns:
+        A :class:`Selector` that matches when ``substring`` is found.
+    """
 
     def pred(_v: Variable, path: str) -> bool:
         """Match when ``substring`` appears inside ``path``."""
@@ -549,7 +653,15 @@ def path_contains(substring: str) -> Selector:
 
 
 def path_endswith(suffix: str) -> Selector:
-    """Return a selector matching variables whose canonical path ends with ``suffix``."""
+    """Return a selector matching variables whose canonical path ends with ``suffix``.
+
+    Args:
+        suffix: The suffix to test against each variable path.
+
+    Returns:
+        A :class:`Selector` that matches when the path ends with
+        ``suffix``.
+    """
 
     def pred(_v: Variable, path: str) -> bool:
         """Match when ``path`` ends with ``suffix``."""
@@ -559,7 +671,15 @@ def path_endswith(suffix: str) -> Selector:
 
 
 def path_startswith(prefix: str) -> Selector:
-    """Return a selector matching variables whose canonical path starts with ``prefix``."""
+    """Return a selector matching variables whose canonical path starts with ``prefix``.
+
+    Args:
+        prefix: The prefix to test against each variable path.
+
+    Returns:
+        A :class:`Selector` that matches when the path starts with
+        ``prefix``.
+    """
 
     def pred(_v: Variable, path: str) -> bool:
         """Match when ``path`` starts with ``prefix``."""

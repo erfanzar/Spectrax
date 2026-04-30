@@ -70,11 +70,15 @@ def test_policy_descendant_reads_ancestor_policy():
     from spectrax.core.module import Module
 
     class Wrapper(Module):
+        """Fixture module for testing."""
+
         def __init__(self, rngs):
+            """Initialize with inner."""
             super().__init__()
             self.inner = Linear(4, 4, rngs=rngs)
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.inner(x)
 
     w = Wrapper(Rngs(0))

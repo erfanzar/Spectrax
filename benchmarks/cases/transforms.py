@@ -18,6 +18,11 @@ from .. import models
 
 
 def build():
+    """Build transform wiring overhead benchmark cases.
+
+    Returns:
+        Dictionary mapping case name to ``(spectrax_fn, nnx_fn)`` pairs.
+    """
     cases: dict[str, tuple[Callable, Callable]] = {}
 
     spx_mdl, x = models.spx_mlp()
@@ -25,10 +30,12 @@ def build():
 
     @spx.jit
     def spx_fwd(m, x):
+        """Jitted spectrax forward pass."""
         return m(x)
 
     @nnx.jit
     def nnx_fwd(m, x):
+        """Jitted nnx forward pass."""
         return m(x)
 
     jax.block_until_ready(spx_fwd(spx_mdl, x))
@@ -40,9 +47,11 @@ def build():
     )
 
     def spx_loss(m, x):
+        """Scalar loss for spectrax: sum of model output."""
         return m(x).sum()
 
     def nnx_loss(m, x):
+        """Scalar loss for nnx: sum of model output."""
         return m(x).sum()
 
     spx_grad = spx.grad(spx_loss)
@@ -70,10 +79,12 @@ def build():
 
     @spx.jit
     def spx_batched(m, x):
+        """Jitted spectrax batched forward via vmap."""
         return jax.vmap(m)(x[:, None, :])[:, 0]
 
     @nnx.jit
     def nnx_batched(m, x):
+        """Jitted nnx batched forward via vmap."""
         return jax.vmap(m)(x[:, None, :])[:, 0]
 
     try:

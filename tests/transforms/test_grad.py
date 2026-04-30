@@ -28,10 +28,12 @@ class _Accum(Module):
     acc: Buffer
 
     def __init__(self) -> None:
+        """Initialize with acc."""
         super().__init__()
         self.acc = Buffer(jnp.zeros((), dtype=jnp.float32), kind="batch_stats")
 
     def forward(self, x):
+        """Run the forward pass."""
         return x + self.acc.value
 
 
@@ -58,6 +60,7 @@ def test_grad_raises_without_module_arg():
     """``spx.grad`` requires at least one :class:`Module` argument."""
 
     def pure_loss(x):
+        """Compute the loss."""
         return jnp.sum(x)
 
     with pytest.raises(TypeError):
@@ -68,6 +71,7 @@ def test_grad_argnum_selects_module():
     """``argnum=`` lets the user pick which argument is the differentiated module."""
 
     def loss(x, m):
+        """Compute the loss."""
         return jnp.mean(m(x) ** 2)
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -79,6 +83,7 @@ def test_grad_has_aux_returns_aux_tuple():
     """With ``has_aux=True`` the inner fn returns ``(loss, aux)``."""
 
     def loss(m, x):
+        """Compute the loss."""
         y = m(x)
         return jnp.mean(y**2), y.shape
 
@@ -92,6 +97,7 @@ def test_grad_has_aux_on_grad_returns_aux_with_grads():
     """``grad(..., has_aux=True)`` returns ``(grads, aux)``."""
 
     def loss(m, x):
+        """Compute and return the jnp.mean(m(x) ** 2), "tag" loss."""
         return jnp.mean(m(x) ** 2), "tag"
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -115,6 +121,7 @@ def test_grad_decorator_form():
 
     @spx.grad
     def loss(m, x):
+        """Compute the loss."""
         return jnp.mean(m(x) ** 2)
 
     grads = loss(Linear(4, 4, rngs=Rngs(0)), jnp.ones((2, 4)))
@@ -140,6 +147,7 @@ def test_vjp_has_aux_returns_aux():
     x = jnp.ones((2, 4))
 
     def fn(mod, x):
+        """Helper function."""
         y = mod(x)
         return y.sum(), y.shape
 
@@ -157,6 +165,7 @@ def test_vjp_mutable_primal_updates_live_module():
     x = jnp.array(3.0, dtype=jnp.float32)
 
     def fn(mod, x):
+        """Helper function."""
         mod.acc.value = mod.acc.value + 2.0
         return mod(x)
 
@@ -173,6 +182,7 @@ def test_vjp_decorator_rejects_kwargs():
 
     @spx.vjp
     def fn(mod, x):
+        """Helper function."""
         return mod(x)
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -200,6 +210,7 @@ def test_jvp_has_aux_returns_aux():
     x_tangent = jnp.ones_like(x)
 
     def fn(mod, x):
+        """Helper function."""
         y = mod(x)
         return y.sum(), y.shape
 
@@ -214,6 +225,7 @@ def test_jvp_mutable_primal_updates_live_module():
     m = _Accum()
 
     def fn(mod, x):
+        """Helper function."""
         mod.acc.value = mod.acc.value + x
         return mod(x)
 

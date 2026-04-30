@@ -33,6 +33,7 @@ def _make_embed_stage(d: int, rng: jax.Array) -> PipelineStage:
     params = {"w": w, "b": b}
 
     def fn(p, s, x):
+        """Helper function."""
         return jax.nn.relu(x @ p["w"] + p["b"]), ()
 
     return PipelineStage(fn=fn, parameters=params, init_state=())
@@ -46,6 +47,7 @@ def _make_block_stage(d: int, rng: jax.Array) -> PipelineStage:
     params = {"w": w, "b": b}
 
     def fn(p, s, x):
+        """Helper function."""
         return jax.nn.relu(x @ p["w"] + p["b"]), ()
 
     return PipelineStage(fn=fn, parameters=params, init_state=())
@@ -59,12 +61,14 @@ def _make_head_stage(d: int, rng: jax.Array) -> PipelineStage:
     params = {"w": w, "b": b}
 
     def fn(p, s, x):
+        """Helper function."""
         return x @ p["w"] + p["b"], ()
 
     return PipelineStage(fn=fn, parameters=params, init_state=())
 
 
 def _loss_fn(out, y):
+    """Private helper: _loss_fn."""
     return ((out - y) ** 2).mean()
 
 
@@ -90,6 +94,7 @@ def hybrid_stages():
 
 @pytest.fixture(scope="module")
 def xy():
+    """XY pair helper."""
     x = jax.random.normal(jax.random.PRNGKey(0), (_BATCH, _D))
     y = jax.random.normal(jax.random.PRNGKey(1), (_BATCH, _D))
     return x, y
@@ -106,6 +111,7 @@ def _reference_loss_and_grads(stages, x, y):
     """Single-device loss + per-stage grads."""
 
     def loss_fn(params_list):
+        """Compute the loss."""
         cur = x
         for i, stage in enumerate(stages):
             p = params_list[i]
@@ -161,6 +167,7 @@ def test_homogeneous_forward_passes_extra_inputs_to_stages():
     mesh = MpMdMesh(Mesh(devs, axis_names=("pp",)), "pp")
 
     def fn(p, s, x, mask):
+        """Helper function."""
         del s
         return x + p["scale"] * mask, ()
 

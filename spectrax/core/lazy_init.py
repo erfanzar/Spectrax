@@ -34,6 +34,9 @@ def lazy_init() -> Iterator[None]:
     materialize on first forward. Call ``module.sequential_init(...)``
     (or ``module.init(...example_inputs...)``) to materialize them
     explicitly.
+
+    Yields:
+        Control passes to the caller's ``with`` body.
     """
     prev = _explicit_lazy_mode()
     _LAZY_STATE.explicit_lazy = True

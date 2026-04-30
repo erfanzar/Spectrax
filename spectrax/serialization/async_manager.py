@@ -3,6 +3,19 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""Asynchronous checkpoint manager built on JAX GlobalAsyncCheckpointManager.
+
+Provides :class:`AsyncCheckpointManager` which wraps JAX's TensorStore-based
+:class:`GlobalAsyncCheckpointManager` for high-performance distributed
+checkpointing. Supports:
+
+* Async array serialization / deserialization
+* Treedef preservation (exact PyTree structure round-trips)
+* Sharding preservation without all-gather
+* Structured saves with per-prefix namespaces
+* Chunked loading for reduced peak memory
+"""
+
 import base64
 import json
 import os
@@ -31,17 +44,38 @@ GLOBAL_CHECKPOINT_TIMEOUT = int(os.getenv("GLOBAL_CHECKPOINT_TIMEOUT", "400"))
 
 
 def _is_array_like(x):
-    """Check if an object is array-like (has shape and dtype attributes)."""
+    """Check if an object is array-like (has ``shape`` and ``dtype`` attributes).
+
+    Args:
+        x: Object to inspect.
+
+    Returns:
+        ``True`` if *x* looks like an array, ``False`` otherwise.
+    """
     return hasattr(x, "shape") and hasattr(x, "dtype")
 
 
 def _treedef_to_b64(treedef) -> str:
-    """Serialize a JAX tree definition to base64 string."""
+    """Serialize a JAX tree definition to a base64 string.
+
+    Args:
+        treedef: A :class:`jax.tree_util.PyTreeDef`.
+
+    Returns:
+        Base64-encoded pickled treedef.
+    """
     return base64.b64encode(pickle.dumps(treedef)).decode("utf-8")
 
 
 def _treedef_from_b64(s: str):
-    """Deserialize a JAX tree definition from base64 string."""
+    """Deserialize a JAX tree definition from a base64 string.
+
+    Args:
+        s: Base64-encoded pickled treedef.
+
+    Returns:
+        The reconstructed :class:`jax.tree_util.PyTreeDef`.
+    """
     return pickle.loads(base64.b64decode(s.encode("utf-8")))
 
 
@@ -61,13 +95,27 @@ def _structure_path(path: str, prefix: str | None) -> str:
 
 
 def _is_none(x):
-    """Check if a value is None."""
+    """Check if a value is ``None``.
+
+    Args:
+        x: Value to check.
+
+    Returns:
+        ``True`` if *x* is ``None``, ``False`` otherwise.
+    """
     return x is None
 
 
 @dataclass
 class CheckpointMetadata:
-    """Enhanced metadata for checkpoints with versioning and validation."""
+    """Enhanced metadata for checkpoints with versioning and validation.
+
+    Attributes:
+        version: Spectrax version string recorded at save time.
+        timestamp: ISO-format timestamp. ``None`` means "use current time
+            when :meth:`to_dict` is called".
+        custom_metadata: Arbitrary user-supplied metadata dict.
+    """
 
     version: str = __version__
     timestamp: str = None
@@ -91,7 +139,7 @@ class AsyncCheckpointManager:
     """Checkpoint manager built on top of JAX GlobalAsyncCheckpointManager (TensorStore).
 
     Provides checkpoint saving and loading with support for parallel operations
-    and tensorstore backend. Preserves existing array shardings (TP/FSDP)
+    and TensorStore backend. Preserves existing array shardings (TP/FSDP)
     without performing all-gather operations.
     """
 
@@ -115,7 +163,11 @@ class AsyncCheckpointManager:
 
     @property
     def global_manager(self) -> GlobalAsyncCheckpointManager:
-        """Get or create the global async checkpoint manager."""
+        """Get or create the global async checkpoint manager lazily.
+
+        Returns:
+            The :class:`GlobalAsyncCheckpointManager` instance.
+        """
         if self._global_manager is None:
             self._global_manager = GlobalAsyncCheckpointManager(timeout_secs=GLOBAL_CHECKPOINT_TIMEOUT)
         return self._global_manager
@@ -142,8 +194,6 @@ class AsyncCheckpointManager:
                 arrays, and other serializable Python objects.
             path: Destination directory (local path or remote URL such as
                 ``"gs://bucket/path"``).
-            mesh: Optional JAX mesh used for sharding context. If provided,
-                shared metadata writes are coordinated across hosts.
             prefix: Logical namespace for the saved tree (e.g. ``"model"``,
                 ``"tx"``). Must be a non-empty string.
             dtype: Optional dtype to cast floating-point arrays to before
@@ -338,6 +388,7 @@ class AsyncCheckpointManager:
         metadata = struct.get("extras", {})
 
         def default_sharding():
+            """Return a fully-replicated sharding on the given mesh."""
             return NamedSharding(mesh=mesh, spec=PartitionSpec())
 
         relpaths: list[str] = struct["array_relpaths"]
@@ -432,6 +483,18 @@ class AsyncCheckpointManager:
         tpl_arr_mask = [_is_array_like(x) for x in tpl_leaves]
 
         def _coerce_or_fallback(loaded, expected, key):
+            """Coerce a loaded array to match *expected* shape, or raise/fall back.
+
+            Handles three forgiving transformations when *strict_shapes* is
+            ``False``:
+
+            1. Drop a leading singleton dimension.
+            2. Reshape to matching element count.
+            3. Return verbatim if shapes already match.
+
+            When *strict_shapes* is ``True``, any mismatch raises
+            :class:`ValueError`.
+            """
             if not (_is_array_like(loaded) and _is_array_like(expected)):
                 return loaded
             if loaded.shape == expected.shape:

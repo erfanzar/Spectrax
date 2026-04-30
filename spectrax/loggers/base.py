@@ -21,30 +21,66 @@ ArrayLike = tp.Union[np.ndarray, "jax.Array"]  # type: ignore[name-defined]
 
 
 class BaseBackend(ABC):
-    """Abstract interface for a logging backend."""
+    """Abstract interface for a logging backend.
+
+    Subclasses must implement the core logging methods. Optional methods
+    (``log_summary``, ``log_table``) default to no-ops.
+    """
 
     @abstractmethod
     def log_scalar(self, tag: str, value: Scalar, step: int) -> None:
-        """Log a scalar value."""
+        """Log a scalar value.
+
+        Args:
+            tag: Metric identifier, e.g. ``"loss/train"``.
+            value: Scalar numeric value.
+            step: Training step number.
+        """
 
     @abstractmethod
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
-        """Log a histogram of values."""
+        """Log a histogram of values.
+
+        Args:
+            tag: Metric identifier.
+            values: Array of values to histogram.
+            step: Training step number.
+        """
 
     @abstractmethod
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
-        """Log an image."""
+        """Log an image.
+
+        Args:
+            tag: Image identifier.
+            image: Image array (format depends on backend).
+            step: Training step number.
+        """
 
     @abstractmethod
     def log_text(self, tag: str, text: str, step: int) -> None:
-        """Log a text string."""
+        """Log a text string.
+
+        Args:
+            tag: Text identifier.
+            text: String content.
+            step: Training step number.
+        """
 
     @abstractmethod
     def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
-        """Log hyper-parameters."""
+        """Log hyper-parameters.
+
+        Args:
+            hparams: Flat or nested dict of hyper-parameters.
+        """
 
     def log_summary(self, metrics: dict[str, tp.Any]) -> None:
-        """Log summary-level metrics (optional; default no-op)."""
+        """Log summary-level metrics (optional; default no-op).
+
+        Args:
+            metrics: Dictionary of summary metrics.
+        """
         return None
 
     def log_table(
@@ -54,7 +90,14 @@ class BaseBackend(ABC):
         rows: list[list[tp.Any]],
         step: int,
     ) -> None:
-        """Log a table (optional; default no-op)."""
+        """Log a table (optional; default no-op).
+
+        Args:
+            tag: Table identifier.
+            columns: List of column header strings.
+            rows: List of row values; each row is a list of cell values.
+            step: Training step number.
+        """
         return None
 
     @abstractmethod
@@ -70,21 +113,27 @@ class _NullBackend(BaseBackend):
     """No-op backend used when no backends are configured."""
 
     def log_scalar(self, tag: str, value: Scalar, step: int) -> None:
+        """No-op."""
         pass
 
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
+        """No-op."""
         pass
 
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
+        """No-op."""
         pass
 
     def log_text(self, tag: str, text: str, step: int) -> None:
+        """No-op."""
         pass
 
     def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+        """No-op."""
         pass
 
     def log_summary(self, metrics: dict[str, tp.Any]) -> None:
+        """No-op."""
         pass
 
     def log_table(
@@ -94,12 +143,15 @@ class _NullBackend(BaseBackend):
         rows: list[list[tp.Any]],
         step: int,
     ) -> None:
+        """No-op."""
         pass
 
     def flush(self) -> None:
+        """No-op."""
         pass
 
     def close(self) -> None:
+        """No-op."""
         pass
 
 
@@ -142,6 +194,13 @@ class Logger:
         *,
         auto_flush: bool = True,
     ):
+        """Initialize the logger.
+
+        Args:
+            backends: List of logging backends to dispatch to. Defaults to
+                a single :class:`_NullBackend` if ``None``.
+            auto_flush: Whether to flush backends after every log call.
+        """
         self._backends = backends or [_NullBackend()]
         self._auto_flush = auto_flush
         self._closed = False
@@ -149,12 +208,29 @@ class Logger:
 
     @staticmethod
     def _is_main_process() -> bool:
+        """Return ``True`` if this is process 0 in a JAX distributed run.
+
+        Falls back to ``True`` when JAX backends are not yet initialized.
+
+        Returns:
+            ``True`` for the primary process, ``False`` for all others.
+        """
         try:
             return jax.process_index() == 0
         except RuntimeError:
             return True
 
     def _dispatch(self, method: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+        """Call *method* on every backend, swallowing individual failures.
+
+        If :attr:`_auto_flush` is enabled, :meth:`flush` is called on all
+        backends after the dispatch.
+
+        Args:
+            method: Backend method name as a string.
+            *args: Positional args forwarded to the method.
+            **kwargs: Keyword args forwarded to the method.
+        """
         if self._closed or not self._is_main:
             return
         for backend in self._backends:
@@ -307,7 +383,9 @@ class Logger:
                 _logger.warning_once(f"Logger backend {type(backend).__name__}.close failed: {e}")
 
     def __enter__(self) -> Logger:
+        """Context-manager entry — returns ``self``."""
         return self
 
     def __exit__(self, *exc: tp.Any) -> None:
+        """Context-manager exit — closes all backends."""
         self.close()

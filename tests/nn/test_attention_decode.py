@@ -77,6 +77,7 @@ def test_jit_decode_advances_cache_under_mutable_cache():
 
     @jit(mutable="cache")
     def step(layer, tok):
+        """Execute one training step and return the result."""
         return layer(tok)
 
     _ = step(attn, jnp.ones((1, 1, 4)))

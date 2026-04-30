@@ -30,6 +30,7 @@ class Affine(spx.Module):
     bias: spx.Parameter
 
     def __init__(self, *, dtype: jnp.dtype = jnp.float32, scale: float = 1.0, bias_shift: float = 0.0) -> None:
+        """Initialize with weight, bias."""
         super().__init__()
         base = jnp.arange(FEATURE_DIM * FEATURE_DIM, dtype=jnp.float32).reshape(FEATURE_DIM, FEATURE_DIM)
         weight = (base - jnp.mean(base)) / 10.0
@@ -38,6 +39,7 @@ class Affine(spx.Module):
         self.bias = spx.Parameter(bias.astype(dtype))
 
     def forward(self, x: jax.Array) -> jax.Array:
+        """Run the forward pass."""
         y = jnp.einsum("...d,df->...f", x, self.weight.value) + self.bias.value
         return jnp.tanh(y)
 
@@ -48,10 +50,12 @@ class StatefulAffine(Affine):
     acc: spx.Buffer
 
     def __init__(self, *, dtype: jnp.dtype = jnp.float32, scale: float = 1.0, bias_shift: float = 0.0) -> None:
+        """Initialize with acc."""
         super().__init__(dtype=dtype, scale=scale, bias_shift=bias_shift)
         self.acc = spx.Buffer(jnp.array(0.0, dtype=dtype), kind="batch_stats")
 
     def forward(self, x: jax.Array, *, mutate: bool = False, amount: float = 1.0) -> jax.Array:
+        """Run the forward pass."""
         if mutate:
             delta = jnp.asarray(amount, dtype=self.acc.value.dtype)
             self.acc.value = self.acc.value + delta
@@ -64,6 +68,7 @@ class ScaleModule(spx.Module):
     scale: spx.Buffer
 
     def __init__(self, *, dtype: jnp.dtype = jnp.float32, value: float = 1.0) -> None:
+        """Initialize with scale."""
         super().__init__()
         self.scale = spx.Buffer(jnp.array(value, dtype=dtype), kind="batch_stats")
 

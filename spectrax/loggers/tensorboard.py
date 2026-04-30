@@ -2,7 +2,12 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Native TensorBoard backend — no external TF/TB/Flax dependencies."""
+"""Native TensorBoard backend — no external TF/TB/Flax dependencies.
+
+Writes TensorBoard event files directly using only ``google.protobuf``
+(which JAX already depends on). Supports scalars, histograms, images,
+text, and hyper-parameters.
+"""
 
 from __future__ import annotations
 
@@ -23,11 +28,32 @@ _ProtoCache: dict[str, tp.Any] = {}
 
 
 def _masked_crc(data: bytes) -> int:
+    """Compute the TensorBoard masked CRC32 of *data*.
+
+    Args:
+        data: Raw bytes to checksum.
+
+    Returns:
+        The 32-bit masked CRC value.
+    """
     crc = zlib.crc32(data) & 0xFFFFFFFF
     return ((crc >> 15) | (crc << 17)) + 0xA282EAD8 & 0xFFFFFFFF
 
 
 def _write_record(f: tp.BinaryIO, data: bytes) -> None:
+    """Write a length-prefixed, CRC-protected record to a binary file.
+
+    The on-disk layout is::
+
+        uint64le length
+        uint32le masked_crc(length)
+        <data>
+        uint32le masked_crc(data)
+
+    Args:
+        f: Open binary file handle.
+        data: Payload bytes.
+    """
     length = struct.pack("<Q", len(data))
     f.write(length)
     f.write(struct.pack("<I", _masked_crc(length)))
@@ -36,6 +62,15 @@ def _write_record(f: tp.BinaryIO, data: bytes) -> None:
 
 
 def _get_protos() -> dict[str, tp.Any]:
+    """Lazy-initialize and cache TensorBoard protobuf message classes.
+
+    Uses ``google.protobuf`` dynamic message construction so no compiled
+    ``.pb2`` files or TensorFlow dependency is required.
+
+    Returns:
+        A dict mapping fully-qualified message names (e.g.
+        ``"tensorboard.Event"``) to their dynamic protobuf classes.
+    """
     if _ProtoCache:
         return _ProtoCache
 
@@ -46,6 +81,15 @@ def _get_protos() -> dict[str, tp.Any]:
     file_proto.syntax = "proto3"
 
     def add_message(name: str, fields: list[tuple[int, str, str, int]]) -> None:
+        """Add a message definition to the dynamic protobuf file.
+
+        Args:
+            name: Message name (relative to the ``tensorboard`` package).
+            fields: List of ``(number, field_name, type_name_or_primitive,
+                label)`` tuples. If ``type_name_or_primitive`` starts with
+                ``"."`` it is treated as a message type reference;
+                otherwise it names a primitive type.
+        """
         msg = file_proto.message_type.add()
         msg.name = name
         for number, fname, ftype, label in fields:
@@ -183,6 +227,11 @@ class TensorBoardBackend(BaseBackend):
     """
 
     def __init__(self, log_dir: str | os.PathLike[str]):
+        """Initialize the TensorBoard backend.
+
+        Args:
+            log_dir: Directory to write TensorBoard event files.
+        """
         log_dir = os.fspath(log_dir)
         mkdir(log_dir, exist_ok=True)
         self._log_dir = log_dir
@@ -190,6 +239,11 @@ class TensorBoardBackend(BaseBackend):
         self._open()
 
     def _open(self) -> None:
+        """Open a new event file with a timestamped name.
+
+        The filename follows the standard TensorBoard convention:
+        ``events.out.tfevents.{timestamp}.{pid}``.
+        """
         from datetime import datetime
 
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -202,16 +256,35 @@ class TensorBoardBackend(BaseBackend):
             self._file = open(path, "wb")
 
     def _ensure_open(self) -> tp.BinaryIO:
+        """Return the open file handle, reopening if it was closed.
+
+        Returns:
+            A writable binary file object.
+        """
         if self._file is None or self._file.closed:
             self._open()
         return self._file
 
     def _write(self, data: bytes) -> None:
+        """Write a protobuf record to the event file.
+
+        Args:
+            data: Serialized protobuf bytes.
+        """
         f = self._ensure_open()
         _write_record(f, data)
         f.flush()
 
     def _event(self, step: int, summary: tp.Any) -> bytes:
+        """Build an ``Event`` protobuf wrapping a ``Summary``.
+
+        Args:
+            step: Training step.
+            summary: A protobuf ``Summary`` message.
+
+        Returns:
+            Serialized ``Event`` bytes.
+        """
         P = _get_protos()
         event = P["tensorboard.Event"]()
         event.wall_time = time.time()
@@ -220,6 +293,13 @@ class TensorBoardBackend(BaseBackend):
         return event.SerializeToString()
 
     def log_scalar(self, tag: str, value: Scalar, step: int) -> None:
+        """Write a scalar event.
+
+        Args:
+            tag: Metric identifier.
+            value: Scalar numeric value.
+            step: Training step.
+        """
         P = _get_protos()
         summary = P["tensorboard.Summary"]()
         val = summary.value.add()
@@ -228,6 +308,13 @@ class TensorBoardBackend(BaseBackend):
         self._write(self._event(step, summary))
 
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
+        """Write a histogram event (30 bins).
+
+        Args:
+            tag: Metric identifier.
+            values: Array of values to histogram.
+            step: Training step.
+        """
         P = _get_protos()
         arr = np.asarray(values).flatten()
         counts, edges = np.histogram(arr, bins=30)
@@ -246,6 +333,17 @@ class TensorBoardBackend(BaseBackend):
         self._write(self._event(step, summary))
 
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
+        """Write an image event as PNG.
+
+        Args:
+            tag: Image identifier.
+            image: Image array. Normalized to ``uint8`` with 3 channels.
+            step: Training step.
+
+        Raises:
+            ValueError: If the image does not have 1 or 3 channels after normalization.
+            RuntimeError: If Pillow is not installed.
+        """
         image = np.asarray(image)
         if image.dtype != np.uint8:
             if image.max() <= 1.0:
@@ -259,7 +357,7 @@ class TensorBoardBackend(BaseBackend):
         if channels != 3:
             raise ValueError("Image must have 1 or 3 channels")
         try:
-            from PIL import Image as PILImage  #type:ignore
+            from PIL import Image as PILImage  # type:ignore
         except Exception as exc:
             raise RuntimeError("TensorBoardBackend image logging requires Pillow") from exc
         img = PILImage.fromarray(image)
@@ -281,6 +379,13 @@ class TensorBoardBackend(BaseBackend):
         self._write(self._event(step, summary))
 
     def log_text(self, tag: str, text: str, step: int) -> None:
+        """Write a text event.
+
+        Args:
+            tag: Text identifier.
+            text: String content.
+            step: Training step.
+        """
         P = _get_protos()
         summary = P["tensorboard.Summary"]()
         val = summary.value.add()
@@ -301,6 +406,14 @@ class TensorBoardBackend(BaseBackend):
         self._write(self._event(step, summary))
 
     def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+        """Write hyper-parameter events.
+
+        Emits a plugin-scoped ``hparams/session_start_info`` event followed
+        by one scalar or text event per hyper-parameter.
+
+        Args:
+            hparams: Dictionary of hyper-parameters.
+        """
         P = _get_protos()
         summary = P["tensorboard.Summary"]()
         val = summary.value.add()
@@ -324,10 +437,12 @@ class TensorBoardBackend(BaseBackend):
                 self.log_text(f"hparams/{k}", str(v), 0)
 
     def flush(self) -> None:
+        """Flush the event file if open."""
         if self._file is not None and not self._file.closed:
             self._file.flush()
 
     def close(self) -> None:
+        """Close the event file."""
         if self._file is not None and not self._file.closed:
             self._file.close()
             self._file = None

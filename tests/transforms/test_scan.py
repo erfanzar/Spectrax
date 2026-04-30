@@ -23,10 +23,12 @@ class _Scale(Module):
     scale: Buffer
 
     def __init__(self, value: float = 1.0) -> None:
+        """Initialize with scale."""
         super().__init__()
         self.scale = Buffer(jnp.array(value, dtype=jnp.float32), kind="batch_stats")
 
     def forward(self, x):
+        """Run the forward pass."""
         return self.scale.value * x
 
 
@@ -36,10 +38,12 @@ class _Accumulator(Module):
     acc: Buffer
 
     def __init__(self) -> None:
+        """Initialize with acc."""
         super().__init__()
         self.acc = Buffer(jnp.zeros((), dtype=jnp.float32), kind="batch_stats")
 
     def forward(self, x):
+        """Run the forward pass."""
         return x
 
 
@@ -55,6 +59,7 @@ def test_scan_outputs_stacked_ys():
     xs = jnp.ones((4, 2))
 
     def step(m, x):
+        """Execute one training step and return the result."""
         return m(x)
 
     ys = spx.scan(step, m, xs)
@@ -126,6 +131,7 @@ def test_associative_scan_rejects_module_writes():
     m = _Accumulator()
 
     def combine(mod, a, b):
+        """Combine helper."""
         mod.acc.value = mod.acc.value + 1.0
         return a + b
 

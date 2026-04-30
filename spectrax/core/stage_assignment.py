@@ -112,6 +112,9 @@ def assign_stage(*, total: int, current: int) -> Iterator[None]:
         ``None``. The hint is active only for the dynamic extent of the
         ``with`` body.
 
+    Returns:
+        A context manager that yields ``None``.
+
     Raises:
         TypeError: If ``current`` or ``total`` are not integer-coercible.
         ValueError: If the normalized values violate the slot invariants.

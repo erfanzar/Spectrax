@@ -55,6 +55,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.jit
                 def fn(mod, xb):
+                    """Helper function."""
                     return mod(xb)
 
         else:
@@ -64,6 +65,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.remat
                 def fn(mod, xb):
+                    """Helper function."""
                     return mod(xb)
 
         out = fn(model, x)
@@ -87,6 +89,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.jit
                 def fn(xb, *, model):
+                    """Helper function."""
                     return model(xb)
 
         else:
@@ -96,6 +99,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.remat
                 def fn(xb, *, model):
+                    """Helper function."""
                     return model(xb)
 
         out = fn(x, model=model)
@@ -121,6 +125,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.jit
                 def fn(lhs, rhs, xb):
+                    """Helper function."""
                     return lhs(xb) + rhs(xb)
 
         else:
@@ -130,6 +135,7 @@ def test_forward_transform_matrix(transform: str, placement: str, shape_kind: st
 
                 @spx.remat
                 def fn(lhs, rhs, xb):
+                    """Helper function."""
                     return lhs(xb) + rhs(xb)
 
         out = fn(left, right, x)
@@ -176,9 +182,11 @@ def test_autodiff_value_matrix(transform: str, placement: str, shape_kind: str, 
         gdef, state = spx.export(model)
 
         def loss(mod, xb, yb):
+            """Compute the loss."""
             return mse(mod(xb), yb)
 
         def ref_loss(state_, xb, yb):
+            """ref_loss helper."""
             return mse(spx.bind(gdef, state_)(xb), yb)
 
         if transform == "grad":
@@ -195,9 +203,11 @@ def test_autodiff_value_matrix(transform: str, placement: str, shape_kind: str, 
         gdef, state = spx.export(model)
 
         def loss(xb, mod, yb):
+            """Compute the loss."""
             return mse(mod(xb), yb)
 
         def ref_loss(state_, xb, yb):
+            """ref_loss helper."""
             return mse(spx.bind(gdef, state_)(xb), yb)
 
         if transform == "grad":
@@ -216,9 +226,11 @@ def test_autodiff_value_matrix(transform: str, placement: str, shape_kind: str, 
         right_gdef, right_state = spx.export(right)
 
         def loss(lhs, rhs, xb, yb):
+            """Compute the loss."""
             return mse(lhs(xb) + rhs(xb), yb)
 
         def ref_loss(left_state_, xb, yb):
+            """ref_loss helper."""
             lhs = spx.bind(left_gdef, left_state_)
             rhs = spx.bind(right_gdef, right_state)
             return mse(lhs(xb) + rhs(xb), yb)
@@ -250,6 +262,7 @@ def test_autodiff_linearization_matrix(transform: str, placement: str, shape_kin
         module_tangent = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.125), model)
 
         def ref_apply(state_, xb):
+            """ref_apply helper."""
             return spx.bind(gdef, state_)(xb)
 
         if transform == "jvp_state":
@@ -277,6 +290,7 @@ def test_autodiff_linearization_matrix(transform: str, placement: str, shape_kin
         module_tangent = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.125), model)
 
         def ref_apply(xb, state_):
+            """ref_apply helper."""
             return spx.bind(gdef, state_)(xb)
 
         if transform == "jvp_state":
@@ -308,6 +322,7 @@ def test_autodiff_linearization_matrix(transform: str, placement: str, shape_kin
         right_module_tangent = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.125), right)
 
         def ref_apply(left_state_, right_state_, xb):
+            """ref_apply helper."""
             lhs = spx.bind(left_gdef, left_state_)
             rhs = spx.bind(right_gdef, right_state_)
             return lhs(xb) + rhs(xb)

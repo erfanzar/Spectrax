@@ -386,6 +386,13 @@ def while_loop(
 
     Returns:
         The final ``user_carry`` after the loop terminates.
+
+    Raises:
+        ValueError: If the invariant portion of the state changes
+            structurally across iterations.
+        IllegalMutationError: If a direct write to the live module
+            occurs on the readonly fast path, or if a mutation lands
+            outside the ``mutable`` selector.
     """
     mutable_sel = resolve_mutable(mutable)
     gdef, state = export(init_module)
@@ -500,6 +507,13 @@ def fori_loop(
 
     Returns:
         The final ``user_carry`` after ``upper - lower`` iterations.
+
+    Raises:
+        ValueError: If the invariant portion of the state changes
+            structurally across iterations.
+        IllegalMutationError: If a direct write to the live module
+            occurs on the readonly fast path, or if a mutation lands
+            outside the ``mutable`` selector.
     """
     mutable_sel = resolve_mutable(mutable)
     gdef, state = export(init_module)
@@ -623,6 +637,13 @@ def remat_scan(
 
     Returns:
         The stacked per-step ``y`` outputs.
+
+    Raises:
+        ValueError: If the invariant portion of the state changes
+            structurally across iterations.
+        IllegalMutationError: If a direct write to the live module
+            occurs on the readonly fast path, or if a mutation lands
+            outside the ``mutable`` selector.
     """
     mutable_sel = resolve_mutable(mutable)
     if mutable_sel is None:

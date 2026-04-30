@@ -29,11 +29,13 @@ from ._dynamic_helpers import (
 
 
 def _state_forward(gdef, state, x):
+    """State-aware forward helper."""
     model = spx.bind(gdef, state)
     return model(x)
 
 
 def _manual_loop(model, x, steps: int) -> jax.Array:
+    """Manual loop implementation."""
     out = x
     for _ in range(steps):
         out = model(out)
@@ -41,6 +43,7 @@ def _manual_loop(model, x, steps: int) -> jax.Array:
 
 
 def _mutating_scan_impl(transform: str, model: StatefulAffine, xs: jax.Array, *, mutable=()) -> Any:
+    """Mutating scan implementation."""
     if transform == "scan":
         return spx.scan(lambda mod, x: mod(x, mutate=True, amount=1.0), model, xs, mutable=mutable)
     if transform == "remat_scan":
@@ -49,7 +52,10 @@ def _mutating_scan_impl(transform: str, model: StatefulAffine, xs: jax.Array, *,
 
 
 def _key_drift_scan_impl(transform: str, model: StatefulAffine, xs: jax.Array) -> Any:
+    """Key-drift scan implementation."""
+
     def body(mod, x):
+        """Loop body function."""
         mod.extra = spx.Buffer(jnp.array(1.0, dtype=x.dtype), kind="batch_stats")
         return mod(x)
 
@@ -109,6 +115,7 @@ def test_jit_dynamic_matches_eager(shape_kind: str, form: str, placement: str):
 
             @spx.jit
             def fn(mod, x):
+                """Helper function."""
                 return mod(x)
 
         model = Affine()
@@ -121,6 +128,7 @@ def test_jit_dynamic_matches_eager(shape_kind: str, form: str, placement: str):
 
             @spx.jit
             def fn(x, *, model):
+                """Helper function."""
                 return model(x)
 
         model = Affine()
@@ -135,6 +143,7 @@ def test_jit_dynamic_matches_eager(shape_kind: str, form: str, placement: str):
 
             @spx.jit
             def fn(lhs, rhs, x):
+                """Helper function."""
                 return lhs(x) + rhs(x)
 
         out = fn(left, right, x)
@@ -152,9 +161,11 @@ def test_grad_dynamic_matches_state_reference(shape_kind: str):
     gdef, state = spx.export(model)
 
     def loss(mod, xb, yb):
+        """Compute the loss."""
         return mse(mod(xb), yb)
 
     def ref_loss(state_, xb, yb):
+        """ref_loss helper."""
         return mse(_state_forward(gdef, state_, xb), yb)
 
     grads = spx.grad(loss)(model, x, target)
@@ -171,10 +182,12 @@ def test_value_and_grad_dynamic_has_aux_matches_reference(shape_kind: str):
     gdef, state = spx.export(model)
 
     def loss(mod, xb, yb):
+        """Compute the loss."""
         pred = mod(xb)
         return mse(pred, yb), pred.shape
 
     def ref_loss(state_, xb, yb):
+        """ref_loss helper."""
         pred = _state_forward(gdef, state_, xb)
         return mse(pred, yb)
 
@@ -196,6 +209,7 @@ def test_jvp_dynamic_matches_state_reference(shape_kind: str):
     gdef, state = spx.export(model)
 
     def ref_apply(state_, xb):
+        """ref_apply helper."""
         return _state_forward(gdef, state_, xb)
 
     ref_out, ref_tangent = jax.jvp(ref_apply, (state, x), (state_tangent, x_tangent))
@@ -216,6 +230,7 @@ def test_vjp_dynamic_matches_state_reference(shape_kind: str):
     gdef, state = spx.export(model)
 
     def ref_apply(state_, xb):
+        """ref_apply helper."""
         return _state_forward(gdef, state_, xb)
 
     out, pullback = spx.vjp(lambda mod, xb: mod(xb), model, x)
@@ -272,10 +287,12 @@ def test_control_flow_dynamic_matches_reference(op: str):
     else:
 
         def cond_fn(_mod, carry):
+            """Condition function."""
             i, _x = carry
             return i < 3
 
         def body_fn(mod, carry):
+            """Body function for loop/cond."""
             i, xb = carry
             return i + 1, mod(xb)
 
@@ -326,6 +343,7 @@ def test_jit_wrapped_control_flow_matches_eager(op: str):
     if op == "cond":
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.cond(
                 jnp.bool_(True),
                 lambda inner, v: inner(v) + 1.0,
@@ -336,6 +354,7 @@ def test_jit_wrapped_control_flow_matches_eager(op: str):
     elif op == "switch":
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.switch(
                 jnp.int32(1),
                 [
@@ -349,10 +368,12 @@ def test_jit_wrapped_control_flow_matches_eager(op: str):
     elif op == "fori_loop":
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.fori_loop(0, 3, lambda _i, inner, carry: inner(carry), mod, xb)
     else:
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.while_loop(
                 lambda _inner, carry: carry[0] < 3,
                 lambda inner, carry: (carry[0] + 1, inner(carry[1])),
@@ -375,11 +396,13 @@ def test_jit_wrapped_autodiff_matches_eager(transform: str):
     x_tangent = make_tangent("batch")
 
     def loss(mod, xb, yb):
+        """Compute the loss."""
         return mse(mod(xb), yb)
 
     if transform == "grad":
 
         def eager(mod, xb, yb):
+            """Eager execution helper."""
             return spx.grad(loss)(mod, xb, yb)
 
         compiled = spx.jit(eager)
@@ -387,6 +410,7 @@ def test_jit_wrapped_autodiff_matches_eager(transform: str):
     elif transform == "value_and_grad":
 
         def eager(mod, xb, yb):
+            """Eager execution helper."""
             return spx.value_and_grad(loss)(mod, xb, yb)
 
         compiled = spx.jit(eager)
@@ -397,6 +421,7 @@ def test_jit_wrapped_autodiff_matches_eager(transform: str):
     elif transform == "jvp_state":
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.jvp(lambda inner, val: inner(val), (mod, xb), (state_tangent, x_tangent))
 
         compiled = spx.jit(eager)
@@ -407,6 +432,7 @@ def test_jit_wrapped_autodiff_matches_eager(transform: str):
     elif transform == "jvp_module":
 
         def eager(mod, xb):
+            """Eager execution helper."""
             return spx.jvp(lambda inner, val: inner(val), (mod, xb), (module_tangent, x_tangent))
 
         compiled = spx.jit(eager)
@@ -417,6 +443,7 @@ def test_jit_wrapped_autodiff_matches_eager(transform: str):
     else:
 
         def eager(mod, xb):
+            """Eager execution helper."""
             out, pullback = spx.vjp(lambda inner, val: inner(val), mod, xb)
             grad_mod, grad_x = pullback(jnp.ones_like(out))
             return out, grad_mod, grad_x
@@ -438,6 +465,7 @@ def test_grad_through_scan_family_matches_state_reference(transform: str):
     gdef, state = spx.export(model)
 
     def loss(mod, xb, yb):
+        """Compute the loss."""
         if transform == "scan":
             ys = spx.scan(lambda inner, x: inner(x), mod, xb)
         else:
@@ -445,6 +473,7 @@ def test_grad_through_scan_family_matches_state_reference(transform: str):
         return mse(ys, yb)
 
     def ref_loss(state_, xb, yb):
+        """ref_loss helper."""
         rebound = spx.bind(gdef, state_)
         ys = jnp.stack([rebound(xb[i]) for i in range(xb.shape[0])], axis=0)
         return mse(ys, yb)
@@ -471,6 +500,7 @@ def test_pure_transforms_reject_undeclared_mutation(transform: str):
     x = make_input("batch")
 
     def fn(mod, xb):
+        """Helper function."""
         return mod(xb, mutate=True, amount=1.0)
 
     with pytest.raises(spx.IllegalMutationError):
@@ -560,6 +590,7 @@ def test_control_flow_rejects_invariant_key_drift(transform: str):
         elif transform == "fori_loop":
 
             def body(_i, mod, carry):
+                """Loop body function."""
                 mod.extra = spx.Buffer(jnp.array(1.0), kind="batch_stats")
                 return carry
 
@@ -567,6 +598,7 @@ def test_control_flow_rejects_invariant_key_drift(transform: str):
         else:
 
             def body(mod, carry):
+                """Loop body function."""
                 mod.extra = spx.Buffer(jnp.array(1.0), kind="batch_stats")
                 return carry[0] + 1, carry[1]
 

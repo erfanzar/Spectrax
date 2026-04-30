@@ -120,6 +120,15 @@ def main():
 
             @sxjit(mesh=mesh.mpmd_mesh)
             def prefill(model, ids):
+                """Two-stage @sxjit prefill: embed -> blocks[:mid] -> iter -> blocks[mid:] -> head.
+
+                Args:
+                    model: :class:`Llama3` instance.
+                    ids: Token ids ``(b, seq)``.
+
+                Returns:
+                    Logits tensor ``(b, seq, vocab)``.
+                """
                 x = model.embed(ids)
                 for blk in model.blocks[:mid]:
                     x = blk(x)
@@ -132,6 +141,15 @@ def main():
 
             @sxjit(mesh=mesh.mpmd_mesh)
             def prefill(model, ids):
+                """Four-stage @sxjit prefill with three ``sxstage_iter`` markers.
+
+                Args:
+                    model: :class:`Llama3` instance.
+                    ids: Token ids ``(b, seq)``.
+
+                Returns:
+                    Logits tensor ``(b, seq, vocab)``.
+                """
                 x = model.embed(ids)
                 for blk in model.blocks[:mid]:
                     x = blk(x)

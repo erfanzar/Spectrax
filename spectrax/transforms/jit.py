@@ -134,6 +134,56 @@ def jit(
 ) -> F:
     """Module-aware ``jax.jit``.
 
+    Compiles ``fn`` via :func:`jax.jit` while transparently handling
+    :class:`~spectrax.Module` arguments. On the first call with a given
+    module structure, each :class:`~spectrax.Module` argument is
+    exported to ``(GraphDef, State)``, the state is threaded through the
+    compiled function, and after the call any mutations to
+    declared-mutable collections are written back to the live module.
+
+    **Compiled signature when ``mutable`` is set**
+
+    When ``mutable`` resolves to a non-empty selector, the compiled
+    function's argument layout becomes ``(states, stripped_args,
+    stripped_kwargs)`` rather than the user's original signature. This
+    means ``static_argnums``, ``donate_argnums``, ``in_shardings``, and
+    ``out_shardings`` index into that 3-tuple. When in doubt, prefer
+    the ``*_argnames`` variants which resolve by name before stripping.
+
+    **In-Out kwargs**
+
+    ``in_shardings`` and ``out_shardings`` (plus ``static_argnums``,
+    ``static_argnames``, ``donate_argnums``, ``donate_argnames``,
+    ``batch_argnums``, ``keep_unused``, ``device``, ``backend``,
+    ``inline``, ``compiler_options``) are forwarded verbatim to
+    :func:`jax.jit`.
+
+    **Compile caching**
+
+    The returned wrapper maintains two internal caches:
+
+    * ``_spx_id_cache`` — identity-based hot-path cache keyed by Python
+      ``id()`` of input modules plus the current graph epoch. Same
+      instance + no structural change reuses the jitted callable in O(1).
+    * ``_spx_compile_cache`` — structural cache keyed by the full
+      ``GraphDef`` tuple. Handles model swaps and distinct instances
+      with identical structure.
+
+    **MPMD dispatch**
+
+    If ``mesh`` is an MPMD mesh, the call routes to
+    :func:`spectrax.runtime.mpmd.sxjit` instead of :func:`jax.jit`. In
+    that mode ``mutable``, ``donate_argnames``, ``keep_unused``,
+    ``device``, ``backend``, ``inline``, and ``compiler_options`` are
+    unsupported and raise :class:`ValueError`.
+
+    **Lowered representation**
+
+    The returned callable has a ``.lower(*args, **kwargs)`` method that
+    mirrors :meth:`jax.jit.lower` and returns a
+    :class:`jax.stages.Lowered` object without dispatching the compiled
+    function.
+
     Args:
         fn: The function to compile. When called without ``fn`` the
             decorator returns a factory: ``@spx.jit(mutable=...)``.
@@ -143,15 +193,38 @@ def jit(
             directly to :func:`spectrax.runtime.mpmd.sxjit`.
         schedule: Optional MPMD schedule, forwarded only when ``mesh`` is
             MPMD.
-        in_shardings, out_shardings, static_argnums, static_argnames,
-            donate_argnums, donate_argnames, batch_argnums, keep_unused, device,
-            backend, inline, compiler_options: Forwarded verbatim to
+        in_shardings: Optional sharding constraint for inputs; forwarded
+            to :func:`jax.jit`.
+        out_shardings: Optional sharding constraint for outputs;
+            forwarded to :func:`jax.jit`.
+        static_argnums: Indices of positional arguments that should be
+            treated as compile-time constants; forwarded to
             :func:`jax.jit`.
+        static_argnames: Names of keyword arguments that should be
+            treated as compile-time constants; forwarded to
+            :func:`jax.jit`.
+        donate_argnums: Indices of positional arguments whose buffers
+            may be donated to the output; forwarded to :func:`jax.jit`.
+        donate_argnames: Names of keyword arguments whose buffers may
+            be donated; forwarded to :func:`jax.jit`.
+        batch_argnums: MPMD-only; indices of positional arguments that
+            represent batch dimensions. Requires an MPMD mesh.
+        keep_unused: Forwarded to :func:`jax.jit`.
+        device: Forwarded to :func:`jax.jit`.
+        backend: Forwarded to :func:`jax.jit`.
+        inline: Forwarded to :func:`jax.jit`.
+        compiler_options: Forwarded to :func:`jax.jit`.
 
     Returns:
         A wrapped function. The first call per distinct
         :class:`~spectrax.GraphDef` tuple triggers a JAX trace; later
         calls with matching graph-defs re-use the cached compile.
+
+    Raises:
+        ValueError: If ``schedule`` is provided without an MPMD mesh, or
+            if ``batch_argnums`` is provided without an MPMD mesh with
+            a schedule, or if an unsupported option is passed when
+            routing to ``sxjit``.
     """
     if fn is None:
         return lambda f: jit(

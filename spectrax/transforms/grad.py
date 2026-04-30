@@ -241,6 +241,10 @@ def grad(
         A wrapped callable returning ``grads`` (or ``(grads, aux)`` if
         ``has_aux`` is set), where ``grads`` is a
         :class:`~spectrax.State` parallel to the selected subset.
+
+    Raises:
+        TypeError: If the resolved positional argument is not a
+            :class:`~spectrax.Module`.
     """
     if fn is None:
         return lambda f: grad(
@@ -328,6 +332,11 @@ def vjp(
     Returns:
         Either ``(out, pullback)`` / ``(out, pullback, aux)`` when
         primals are supplied, or a wrapper callable otherwise.
+
+    Raises:
+        TypeError: If keyword arguments are supplied in the wrapped-call
+            form (the decorator-mode wrapper rejects kwargs to match
+            :func:`jax.vjp` semantics).
     """
     if fn is None:
         return lambda f: vjp(f, has_aux=has_aux, reduce_axes=reduce_axes, mutable=mutable)
@@ -501,6 +510,18 @@ def _splice_module_cotangents(
     produced for the non-module pytree positions plus the cotangents for
     the module states, and slots the module cotangents back into the
     positions they occupied in the user's primal tuple.
+
+    Args:
+        refs: Located module refs from
+            :func:`~spectrax.transforms.split_merge.locate_and_strip_fast`.
+        stripped_cotangents: Cotangents for the non-module pytree
+            positions, in the same order as the stripped positional args.
+        state_cotangents: Cotangents for each module state, parallel to
+            ``refs``.
+
+    Returns:
+        A tuple parallel to the user's original primal tuple with module
+        cotangents re-inserted at their original positions.
     """
     out = list(stripped_cotangents)
     for ref, ct in zip(refs, state_cotangents, strict=False):
@@ -614,6 +635,15 @@ def _convert_direct_cotangents(primals: tuple[Any, ...], cotangents: tuple[Any, 
     cotangent that corresponds to a :class:`~spectrax.Module` primal
     into a :class:`~spectrax.State` via :func:`_module_like_to_state`.
     Non-module cotangents pass through unchanged.
+
+    Args:
+        primals: User-supplied primal tuple; used to identify which
+            cotangent positions correspond to modules.
+        cotangents: JAX-produced cotangents, parallel to ``primals``.
+
+    Returns:
+        A tuple parallel to ``cotangents`` where every module-associated
+        entry has been converted to :class:`~spectrax.State`.
     """
     out: list[Any] = []
     for primal, cotangent in zip(primals, cotangents, strict=False):

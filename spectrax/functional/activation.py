@@ -230,10 +230,17 @@ def hard_silu(x: ArrayLike) -> Array:
 
 
 def hard_swish(x: ArrayLike) -> Array:
-    """Alias for :func:`hard_silu`.
+    """Piecewise-linear approximation of swish: ``x * hard_sigmoid(x)``.
 
-    The two names refer to the same operation; ``swish`` is the original
-    Google name and ``silu`` is the convention in PyTorch / JAX.
+    Alias for :func:`hard_silu`; the two names refer to the same
+    operation. ``swish`` is the original Google name and ``silu`` is the
+    convention in PyTorch / JAX.
+
+    Args:
+        x: Input array of any shape and floating-point dtype.
+
+    Returns:
+        ``jax.nn.hard_silu(x)`` — same shape and dtype as ``x``.
     """
     return jax.nn.hard_silu(x)
 

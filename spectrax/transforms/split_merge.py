@@ -119,6 +119,14 @@ def locate_and_strip_fast(args: tuple[Any, ...]) -> tuple[list[_ModuleRef], tupl
     exported into a :class:`_ModuleRef` and replaced by ``None`` in the
     stripped tuple. Used by :func:`~spectrax.jit`'s kwargs-empty hot
     path (the common case for training-step wrappers).
+
+    Args:
+        args: Positional arguments passed to the wrapped function.
+
+    Returns:
+        A pair ``(refs, stripped_args)`` where ``refs`` is a list of
+        :class:`_ModuleRef` and ``stripped_args`` is ``args`` with every
+        :class:`~spectrax.Module` replaced by ``None``.
     """
     refs: list[_ModuleRef] = []
     stripped: list[Any] = []
@@ -584,6 +592,15 @@ def make_pure(fn: Callable[..., Any], refs: list[_ModuleRef]) -> PureFn:
     comparison work to do on the dispatch hot path. The net effect
     is that a pure forward pass through jit returns an empty state
     tuple for every module.
+
+    Args:
+        fn: The user function being traced.
+        refs: Module refs produced by :func:`locate_and_strip`.
+
+    Returns:
+        A pure callable with signature
+        ``(states, stripped_args, stripped_kwargs) -> (out, new_states)``
+        consumable by :func:`jax.jit`.
     """
     gdefs = tuple(r.gdef for r in refs)
     orig_modules = tuple(r.module for r in refs)
@@ -608,6 +625,15 @@ def make_pure_readonly(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callab
     :class:`~spectrax.IllegalMutationError` at trace time. Returns
     only the user output — there is no second tuple element for
     captured states because none are allowed to change.
+
+    Args:
+        fn: The user function being traced.
+        refs: Module refs produced by :func:`locate_and_strip`.
+
+    Returns:
+        A pure callable with signature
+        ``(states, stripped_args, stripped_kwargs) -> out`` consumable
+        by :func:`jax.jit`.
     """
     gdefs = tuple(r.gdef for r in refs)
     orig_modules = tuple(r.module for r in refs)
@@ -706,6 +732,15 @@ def make_pure_readonly_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Ca
     through :func:`_run_readonly_body` so any variable write raises
     :class:`~spectrax.IllegalMutationError` at trace time. Used by the
     scope-aware readonly path of :func:`~spectrax.jit`.
+
+    Args:
+        fn: The user function being traced.
+        refs: Module refs produced by :func:`locate_and_strip`.
+
+    Returns:
+        A pure callable with signature
+        ``(states, traced_ctx, stripped_args, stripped_kwargs) -> out``
+        consumable by :func:`jax.jit`.
     """
     gdefs = tuple(r.gdef for r in refs)
     orig_modules = tuple(r.module for r in refs)

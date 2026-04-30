@@ -44,7 +44,12 @@ def _get_stack() -> list["Policy"]:
 
 
 def current_policy() -> "Policy | None":
-    """Return the innermost active :class:`Policy`, or ``None``."""
+    """Return the innermost active :class:`Policy`, or ``None``.
+
+    Returns:
+        The currently-enforced dtype policy, or ``None`` when no policy
+        has been pushed.
+    """
     s = _get_stack()
     return s[-1] if s else None
 
@@ -55,6 +60,12 @@ def push_policy(policy: "Policy | None") -> Iterator[None]:
 
     ``None`` is a no-op (so callers can guardlessly push the result of
     ``module._spx_policy``).
+
+    Args:
+        policy: The :class:`Policy` to activate, or ``None`` for a no-op.
+
+    Yields:
+        Control passes to the caller's ``with`` body.
     """
     if policy is None:
         yield
@@ -85,13 +96,29 @@ class Policy:
     output_dtype: DType | None = None
 
     def cast_param(self, x: ArrayLike) -> Array:
-        """Cast ``x`` to ``compute_dtype`` (or identity if unset)."""
+        """Cast ``x`` to :attr:`compute_dtype` (or identity if unset).
+
+        Args:
+            x: Array-like value to cast.
+
+        Returns:
+            The casted :class:`Array`, or ``x`` unchanged when
+            :attr:`compute_dtype` is ``None``.
+        """
         if self.compute_dtype is None:
             return jnp.asarray(x)
         return jnp.asarray(x, dtype=self.compute_dtype)
 
     def cast_output(self, x: ArrayLike) -> Array:
-        """Cast ``x`` to ``output_dtype`` (or identity if unset)."""
+        """Cast ``x`` to :attr:`output_dtype` (or identity if unset).
+
+        Args:
+            x: Array-like value to cast.
+
+        Returns:
+            The casted :class:`Array`, or ``x`` unchanged when
+            :attr:`output_dtype` is ``None``.
+        """
         if self.output_dtype is None:
             return jnp.asarray(x)
         return jnp.asarray(x, dtype=self.output_dtype)
@@ -99,7 +126,15 @@ class Policy:
     def storage_dtype(self, fallback: DType | None) -> DType | None:
         """Return the dtype parameters should be stored as.
 
-        If ``param_dtype`` is set it takes precedence; otherwise
+        If :attr:`param_dtype` is set it takes precedence; otherwise
         ``fallback`` is returned (typically the layer's declared dtype).
+
+        Args:
+            fallback: The dtype to fall back to when :attr:`param_dtype`
+                is ``None``.
+
+        Returns:
+            The resolved storage dtype, or ``None`` when both
+            :attr:`param_dtype` and ``fallback`` are ``None``.
         """
         return self.param_dtype if self.param_dtype is not None else fallback

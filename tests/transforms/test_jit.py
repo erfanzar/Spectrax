@@ -45,6 +45,7 @@ def test_jit_decorator_form():
 
     @spx.jit
     def step(m, x):
+        """Execute one training step and return the result."""
         return m(x)
 
     m = Net(rngs=Rngs(0))
@@ -68,6 +69,7 @@ def test_jit_mutable_required_for_batch_stats():
 
     @spx.jit
     def step(m, x):
+        """Execute one training step and return the result."""
         return m(x)
 
     m = Net(rngs=Rngs(0))
@@ -81,6 +83,7 @@ def test_jit_mutable_declared_propagates_back():
 
     @spx.jit(mutable="batch_stats")
     def step(m, x):
+        """Execute one training step and return the result."""
         return m(x)
 
     m = Net(rngs=Rngs(0))
@@ -95,6 +98,7 @@ def test_jit_mutable_empty_is_equivalent_to_no_mutable():
 
     @spx.jit(mutable=())
     def step(m, x):
+        """Execute one training step and return the result."""
         return m(x)
 
     m = Net(rngs=Rngs(0))
@@ -108,6 +112,7 @@ def test_jit_module_in_kwargs():
 
     @spx.jit
     def fn(x, *, model):
+        """Helper function."""
         return model(x)
 
     m = Linear(4, 4, rngs=Rngs(0))
@@ -181,6 +186,7 @@ def test_jit_with_mpmd_mesh_routes_to_sxjit():
 
     @spx.jit(mesh=mesh)
     def step(x):
+        """Execute one training step and return the result."""
         for stage in range(n - 1):
             x = x + 1
             x = spx.sxstage_iter(x, stage=stage)
@@ -199,6 +205,7 @@ def test_jit_with_mpmd_mesh_preserves_output_pytree():
 
     @spx.jit(mesh=mesh)
     def step(x):
+        """Execute one training step and return the result."""
         for stage in range(n - 1):
             x = x + 1
             x = spx.sxstage_iter(x, stage=stage)
@@ -218,6 +225,7 @@ def test_jit_with_non_mpmd_mesh_keeps_module_aware_jit_path():
 
     @spx.jit(mesh=mesh)
     def step(x):
+        """Execute one training step and return the result."""
         return x + 2
 
     out = step(jnp.asarray(1.0))

@@ -96,6 +96,7 @@ def test_split_rngs_clones_unsplit_streams_under_jit():
 
     @jax.jit
     def draw_from_unsplit_stream(r):
+        """Draw from an unsplit RNG stream."""
         with split_rngs(r, axis_size=2, only=("default",)) as forks:
             return jax.random.key_data(forks[0].key("dropout"))
 

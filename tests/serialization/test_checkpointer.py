@@ -142,6 +142,7 @@ class TestCheckpointer:
         called_with = {}
 
         def cb(dest, m, meta):
+            """Callback function."""
             called_with["dest"] = dest
             called_with["step"] = meta["step"]
 

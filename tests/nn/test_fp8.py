@@ -218,6 +218,7 @@ def test_fp8_linear_updates_meta_under_jit():
 
     @spx.jit(mutable="fp8_meta")
     def fwd(m, x):
+        """Forward pass helper."""
         return m(x)
 
     _ = fwd(lin, x)
@@ -233,7 +234,10 @@ def test_fp8_linear_grad_flows_to_weight():
 
     @spx.jit(mutable="fp8_meta")
     def step(m, x):
+        """Execute one training step and return the result."""
+
         def loss(m, x):
+            """Compute the loss."""
             return (m(x) ** 2).sum()
 
         return spx.grad(loss)(m, x)

@@ -71,6 +71,7 @@ def test_get_partition_spec_returns_collection_dict():
 
 
 def test_partition_axis_resolves_builtin_semantics_and_generation_mode():
+    """Partition axis resolves builtin semantics and generation mode."""
     paxis = PartitionAxis(data_parallel_axis="dp", tensor_parallel_axis="tp", sequence_parallel_axis="sp")
 
     assert paxis.resolve_axis([ct.BATCH, ct.HEAD, ct.EMPTY], mode=ct.MODE_TRAIN) == [
@@ -105,6 +106,7 @@ def test_partition_axis_register_rejects_missing_axis_rule():
 
 
 def test_partition_manager_context_drives_apply_logical_sharding():
+    """Partition manager context drives apply logical sharding."""
     paxis = PartitionAxis(batch_axis=None, query_sequence_axis=None, hidden_state_axis=None)
     x = jnp.ones((2, 3, 4), dtype=jnp.float32)
 
@@ -115,6 +117,7 @@ def test_partition_manager_context_drives_apply_logical_sharding():
 
 
 def test_partition_helpers_preserve_tree_structure_and_sanitize_missing_mesh_axes():
+    """Partition helpers preserve tree structure and sanitize missing mesh axes."""
     tree = {"model": {"weight": jnp.ones((4, 8)), "bias": jnp.ones((8,))}}
     specs = spx.match_partition_rules(
         [(r"model/weight", jax.sharding.PartitionSpec("fsdp", "tp")), (r".*", jax.sharding.PartitionSpec())],
@@ -151,10 +154,14 @@ def test_apply_logical_sharding_resolve_fallback_honors_auto_correct(monkeypatch
     seen = {}
 
     class ResolveOnly:
+        """Fixture class for testing."""
+
         def resolve(self, **_kwargs):
+            """Resolve helper."""
             return jax.sharding.PartitionSpec("tp")
 
     def fake_constraint(x, spec):
+        """Fake constraint for testing."""
         seen["spec"] = spec
         return x
 
@@ -171,6 +178,7 @@ def test_with_sharding_constraint_propagates_jax_errors(monkeypatch):
     from spectrax.sharding import partition as partition_mod
 
     def boom(*_args, **_kwargs):
+        """Helper that raises an error."""
         raise RuntimeError("constraint boom")
 
     monkeypatch.setattr(jax.lax, "with_sharding_constraint", boom)
@@ -180,6 +188,7 @@ def test_with_sharding_constraint_propagates_jax_errors(monkeypatch):
 
 
 def test_mesh_query_helpers_exclude_mpmd_axis_from_spmd_axes():
+    """Mesh query helpers exclude mpmd axis from spmd axes."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
 
     assert spx.names_in_current_mesh("tp", mesh=mesh)
@@ -193,6 +202,7 @@ def test_mesh_query_helpers_exclude_mpmd_axis_from_spmd_axes():
 
 
 def test_mpmd_with_sharding_constraint_uses_explicit_stage_mesh():
+    """Mpmd with sharding constraint uses explicit stage mesh."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     x = jnp.ones((2, 4), dtype=jnp.float32)
 
@@ -204,6 +214,7 @@ def test_mpmd_with_sharding_constraint_uses_explicit_stage_mesh():
 
 
 def test_mpmd_with_sharding_constraint_promotes_active_raw_mesh():
+    """Mpmd with sharding constraint promotes active raw mesh."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     x = jnp.ones((2, 4), dtype=jnp.float32)
 
@@ -219,6 +230,7 @@ def test_mpmd_with_sharding_constraint_promotes_active_raw_mesh():
 
 
 def test_mpmd_with_sharding_constraint_can_be_ignored():
+    """Mpmd with sharding constraint can be ignored."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     x = jnp.ones((2, 4), dtype=jnp.float32)
 
@@ -233,6 +245,7 @@ def test_mpmd_with_sharding_constraint_can_be_ignored():
 
 
 def test_with_sharding_constraint_handles_pytrees():
+    """With sharding constraint handles pytrees."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     batch = {"x": jnp.ones((2, 4), dtype=jnp.float32)}
 
@@ -255,6 +268,7 @@ def test_with_sharding_constraint_handles_pytrees():
 
 
 def test_mpmd_with_sharding_constraint_uses_requested_stage_rank():
+    """Mpmd with sharding constraint uses requested stage rank."""
     if len(jax.devices()) < 2:
         pytest.skip("need at least 2 devices for multi-stage MPMD constraint test")
 
@@ -269,6 +283,7 @@ def test_mpmd_with_sharding_constraint_uses_requested_stage_rank():
 
 
 def test_lax_reshard_and_sharding_structure_are_mpmd_aware():
+    """Lax reshard and sharding structure are mpmd aware."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     tree = {"x": jnp.ones((2, 4), dtype=jnp.float32), "meta": 1}
 
@@ -284,6 +299,7 @@ def test_lax_reshard_and_sharding_structure_are_mpmd_aware():
 
 
 def test_lax_reshard_uses_active_spxmesh_context():
+    """Lax reshard uses active spxmesh context."""
     mesh = create_mesh(axis_dims=(1, -1), axis_names=("pp", "tp"), mpmd_axis="pp")
     x = jnp.ones((2, 4), dtype=jnp.float32)
 
@@ -299,6 +315,7 @@ def test_lax_reshard_uses_active_spxmesh_context():
 
 
 def test_lax_reshard_uses_active_assign_stage_context():
+    """Lax reshard uses active assign stage context."""
     if len(jax.devices()) < 2:
         pytest.skip("need at least 2 devices for multi-stage MPMD constraint test")
 
@@ -317,6 +334,7 @@ def test_lax_reshard_uses_active_assign_stage_context():
 
 
 def test_apply_logical_sharding_uses_active_spxmesh_and_assign_stage():
+    """Apply logical sharding uses active spxmesh and assign stage."""
     if len(jax.devices()) < 2:
         pytest.skip("need at least 2 devices for multi-stage MPMD constraint test")
 
@@ -358,7 +376,10 @@ def test_parameter_named_sharding_accepts_compound_physical_axis_names():
     """Physical mesh axis names can be used directly, including compound axes."""
 
     class Model(spx.Module):
+        """Fixture model module for testing."""
+
         def __init__(self):
+            """Initialize with weight."""
             super().__init__()
             self.weight = spx.Parameter(
                 jnp.ones((4, 4), dtype=jnp.float32),
@@ -375,7 +396,10 @@ def test_parameter_named_sharding_accepts_compound_logical_axis_names():
     """Compound entries can still resolve through logical-axis rules."""
 
     class Model(spx.Module):
+        """Fixture model module for testing."""
+
         def __init__(self):
+            """Initialize with weight."""
             super().__init__()
             self.weight = spx.Parameter(
                 jnp.ones((4, 4), dtype=jnp.float32),
@@ -393,7 +417,10 @@ def test_stage_tagged_variable_resolves_to_stage_local_namedsharding():
     """Stage-tagged vars on an MPMD mesh resolve to their owning sub-mesh."""
 
     class StageTagged(spx.Module):
+        """Fixture module for testing."""
+
         def __init__(self):
+            """Initialize the instance."""
             super().__init__()
             with spx.assign_stage(total=4, current=3):
                 self.weight = spx.Parameter(jnp.ones((2, 4)), sharding=("fsdp", "tp"))
@@ -430,6 +457,7 @@ def test_mpmd_mesh_orders_pipeline_axis_by_topology():
     coords = [tuple(float(v) for v in device.coords) for device in stage_devices]
 
     def dist(a, b):
+        """Distribution helper."""
         return sum((x - y) ** 2 for x, y in zip(a, b, strict=True))
 
     nearest_upper_bound = max(min(dist(c, other) for other in coords if other != c) for c in coords)
@@ -454,6 +482,7 @@ def test_variable_init_placement_hook_can_place_without_spx_mesh_context():
     seen = {}
 
     def place(value, metadata, explicit_sharding):
+        """Placement helper."""
         seen["metadata"] = dict(metadata)
         seen["explicit_sharding"] = explicit_sharding
         axis_names = metadata.get("axis_names")
@@ -478,9 +507,11 @@ def test_deferred_parameter_materialize_uses_variable_init_placement_hook():
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]).reshape((1,)), ("tp",))
 
     def init(_rngs, shape, dtype):
+        """Initialization helper."""
         return jnp.arange(np.prod(shape), dtype=dtype).reshape(shape)
 
     def place(value, metadata, _explicit_sharding):
+        """Placement helper."""
         axis_names = metadata.get("axis_names")
         if axis_names != ("batch", "hidden"):
             return None
@@ -561,6 +592,7 @@ def test_with_sharding_constraint_by_name_inside_jit_works():
     mesh = jax.sharding.Mesh(devices, ("dp",))
 
     def f(x):
+        """Helper function."""
         with logical_axis_rules([("batch", "dp"), ("features", None)]):
             return with_sharding_constraint_by_name(x, ("batch", "features"))
 

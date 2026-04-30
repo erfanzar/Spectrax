@@ -29,7 +29,10 @@ helpers that slice a traced :class:`Jaxpr` into per-stage sub-jaxprs.
 
 from __future__ import annotations
 
+import functools
 import itertools
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -40,12 +43,15 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 __all__ = [
     "cluster_jaxpr_by_markers",
+    "has_stage_regions",
     "marker_edge_shardings",
     "split_by_markers",
+    "stage_region_specs",
     "sxenter_loop",
     "sxexit_loop",
     "sxloop",
     "sxstage_iter",
+    "sxstage_region",
 ]
 
 
@@ -57,6 +63,102 @@ sxenter_loop_p.multiple_results = True
 
 sxexit_loop_p = Primitive("sxexit_loop")
 sxexit_loop_p.multiple_results = True
+
+sxstage_region_enter_p = Primitive("sxstage_region_enter")
+sxstage_region_enter_p.multiple_results = True
+
+sxstage_region_exit_p = Primitive("sxstage_region_exit")
+sxstage_region_exit_p.multiple_results = True
+
+
+@dataclass(frozen=True)
+class StageRegionSpec:
+    """Hashable metadata attached to :func:`sxstage_region` marker eqns."""
+
+    name: str | None
+    schedule_name: str | None
+    schedule_repr: str | None
+    microbatches: int | None
+    virtual_stages: int | None
+    batch_argnums: tuple[int, ...] | None
+    static_argnums: tuple[int, ...] | None
+    donate_argnums: tuple[int, ...] | None
+
+
+def _normalize_optional_argnums(argnums: Any) -> tuple[int, ...] | None:
+    """Coerce optional argnum spec to a tuple of ints (or ``None``).
+
+    Accepts ``None``, a single ``int``, or any iterable of ints. Each
+    element is passed through ``int()`` so string numbers are also
+    accepted.
+
+    Args:
+        argnums: User-supplied argnum specification.
+
+    Returns:
+        Normalised tuple, or ``None`` when the input was ``None``.
+    """
+    if argnums is None:
+        return None
+    if isinstance(argnums, int):
+        return (argnums,)
+    return tuple(int(argnum) for argnum in argnums)
+
+
+def _make_stage_region_spec(
+    name: str | None,
+    *,
+    schedule: Any = None,
+    batch_argnums: Any = None,
+    static_argnums: Any = None,
+    donate_argnums: Any = None,
+) -> StageRegionSpec:
+    """Build a :class:`StageRegionSpec` from user-facing :func:`sxstage_region` kwargs.
+
+    Extracts stable metadata from an optional schedule object (name,
+    microbatch count, virtual stages) and normalises the argnum specs.
+
+    Args:
+        name: Human-readable region name (may be ``None``).
+        schedule: Optional schedule object whose metadata is copied.
+        batch_argnums: Positional args to split into microbatches.
+        static_argnums: Positional args treated as compile-time constants.
+        donate_argnums: Positional args whose buffers may be donated.
+
+    Returns:
+        A frozen :class:`StageRegionSpec` ready to attach to marker eqns.
+    """
+    virtual_stages = None
+    if schedule is not None and hasattr(schedule, "virtual_stages_per_rank"):
+        virtual_stages = int(schedule.virtual_stages_per_rank())
+    return StageRegionSpec(
+        name=name,
+        schedule_name=None if schedule is None else type(schedule).__name__,
+        schedule_repr=None if schedule is None else repr(schedule),
+        microbatches=None if schedule is None else getattr(schedule, "microbatches", None),
+        virtual_stages=virtual_stages,
+        batch_argnums=_normalize_optional_argnums(batch_argnums),
+        static_argnums=_normalize_optional_argnums(static_argnums),
+        donate_argnums=_normalize_optional_argnums(donate_argnums),
+    )
+
+
+def _is_marker_leaf(x: Any) -> bool:
+    """Return whether ``x`` can safely be used as a JAX primitive operand."""
+    return hasattr(x, "aval") or (hasattr(x, "shape") and hasattr(x, "dtype"))
+
+
+def _bind_stage_region_marker(x: Any, primitive: Primitive, *, spec: StageRegionSpec) -> Any:
+    """Mark every JAX value leaf in ``x`` while leaving static leaves unchanged."""
+
+    def mark_leaf(leaf: Any) -> Any:
+        """Bind one leaf to the region primitive if it is a JAX traceable value."""
+        if not _is_marker_leaf(leaf):
+            return leaf
+        (marked,) = primitive.bind(leaf, spec=spec)
+        return marked
+
+    return jax.tree_util.tree_map(mark_leaf, x)
 
 
 def _normalize_sharding_axis(axis: Any) -> Any:
@@ -187,6 +289,189 @@ def _mpmd_stage_iter_batch(vector_arg_values, batch_axes, *, stage, sharding, tr
 
 
 batching.primitive_batchers[sxstage_iter_p] = _mpmd_stage_iter_batch
+
+
+def sxstage_region(
+    name: str | Callable | None = None,
+    *,
+    schedule: Any = None,
+    batch_argnums: Any = None,
+    static_argnums: Any = None,
+    donate_argnums: Any = None,
+) -> Any:
+    """Declare an independently schedulable pipeline stage region.
+
+    ``sxstage_region`` is a lightweight wrapper/decorator that records
+    region enter/exit markers around a sub-call inside a model forward.
+    The markers are identities for eager execution, normal JAX transforms,
+    and MLIR lowering. MPMD runtimes can use the metadata to build a
+    region graph instead of treating every :func:`sxstage_iter` marker as
+    part of one flat pipeline.
+
+    Example:
+
+    .. code-block:: python
+
+        vision = spx.sxstage_region("vision", schedule=spx.GPipe(4))(self.vision_model)
+        text = spx.sxstage_region("text", schedule=spx.DualPipeV(8))(self.language_model)
+        image_features = vision(pixel_values)
+        logits = text(input_ids, image_features)
+
+    Args:
+        name: Optional human-readable region name. If a callable is passed
+            directly, ``sxstage_region(fn)`` decorates it as an unnamed region.
+        schedule: Optional region-local schedule metadata. The schedule object
+            itself is not stored in the jaxpr; only stable identifying fields
+            are attached to marker params.
+        batch_argnums: Optional region-local batch/microbatch positional args.
+        static_argnums: Optional region-local static positional args.
+        donate_argnums: Optional region-local donated positional args.
+
+    Returns:
+        A decorator/wrapper object, or a wrapped callable when used as
+        ``sxstage_region(fn)``.
+    """
+
+    if callable(name) and not isinstance(name, str):
+        region = _StageRegion(
+            _make_stage_region_spec(
+                None,
+                schedule=schedule,
+                batch_argnums=batch_argnums,
+                static_argnums=static_argnums,
+                donate_argnums=donate_argnums,
+            )
+        )
+        return region(name)
+    return _StageRegion(
+        _make_stage_region_spec(
+            name,
+            schedule=schedule,
+            batch_argnums=batch_argnums,
+            static_argnums=static_argnums,
+            donate_argnums=donate_argnums,
+        )
+    )
+
+
+class _StageRegion:
+    """Callable object returned by :func:`sxstage_region`.
+
+    Wraps a user function with region-enter and region-exit markers so
+    the MPMD compiler can identify independently schedulable pipeline
+    segments. Can be used as a decorator (``@region``), a direct wrapper
+    (``region(fn)``), or a context manager (``with region:``).
+    """
+
+    def __init__(self, spec: StageRegionSpec):
+        """Store the region spec that will be attached to marker primitives.
+
+        Args:
+            spec: Frozen metadata describing this region's schedule and
+                argnum configuration.
+        """
+        self.spec = spec
+
+    def __call__(self, fn: Callable) -> Callable:
+        """Wrap ``fn`` with enter/exit markers.
+
+        Args:
+            fn: The callable to decorate. Must accept the same signature
+                as the original function.
+
+        Returns:
+            A wrapped callable that inserts region markers around its
+            inputs and outputs.
+
+        Raises:
+            TypeError: If ``fn`` is not callable.
+        """
+        if not callable(fn):
+            raise TypeError("sxstage_region(...) expects a callable to wrap.")
+
+        @functools.wraps(fn)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            """Run the original function with region markers on args/kwargs and output."""
+            marked_args, marked_kwargs = self.enter((args, kwargs))
+            out = fn(*marked_args, **marked_kwargs)
+            return self.exit(out)
+
+        return wrapped
+
+    def __enter__(self) -> "_StageRegion":
+        """Enter the context-manager protocol; returns ``self``."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        """Exit the context-manager protocol; does not suppress exceptions."""
+        del exc_type, exc, tb
+        return False
+
+    def enter(self, x: Any) -> Any:
+        """Insert a region-enter marker around ``x``."""
+        return _bind_stage_region_marker(x, sxstage_region_enter_p, spec=self.spec)
+
+    def exit(self, x: Any) -> Any:
+        """Insert a region-exit marker around ``x``."""
+        return _bind_stage_region_marker(x, sxstage_region_exit_p, spec=self.spec)
+
+
+@sxstage_region_enter_p.def_impl
+def _mpmd_stage_region_enter_impl(*args, spec):
+    """Eager impl rule for :data:`sxstage_region_enter_p`: identity."""
+    del spec
+    return args
+
+
+@sxstage_region_enter_p.def_abstract_eval
+def _mpmd_stage_region_enter_abs(*args, spec):
+    """Abstract-eval rule for :data:`sxstage_region_enter_p`: identity."""
+    del spec
+    return args
+
+
+@sxstage_region_exit_p.def_impl
+def _mpmd_stage_region_exit_impl(*args, spec):
+    """Eager impl rule for :data:`sxstage_region_exit_p`: identity."""
+    del spec
+    return args
+
+
+@sxstage_region_exit_p.def_abstract_eval
+def _mpmd_stage_region_exit_abs(*args, spec):
+    """Abstract-eval rule for :data:`sxstage_region_exit_p`: identity."""
+    del spec
+    return args
+
+
+def _mpmd_stage_region_transpose(cotangents, *args, spec):
+    """Linear transpose for region markers: cotangents pass through."""
+    del args, spec
+    return cotangents
+
+
+ad.deflinear2(sxstage_region_enter_p, _mpmd_stage_region_transpose)
+ad.deflinear2(sxstage_region_exit_p, _mpmd_stage_region_transpose)
+
+
+def _mpmd_stage_region_lowering(ctx, *args, spec):
+    """MLIR lowering for region markers: pass operands through."""
+    del ctx, spec
+    return list(args)
+
+
+mlir.register_lowering(sxstage_region_enter_p, _mpmd_stage_region_lowering)
+mlir.register_lowering(sxstage_region_exit_p, _mpmd_stage_region_lowering)
+
+
+def _mpmd_stage_region_batch(vector_arg_values, batch_axes, *, spec):
+    """``vmap`` rule for region markers: axes pass through unchanged."""
+    del spec
+    return vector_arg_values, batch_axes
+
+
+batching.primitive_batchers[sxstage_region_enter_p] = _mpmd_stage_region_batch
+batching.primitive_batchers[sxstage_region_exit_p] = _mpmd_stage_region_batch
 
 
 def sxenter_loop(x: Any, *, name: str | None = None) -> Any:
@@ -370,6 +655,68 @@ def marker_edge_shardings(jaxpr: Jaxpr) -> list[PartitionSpec | None]:
     return [eqn.params.get("sharding") for eqn in jaxpr.eqns if eqn.primitive is sxstage_iter_p]
 
 
+_REGION_PRIMITIVES = (sxstage_region_enter_p, sxstage_region_exit_p)
+
+
+def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
+    """Return all :func:`sxstage_region` specs found in ``jaxpr`` order.
+
+    Nested jaxprs in primitive params (for example scan/cond bodies) are
+    inspected as well. The returned list includes both enter and exit marker
+    occurrences because each marker carries the same region spec.
+    """
+    specs: list[StageRegionSpec] = []
+    seen: set[int] = set()
+
+    def visit_obj(obj: Any) -> None:
+        """Recursively inspect ``obj`` for nested jaxprs and region primitives.
+
+        Guards against cycles via the ``seen`` id-set. Dictionaries,
+        tuples, and lists are traversed elementwise; objects exposing a
+        ``.jaxpr`` attribute (e.g. closed jaxprs) are unwrapped and
+        scanned as well.
+        """
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+        if isinstance(obj, Jaxpr):
+            visit_jaxpr(obj)
+            return
+        nested = getattr(obj, "jaxpr", None)
+        if isinstance(nested, Jaxpr):
+            visit_jaxpr(nested)
+            return
+        if isinstance(obj, dict):
+            for value in obj.values():
+                visit_obj(value)
+            return
+        if isinstance(obj, (tuple, list)):
+            for value in obj:
+                visit_obj(value)
+
+    def visit_jaxpr(sub_jaxpr: Jaxpr) -> None:
+        """Scan one jaxpr's equations for region enter/exit primitives.
+
+        Every matching equation's ``spec`` parameter is appended to the
+        outer ``specs`` list. Nested params are forwarded to
+        :func:`visit_obj` so scan/cond bodies etc. are also searched.
+        """
+        for eqn in sub_jaxpr.eqns:
+            if eqn.primitive in _REGION_PRIMITIVES:
+                specs.append(eqn.params["spec"])
+            for value in eqn.params.values():
+                visit_obj(value)
+
+    visit_jaxpr(jaxpr)
+    return specs
+
+
+def has_stage_regions(jaxpr: Jaxpr) -> bool:
+    """Return whether ``jaxpr`` contains any :func:`sxstage_region` markers."""
+    return bool(stage_region_specs(jaxpr))
+
+
 def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
     """Split ``jaxpr`` into sub-jaxprs at every ``sxstage_iter`` eqn.
 
@@ -430,6 +777,7 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         for invar in eqn.invars
         if isinstance(invar, Var)
     }
+    jaxpr_outvar_ids = {id(v) for v in jaxpr.outvars if isinstance(v, Var)}
 
     remat_cache: dict[int, bool] = {}
 
@@ -553,7 +901,11 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         invars = [v for v in defined_before if v in used and v not in defined_here]
         if end < n_eqns:
             needed_downstream = read_after_at[end]
-            outvars: list[Var] = [v for v in defined_here if v in needed_downstream and not can_rematerialize(v)]
+            outvars: list[Var] = [
+                v
+                for v in defined_here
+                if v in needed_downstream and (id(v) in jaxpr_outvar_ids or not can_rematerialize(v))
+            ]
         else:
             needed_downstream = set(v for v in jaxpr.outvars if isinstance(v, Var))
             outvars = [v for v in jaxpr.outvars if isinstance(v, Var) and v in defined_here]

@@ -40,6 +40,9 @@ def weak_invalidate(anchor: Any, cache: dict[Any, Any], key: Any) -> None:
             is finalized, ``cache[key]`` is removed.
         cache: The cache dict to prune.
         key: The key to drop.
+
+    Returns:
+        ``None``.
     """
     try:
         weakref.finalize(anchor, cache.pop, key, None)

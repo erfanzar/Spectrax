@@ -64,6 +64,12 @@ def is_static_scalar(x: object) -> bool:
     the same. Anything else (lists, dicts, arbitrary objects) fails the
     check and must either be wrapped in :class:`Static` or stored as a
     :class:`~spectrax.Variable`/``Module`` child.
+
+    Args:
+        x: The value to test.
+
+    Returns:
+        ``True`` when ``x`` qualifies as a static scalar.
     """
     if x is None or isinstance(x, bool | int | float | complex | str | bytes):
         return True

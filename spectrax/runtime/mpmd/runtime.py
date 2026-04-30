@@ -93,6 +93,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import jax
 import jax.numpy as jnp
+from jax.extend.core import Literal as JaxLiteral
 from jax.extend.core import Var
 
 from ...core._weakcache import weak_invalidate
@@ -114,7 +115,7 @@ from ..schedules import (
 )
 from ..types.array import StagesArray
 from ..types.mesh import MpMdMesh, resolve_mpmd_mesh
-from .markers import cluster_jaxpr_by_markers, marker_edge_shardings, sxstage_iter_p
+from .markers import cluster_jaxpr_by_markers, marker_edge_shardings, stage_region_specs, sxstage_iter_p
 from .pscan_compiler import (
     _build_invar_sources,
     _build_logical_locs,
@@ -1141,6 +1142,38 @@ def _schedule_grad_target_for_value(value: Any, stage_mesh: Any) -> Any | None:
     return _canonical_stage_sharding(value, getattr(value, "sharding", None), stage_mesh)
 
 
+def _raise_on_stage_regions(jaxpr: Any, *, path: str) -> None:
+    """Reject region-marked MPMD paths until region-DAG dispatch exists."""
+    specs = stage_region_specs(jaxpr)
+    if not specs:
+        return
+    seen: set[tuple[Any, ...]] = set()
+    region_parts: list[str] = []
+    for spec in specs:
+        key = (
+            spec.name,
+            spec.schedule_name,
+            spec.microbatches,
+            spec.virtual_stages,
+            spec.batch_argnums,
+            spec.static_argnums,
+            spec.donate_argnums,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        label = spec.name or "<unnamed>"
+        schedule = spec.schedule_name or "default"
+        region_parts.append(f"{label}[schedule={schedule}, microbatches={spec.microbatches}, V={spec.virtual_stages}]")
+    regions = ", ".join(region_parts)
+    raise NotImplementedError(
+        f"{path}: sxstage_region markers were found ({regions}). "
+        "Region markers are recorded correctly, but scheduled region-DAG MPMD dispatch is not implemented yet. "
+        "Use one flat sxstage_iter pipeline for now, or implement the region dispatcher before relying on "
+        "separate encoder/decoder PP schedules."
+    )
+
+
 def _build_schedule_plan(
     fn: Callable,
     args: tuple,
@@ -1231,12 +1264,25 @@ def _build_schedule_plan(
         return fn(*full_args, **kwargs)
 
     def _make_mb_arg(i: int):
+        """Return argument ``i`` either microbatch-sampled or unchanged.
+
+        Arguments listed in ``batch_nums`` have their leading axis split
+        into microbatches via :func:`_microbatch_sample`; all other
+        arguments are passed through verbatim.
+
+        Args:
+            i: Positional argument index into the original ``args``.
+
+        Returns:
+            The (possibly sampled) value for argument ``i``.
+        """
         if i in batch_nums:
             return jax.tree.map(lambda a: _microbatch_sample(a, m), args[i])
         return args[i]
 
     mb_dynamic_args = tuple(_make_mb_arg(i) for i in dynamic_argnums)
     closed_jaxpr = jax.make_jaxpr(_wrapper)(*mb_dynamic_args)
+    _raise_on_stage_regions(closed_jaxpr.jaxpr, path="sxjit schedule path")
 
     edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
     clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
@@ -1589,6 +1635,70 @@ def _schedule_per_call_consts(plan: dict[str, Any], args: tuple[Any, ...]) -> di
     return rebound
 
 
+def _schedule_grad_accum_targets(plan: dict[str, Any], args: tuple[Any, ...]) -> dict[int, Any]:
+    """Return the preferred final placement for each flat argument gradient.
+
+    Shared/tied leaves can be used by multiple pipeline stages.  Their per-stage
+    backward launches naturally produce partial gradients on different rank
+    submeshes, so host-side accumulation must first move those partials to one
+    common sharding.  Prefer the live primal's sharding because the returned
+    cotangent should match the argument the caller passed in; fall back to an
+    explicit stage-owner sharding when one is known.
+    """
+    flat_args_live = jax.tree.leaves(args)
+    flat_templates = plan.get("flat_args", ())
+    leaf_shardings = plan.get("leaf_shardings", ())
+    leaf_stage_owners = plan.get("leaf_stage_owners", {})
+    rank_submeshes = plan.get("rank_submeshes", ())
+    targets: dict[int, Any] = {}
+
+    for flat_idx, value in enumerate(flat_args_live):
+        target = getattr(value, "sharding", None)
+        if target is None:
+            owner = leaf_stage_owners.get(flat_idx)
+            if owner is not None and owner < len(leaf_shardings):
+                target = leaf_shardings[owner].get(flat_idx)
+                if target is not None and owner < len(rank_submeshes):
+                    template = (
+                        value if hasattr(value, "shape") or flat_idx >= len(flat_templates) else flat_templates[flat_idx]
+                    )
+                    target = _canonical_stage_sharding(template, target, rank_submeshes[owner]) or target
+        if target is not None:
+            targets[flat_idx] = target
+    return targets
+
+
+def _place_grad_on_target(grad: Any, target: Any | None) -> Any:
+    """Move one concrete grad leaf to ``target`` when it is array-like."""
+    if target is None or _is_float0(grad) or not hasattr(grad, "shape"):
+        return grad
+    current = getattr(grad, "sharding", None)
+    if _same_sharding(current, target):
+        return grad
+    return jax.device_put(grad, target)
+
+
+def _add_grad_on_common_sharding(a: Any, b: Any, target: Any | None = None) -> Any:
+    """Add two concrete grad leaves after normalizing their device placement."""
+    if target is None:
+        target = getattr(a, "sharding", None)
+        if target is None:
+            target = getattr(b, "sharding", None)
+    if target is not None:
+        a = _place_grad_on_target(a, target)
+        b = _place_grad_on_target(b, target)
+    return _add_grad(a, b)
+
+
+def _accumulate_flat_grad(accums: dict[int, Any], flat_idx: int, grad: Any, grad_targets: dict[int, Any]) -> None:
+    """Accumulate one flat-argument grad, handling cross-stage shared leaves."""
+    target = grad_targets.get(flat_idx)
+    if flat_idx not in accums:
+        accums[flat_idx] = _place_grad_on_target(grad, target)
+        return
+    accums[flat_idx] = _add_grad_on_common_sharding(accums[flat_idx], grad, target)
+
+
 def _dispatch_gpipe_fwd(
     plan: dict[str, Any],
     args: tuple,
@@ -1683,7 +1793,12 @@ def _dispatch_gpipe_fwd(
                 saved_outputs[(rank, virt, mb)] = out
 
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
-    return mean_loss, {"saved_inputs": saved_inputs, "saved_outputs": saved_outputs, "per_loc_consts": per_loc_consts}
+    return mean_loss, {
+        "saved_inputs": saved_inputs,
+        "saved_outputs": saved_outputs,
+        "per_loc_consts": per_loc_consts,
+        "flat_args_live": tuple(flat_args),
+    }
 
 
 def _dispatch_gpipe_bwd(
@@ -1714,6 +1829,7 @@ def _dispatch_gpipe_bwd(
     dynamic_flat_to_global_flat = plan["dynamic_flat_to_global_flat"]
     n_flat = plan["n_flat"]
     flat_args = plan["flat_args"]
+    grad_targets = _schedule_grad_accum_targets(plan, (saved.get("flat_args_live") or ()))
 
     saved_inputs = saved["saved_inputs"]
     saved_outputs = saved["saved_outputs"]
@@ -1749,10 +1865,7 @@ def _dispatch_gpipe_bwd(
                 if flat_idx is None:
                     continue
                 grad = g_consts[local_idx]
-                if flat_idx not in grad_accums:
-                    grad_accums[flat_idx] = grad
-                else:
-                    grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
             for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
                 if source_kind != "body_invar":
@@ -1766,10 +1879,7 @@ def _dispatch_gpipe_bwd(
                         grad_accums[flat_idx] = [None] * m
                     grad_accums[flat_idx][mb] = grad
                 else:
-                    if flat_idx not in grad_accums:
-                        grad_accums[flat_idx] = grad
-                    else:
-                        grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                    _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
             if logical > 0:
                 for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
@@ -1801,7 +1911,7 @@ def _dispatch_gpipe_bwd(
                     if slots[producer_out_idx] is None:
                         slots[producer_out_idx] = cot
                     else:
-                        slots[producer_out_idx] = _add_grad(slots[producer_out_idx], cot)
+                        slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
 
     final_grads: list[Any] = []
     for i in range(n_flat):
@@ -1860,6 +1970,7 @@ def _dispatch_schedule_faithful_serial(
     lazy_bwd_batching = plan["schedule"].lazy_bwd_batching
 
     flat_args_live = jax.tree.leaves(args)
+    grad_targets = _schedule_grad_accum_targets(plan, args)
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args_live):
         if microbatch_mask[i]:
@@ -1982,10 +2093,7 @@ def _dispatch_schedule_faithful_serial(
                         if flat_idx is None:
                             continue
                         grad = g_consts[local_idx]
-                        if flat_idx not in const_accums:
-                            const_accums[flat_idx] = grad
-                        else:
-                            const_accums[flat_idx] = _add_grad(const_accums[flat_idx], grad)
+                        _accumulate_flat_grad(const_accums, flat_idx, grad, grad_targets)
 
                 if phase is not Phase.BWD_W:
                     for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
@@ -2000,10 +2108,7 @@ def _dispatch_schedule_faithful_serial(
                                 grad_accums[flat_idx] = [None] * m
                             grad_accums[flat_idx][mb] = grad
                         else:
-                            if flat_idx not in grad_accums:
-                                grad_accums[flat_idx] = grad
-                            else:
-                                grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
                 if phase is not Phase.BWD_W:
                     for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
@@ -2037,7 +2142,7 @@ def _dispatch_schedule_faithful_serial(
                         if slots[producer_out_idx] is None:
                             slots[producer_out_idx] = cot
                         else:
-                            slots[producer_out_idx] = _add_grad(slots[producer_out_idx], cot)
+                            slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
 
     if lazy_bwd_batching:
         vbwd_jits = plan.get("vbwd_jits", {})
@@ -2073,10 +2178,7 @@ def _dispatch_schedule_faithful_serial(
                         if flat_idx is None:
                             continue
                         grad = g_consts[local_idx]
-                        if flat_idx not in terminal_const_grad_accums:
-                            terminal_const_grad_accums[flat_idx] = grad
-                        else:
-                            terminal_const_grad_accums[flat_idx] = _add_grad(terminal_const_grad_accums[flat_idx], grad)
+                        _accumulate_flat_grad(terminal_const_grad_accums, flat_idx, grad, grad_targets)
                     for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
                         if source_kind != "body_invar":
                             continue
@@ -2089,10 +2191,7 @@ def _dispatch_schedule_faithful_serial(
                                 grad_accums[flat_idx] = [None] * m
                             grad_accums[flat_idx][mb] = grad
                         else:
-                            if flat_idx not in grad_accums:
-                                grad_accums[flat_idx] = grad
-                            else:
-                                grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
                     for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
                         if source_kind != "cluster_out":
                             continue
@@ -2124,7 +2223,7 @@ def _dispatch_schedule_faithful_serial(
                         if slots[producer_out_idx] is None:
                             slots[producer_out_idx] = cot
                         else:
-                            slots[producer_out_idx] = _add_grad(slots[producer_out_idx], cot)
+                            slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
             else:
                 in_axes = _schedule_invar_microbatch_axes(
                     invar_sources,
@@ -2177,10 +2276,7 @@ def _dispatch_schedule_faithful_serial(
                     if flat_idx is None:
                         continue
                     grad = g_consts[local_idx].sum(axis=0)
-                    if flat_idx not in grad_accums:
-                        grad_accums[flat_idx] = grad
-                    else:
-                        grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                    _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
                 for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
                     if source_kind != "body_invar":
@@ -2196,10 +2292,7 @@ def _dispatch_schedule_faithful_serial(
                             grad_accums[flat_idx][mb] = grad[idx]
                     else:
                         summed_grad = grad.sum(axis=0)
-                        if flat_idx not in grad_accums:
-                            grad_accums[flat_idx] = summed_grad
-                        else:
-                            grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], summed_grad)
+                        _accumulate_flat_grad(grad_accums, flat_idx, summed_grad, grad_targets)
 
                 for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
                     if source_kind != "cluster_out":
@@ -2233,7 +2326,7 @@ def _dispatch_schedule_faithful_serial(
                         if slots[producer_out_idx] is None:
                             slots[producer_out_idx] = cot
                         else:
-                            slots[producer_out_idx] = _add_grad(slots[producer_out_idx], cot)
+                            slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
 
     final_grads: list[Any] = []
     terminal_const_scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
@@ -2247,7 +2340,10 @@ def _dispatch_schedule_faithful_serial(
                     terminal_grad,
                     is_leaf=_is_leaf,
                 )
-                grad = terminal_grad if grad is None else _add_grad(grad, terminal_grad)
+                if grad is None:
+                    grad = _place_grad_on_target(terminal_grad, grad_targets.get(i))
+                else:
+                    grad = _add_grad_on_common_sharding(grad, terminal_grad, grad_targets.get(i))
             if microbatch_mask[i]:
                 if isinstance(grad, list):
                     template = next(g for g in grad if g is not None)
@@ -2817,6 +2913,7 @@ def _dispatch_schedule_fused_async(
     eager_terminal_bwd = True
 
     flat_args_live = jax.tree.leaves(args)
+    grad_targets = _schedule_grad_accum_targets(plan, args)
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args_live):
         if microbatch_mask[i]:
@@ -3041,10 +3138,7 @@ def _dispatch_schedule_fused_async(
                             grad_accums[flat_idx] = [None] * m
                         grad_accums[flat_idx][mb] = grad
                     else:
-                        if flat_idx not in grad_accums:
-                            grad_accums[flat_idx] = grad
-                        else:
-                            grad_accums[flat_idx] = _add_grad(grad_accums[flat_idx], grad)
+                        _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
 
             for p_key, producer_out_idx, cot in cot_updates:
                 slots = recv_cots.setdefault(
@@ -3061,7 +3155,7 @@ def _dispatch_schedule_fused_async(
                         existing = existing_result()
                     if callable(cot_result):
                         cot = cot_result()
-                    slots[producer_out_idx] = _add_grad(existing, cot)
+                    slots[producer_out_idx] = _add_grad_on_common_sharding(existing, cot)
 
     def _run_fwd(rank: int, virt: int, action: Any) -> None:
         """Execute one forward action for the given (rank, virt) location.
@@ -3506,10 +3600,7 @@ def _dispatch_schedule_fused_async(
             if flat_idx is None:
                 continue
             grad = g_consts[local_idx]
-            if flat_idx not in grad_accums:
-                grad_accums[flat_idx] = grad
-            else:
-                grad_accums[flat_idx] = _accumulate_grad_tree(grad_accums[flat_idx], grad)
+            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
     for loc, g_consts in terminal_const_tuple_accums.items():
         scaled_consts = _scale_grad_tree(g_consts, terminal_const_scale)
         for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
@@ -3517,10 +3608,7 @@ def _dispatch_schedule_fused_async(
             if flat_idx is None:
                 continue
             grad = scaled_consts[local_idx]
-            if flat_idx not in grad_accums:
-                grad_accums[flat_idx] = grad
-            else:
-                grad_accums[flat_idx] = _accumulate_grad_tree(grad_accums[flat_idx], grad)
+            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
     for i in range(n_flat):
         if i in grad_accums:
             grad = grad_accums.get(i)
@@ -3943,6 +4031,8 @@ def sxjit(
                 _state["schedule_plan"] = plan
                 return
 
+            _raise_on_stage_regions(closed_jaxpr.jaxpr, path="sxjit")
+
             edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
             clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
             consts = closed_jaxpr.consts
@@ -4009,7 +4099,12 @@ def sxjit(
                 rank_submeshes,
             )
 
-            explicit_in_sh = _resolve_explicit_shardings(in_shardings, flat_init)
+            explicit_in_sh = _resolve_explicit_shardings(
+                in_shardings,
+                flat_init,
+                args=args,
+                static_argnums=static_nums,
+            )
 
             placed = _place_static_args(
                 cluster_plans,
@@ -4026,6 +4121,7 @@ def sxjit(
             _state["dynamic"] = dynamic
             _state["explicit_in_sh"] = explicit_in_sh
             _state["fn_outvar_map"] = fn_outvar_map
+            _state["mpmd_mesh"] = mpmd_mesh
             if not use_legacy_path:
                 _state["dynamic_flat_to_orig_flat"] = dynamic_flat_to_orig_flat
 
@@ -4055,6 +4151,7 @@ def sxjit(
             flat_args = jax.tree.leaves(args)
             all_cluster_outputs: list[tuple] = []
             prev_outputs: tuple = ()
+            stage_launches = 0
 
             for ri, (stage_jit, submesh, my_sh, _, invar_map) in enumerate(compiled):
                 rank_devices = set(rank_submeshes[ri].devices.flat)
@@ -4075,12 +4172,15 @@ def sxjit(
                 )
                 with submesh:
                     prev_outputs = stage_jit(*invars)
+                stage_launches += 1
                 all_cluster_outputs.append(prev_outputs)
+            _state["forward_stage_launches"] = stage_launches
 
             return _assemble_outputs(
                 _state["fn_outvar_map"],
                 all_cluster_outputs,
                 flat_args,
+                dynamic_flat_to_orig_flat=_state.get("dynamic_flat_to_orig_flat"),
             )
 
         def _shape_signature(args: tuple, kwargs: dict) -> tuple:
@@ -4126,16 +4226,13 @@ def sxjit(
             else:
                 _state["schedule_requested"] = schedule is not None
 
-        def wrapped(*args, **kwargs):
-            """The user-visible callable returned by :func:`sxjit`.
+        def _prepare_mpmd_state(*args, **kwargs):
+            """Select or build the cached MPMD plan for ``args`` without dispatching it.
 
-            On every call we compute the shape signature and look up
-            a matching cached plan; if none exists we run ``_build``
-            once. Once a plan is in scope, the call routes to the
-            schedule dispatcher, the pscan dispatcher, or the legacy
-            per-stage path depending on which key ``_build`` populated.
-            Output pytree structure (lost when the runtime returns
-            flat tuples) is restored via the captured ``result_treedef``.
+            Runtime integrations that need explicit control over the per-stage
+            callables (for example resident inference pipelines) can use this
+            hook to reuse sxjit's tracing, clustering, placement, and shape-keyed
+            plan cache while providing their own dispatcher.
             """
             sig = _shape_signature(args, kwargs)
             cur_sig = _state.get(_SIG_KEY)
@@ -4150,6 +4247,21 @@ def sxjit(
                     _build(args, kwargs)
                     _state[_SIG_KEY] = sig
                     _state_cache[sig] = {k: v for k, v in _state.items()}
+            _state["out_shardings"] = out_shardings
+            return _state
+
+        def wrapped(*args, **kwargs):
+            """The user-visible callable returned by :func:`sxjit`.
+
+            On every call we compute the shape signature and look up
+            a matching cached plan; if none exists we run ``_build``
+            once. Once a plan is in scope, the call routes to the
+            schedule dispatcher, the pscan dispatcher, or the legacy
+            per-stage path depending on which key ``_build`` populated.
+            Output pytree structure (lost when the runtime returns
+            flat tuples) is restored via the captured ``result_treedef``.
+            """
+            _prepare_mpmd_state(*args, **kwargs)
 
             if "schedule_plan" in _state:
                 plan = _state["schedule_plan"]
@@ -4169,6 +4281,8 @@ def sxjit(
         wrapped.__qualname__ = getattr(fn, "__qualname__", "mpmd_jit_fn")
         wrapped._mpmd_state = _state
         wrapped._mpmd_build = _build
+        wrapped._mpmd_prepare = _prepare_mpmd_state
+        wrapped._mpmd_mesh = mpmd_mesh
         return wrapped
 
     if fn is not None:
@@ -4199,7 +4313,7 @@ def _build_outvar_map(
         {id(resolve_alias(v)): pos for pos, v in enumerate(c.outvars) if isinstance(v, Var)} for c in clusters
     ]
     fn_outvar_map: list[tuple] = []
-    for v in closed_jaxpr.jaxpr.outvars:
+    for out_idx, v in enumerate(closed_jaxpr.jaxpr.outvars):
         vid = id(resolve_alias(v)) if isinstance(v, Var) else id(v)
         found = None
         for ri in range(len(clusters) - 1, -1, -1):
@@ -4208,6 +4322,8 @@ def _build_outvar_map(
                 break
         if found is not None:
             fn_outvar_map.append(found)
+        elif isinstance(v, JaxLiteral):
+            fn_outvar_map.append(("const_passthrough", v.val))
         else:
             orig_idx = original_idx_by_id.get(vid, original_id_to_idx.get(id(v)))
             if orig_idx is not None:
@@ -4217,9 +4333,9 @@ def _build_outvar_map(
                 if const_idx is not None and consts is not None:
                     fn_outvar_map.append(("const_passthrough", consts[const_idx]))
                 else:
-                    fn_outvar_map.append(("missing", -1))
+                    fn_outvar_map.append(("missing", out_idx, repr(v)))
             else:
-                fn_outvar_map.append(("missing", -1))
+                fn_outvar_map.append(("missing", out_idx, repr(v)))
     return fn_outvar_map
 
 
@@ -4458,14 +4574,48 @@ def _infer_leaf_shardings(
 def _resolve_explicit_shardings(
     in_shardings: Any | None,
     flat_init: list,
+    *,
+    args: tuple | None = None,
+    static_argnums: set[int] | None = None,
 ) -> dict[int, Any]:
     """Flatten explicit ``in_shardings`` into a flat-index to sharding map.
 
-    Returns an empty dict when ``in_shardings`` is ``None``.
+    Returns an empty dict when ``in_shardings`` is ``None``. When static
+    positional args are present, accept both forms used by JAX callers:
+    shardings matching all positional args and shardings matching only the
+    non-static positional args.
     """
     if in_shardings is None:
         return {}
     explicit: dict[int, Any] = {}
+    if args is not None and isinstance(in_shardings, tuple | list):
+        static_argnums = static_argnums or set()
+        dynamic_argnums = tuple(i for i in range(len(args)) if i not in static_argnums)
+        if len(in_shardings) == len(args):
+            argnums = tuple(range(len(args)))
+        elif len(in_shardings) == len(dynamic_argnums):
+            argnums = dynamic_argnums
+        else:
+            argnums = ()
+
+        if argnums:
+            arg_offsets: list[int] = []
+            offset = 0
+            for arg in args:
+                arg_offsets.append(offset)
+                offset += len(jax.tree_util.tree_leaves(arg))
+
+            for argnum, sharding_tree in zip(argnums, in_shardings, strict=False):
+                if sharding_tree is None:
+                    continue
+                leaves = jax.tree_util.tree_leaves(sharding_tree, is_leaf=lambda x: x is None)
+                start = arg_offsets[argnum]
+                for j, sh in enumerate(leaves):
+                    idx = start + j
+                    if sh is not None and idx < len(flat_init):
+                        explicit[idx] = sh
+            return explicit
+
     leaves = jax.tree_util.tree_leaves(in_shardings, is_leaf=lambda x: x is None)
     for i, sh in enumerate(leaves):
         if sh is not None and i < len(flat_init):
@@ -4511,7 +4661,8 @@ def _place_static_args(
                 )
             leaf = flat_init[idx]
             if idx in explicit_in_sh:
-                placed[(ri, idx)] = jax.device_put(leaf, explicit_in_sh[idx])
+                target = _canonical_stage_sharding(leaf, explicit_in_sh[idx], rank_submeshes[ri]) or explicit_in_sh[idx]
+                placed[(ri, idx)] = jax.device_put(leaf, target)
             elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
                 placed[(ri, idx)] = leaf
             elif idx in leaf_shardings[ri]:
@@ -4554,7 +4705,11 @@ def _assemble_invars(
             if orig_idx in dynamic:
                 leaf = flat_args[orig_idx]
                 if orig_idx in explicit_in_sh:
-                    invars.append(jax.device_put(leaf, explicit_in_sh[orig_idx]))
+                    target = (
+                        _canonical_stage_sharding(leaf, explicit_in_sh[orig_idx], rank_submeshes[ri])
+                        or explicit_in_sh[orig_idx]
+                    )
+                    invars.append(jax.device_put(leaf, target))
                 elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
                     invars.append(leaf)
                 else:
@@ -4586,6 +4741,7 @@ def _assemble_outputs(
     fn_outvar_map: list[tuple],
     all_cluster_outputs: list[tuple],
     flat_args: list,
+    dynamic_flat_to_orig_flat: dict[int, int] | None = None,
 ) -> Any:
     """Collect return values from all clusters using the outvar map.
 
@@ -4594,15 +4750,21 @@ def _assemble_outputs(
     """
     final = []
     for mapping in fn_outvar_map:
-        src_rank, src_pos = mapping
+        src_rank, src_pos = mapping[:2]
         if isinstance(src_rank, int):
             final.append(all_cluster_outputs[src_rank][src_pos])
         elif src_rank == "orig_passthrough":
-            final.append(flat_args[src_pos])
+            orig_pos = (
+                dynamic_flat_to_orig_flat.get(src_pos, src_pos) if dynamic_flat_to_orig_flat is not None else src_pos
+            )
+            final.append(flat_args[orig_pos])
         elif src_rank == "const_passthrough":
             final.append(src_pos)
         else:
-            final.append(None)
+            detail = mapping[2] if len(mapping) > 2 else "<unknown>"
+            raise ValueError(
+                f"sxjit: could not map function output leaf {src_pos} to a producing stage or input: {detail}"
+            )
     if len(final) == 1:
         return final[0]
     return tuple(final)
@@ -4616,17 +4778,47 @@ def _apply_out_shardings(result: Any, out_shardings: Any | None) -> Any:
     broadcast to all outputs. A list/tuple applies per-output (``None``
     entries mean "preserve").
     """
+
+    def _put_if_needed(value: Any, sharding: Any | None) -> Any:
+        """Move ``value`` to ``sharding`` only when it lacks an existing sharding.
+
+        This avoids re-placing arrays that already have a valid sharding
+        (e.g. donated outputs that live on their producing rank's sub-mesh),
+        which would otherwise trigger an unnecessary host-mediated copy.
+
+        Args:
+            value: The output leaf to potentially relocate.
+            sharding: Target sharding, or ``None`` to skip.
+
+        Returns:
+            ``value`` possibly moved to ``sharding``, or unchanged.
+        """
+        if sharding is None or not isinstance(value, jax.Array):
+            return value
+        current = getattr(value, "sharding", None)
+        if current is not None:
+            # MPMD stage dispatch already materializes outputs on the producing
+            # rank's stage-local mesh. Re-device-putting donated outputs here can
+            # force a host-mediated copy from an alias that JAX is free to delete.
+            return value
+        return jax.device_put(value, sharding)
+
     if out_shardings is None:
         return result
     if isinstance(result, jax.Array):
-        return jax.device_put(result, out_shardings)
+        return _put_if_needed(result, out_shardings)
     if isinstance(result, tuple):
+        if isinstance(out_shardings, jax.sharding.Sharding):
+            return tuple(_put_if_needed(r, out_shardings) for r in result)
+        sharding_leaves = jax.tree_util.tree_leaves(
+            out_shardings,
+            is_leaf=lambda x: x is None or isinstance(x, jax.sharding.Sharding),
+        )
+        if len(sharding_leaves) == len(result):
+            return tuple(_put_if_needed(r, s) for r, s in zip(result, sharding_leaves, strict=True))
         if isinstance(out_shardings, (list, tuple)):
-            return tuple(
-                jax.device_put(r, s) if s is not None and isinstance(r, jax.Array) else r
-                for r, s in zip(result, out_shardings, strict=False)
-            )
-        return tuple(jax.device_put(r, out_shardings) if isinstance(r, jax.Array) else r for r in result)
+            return tuple(_put_if_needed(r, s) for r, s in zip(result, out_shardings, strict=False))
+        return tuple(_put_if_needed(r, out_shardings) for r in result)
     return result
 
 

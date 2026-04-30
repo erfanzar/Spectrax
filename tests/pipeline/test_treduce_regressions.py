@@ -26,6 +26,7 @@ def test_treduce_rejects_short_operation_sequence():
     """Missing per-output operations should fail instead of silently defaulting to Add."""
 
     def body(i):
+        """Loop body function."""
         value = i.astype(jnp.float32)
         return value, value + 1.0
 

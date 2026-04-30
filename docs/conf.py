@@ -1,3 +1,5 @@
+"""Sphinx configuration for the SpectraX documentation."""
+
 import os
 import sys
 

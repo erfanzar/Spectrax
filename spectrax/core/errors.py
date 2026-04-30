@@ -26,7 +26,11 @@ from __future__ import annotations
 
 
 class SpecTraxError(Exception):
-    """Base class for every exception raised by spectrax."""
+    """Base class for every exception raised by spectrax.
+
+    Catching this class catches all spectrax-originated failures with a
+    single ``except spectrax.SpecTraxError`` clause.
+    """
 
 
 class CyclicGraphError(SpecTraxError):
@@ -67,7 +71,12 @@ class SelectorError(SpecTraxError):
 
 
 class PolicyError(SpecTraxError):
-    """Raised for invalid dtype policy configuration on a module."""
+    """Raised for invalid dtype policy configuration on a module.
+
+    Typically triggered when a :class:`~spectrax.Policy` is assigned to
+    a module attribute and the value is not a :class:`~spectrax.Policy`
+    instance or ``None``.
+    """
 
 
 class GraphStructureError(SpecTraxError):

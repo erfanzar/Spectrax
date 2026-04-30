@@ -40,11 +40,13 @@ class TwoStage(spx.Module):
     """Two linear layers with one explicit pipeline boundary."""
 
     def __init__(self, d, *, rngs):
+        """Initialize with l1, l2."""
         super().__init__()
         self.l1 = nn.Linear(d, d, rngs=rngs)
         self.l2 = nn.Linear(d, d, rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         h = self.l1(x)
         h = sxstage_iter(h)
         return self.l2(h)
@@ -54,6 +56,7 @@ class FourStage(spx.Module):
     """Four linear layers with three explicit pipeline boundaries."""
 
     def __init__(self, d, *, rngs):
+        """Initialize with l1, l2, l3 and 1 other(s)."""
         super().__init__()
         self.l1 = nn.Linear(d, d, rngs=rngs)
         self.l2 = nn.Linear(d, d, rngs=rngs)
@@ -61,6 +64,7 @@ class FourStage(spx.Module):
         self.l4 = nn.Linear(d, d, rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         h = self.l1(x)
         h = sxstage_iter(h)
         h = self.l2(h)
@@ -74,11 +78,13 @@ class TPAnnotatedTwoStage(spx.Module):
     """Two-stage model with TP-annotated stage-local weights."""
 
     def __init__(self, d, *, rngs):
+        """Initialize with l1, l2."""
         super().__init__()
         self.l1 = nn.Linear(d, d, use_bias=False, sharding=(None, "model"), rngs=rngs)
         self.l2 = nn.Linear(d, d, use_bias=False, sharding=(None, "model"), rngs=rngs)
 
     def forward(self, x):
+        """Run the forward pass."""
         h = self.l1(x)
         h = sxstage_iter(h)
         return self.l2(h)
@@ -88,12 +94,14 @@ class StageTaggedAffine(spx.Module):
     """Custom stage using raw Parameter/Buffer creation under ``assign_stage``."""
 
     def __init__(self, d, *, total, current):
+        """Initialize the instance."""
         super().__init__()
         with assign_stage(total=total, current=current):
             self.weight = spx.Parameter(jnp.eye(d))
             self.bias = spx.Buffer(jnp.zeros((d,)))
 
     def forward(self, x):
+        """Run the forward pass."""
         return x @ self.weight + self.bias
 
 
@@ -101,11 +109,13 @@ class MisassignedTwoStage(spx.Module):
     """Two-stage model whose explicit stage hints intentionally disagree with execution."""
 
     def __init__(self, d):
+        """Initialize with left, right."""
         super().__init__()
         self.left = StageTaggedAffine(d, total=2, current=1)
         self.right = StageTaggedAffine(d, total=2, current=0)
 
     def forward(self, x):
+        """Run the forward pass."""
         h = self.left(x)
         h = sxstage_iter(h)
         return self.right(h)
@@ -201,7 +211,10 @@ def test_pscan_mpmd_matches_reference(schedule_cls, body_mode, mesh, model, xy, 
 
     @sxjit(mesh=mesh)
     def step(model, x, y):
+        """Execute one training step and return the result."""
+
         def body(mb):
+            """Loop body function."""
             if body_mode == "scalar_loss":
                 return _micro_loss(model, mb)
             return spx.value_and_grad(_micro_loss)(model, mb)
@@ -247,7 +260,10 @@ def test_pscan_mpmd_virtual_schedules_match_reference(
 
     @sxjit(mesh=mesh)
     def step(model, x, y):
+        """Execute one training step and return the result."""
+
         def body(mb):
+            """Loop body function."""
             if body_mode == "scalar_loss":
                 return _micro_loss(model, mb)
             return spx.value_and_grad(_micro_loss)(model, mb)
@@ -275,7 +291,10 @@ def test_pscan_plan_auto_places_tp_consts_on_stage_submesh(mesh_pp_tp):
         model = TPAnnotatedTwoStage(d, rngs=spx.Rngs(7))
 
         def step(model, x, y):
+            """Execute one training step and return the result."""
+
             def body(mb):
+                """Loop body function."""
                 i_x, i_y = mb
                 pred = model(i_x[None])
                 return jnp.sum((pred - i_y[None]) ** 2)
@@ -320,6 +339,7 @@ def test_assign_stage_mismatch_raises_for_forward_mpmd(mesh):
 
     @sxjit(mesh=mesh)
     def step(model, x):
+        """Execute one training step and return the result."""
         return model(x)
 
     with pytest.raises(ValueError, match="assign_stage"):

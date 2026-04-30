@@ -49,6 +49,7 @@ from spectrax.sharding import logical_axis_rules, with_sharding_constraint_by_na
 
 
 def _null_ctx():
+    """Return a no-op context manager."""
     return contextlib.nullcontext()
 
 
@@ -66,17 +67,29 @@ class Llama3Config:
     microbatches: int = 4
 
     def __init__(self, **kwargs):
+        """Override any default attribute via keyword arguments."""
         for k, v in kwargs.items():
             setattr(self, k, v)
 
     @property
     def total_params(self) -> int:
+        """Approximate total parameter count across all layers."""
         attn = 2 * self.d_model * self.d_model + 2 * self.d_model * (self.d_model * self.n_kv_heads // self.n_heads)
         ffn = 3 * self.d_model * self.ffn
         return self.n_layers * (attn + ffn)
 
 
 def _rope_freqs(seq_len: int, head_dim: int, theta: float = 500_000.0):
+    """Precompute RoPE cos/sin tables of shape ``(seq_len, head_dim // 2)``.
+
+    Args:
+        seq_len: Sequence length.
+        head_dim: Per-head dimension.
+        theta: RoPE base frequency.
+
+    Returns:
+        ``(cos, sin)`` tuple of bf16 arrays.
+    """
     half = head_dim // 2
     inv_freq = 1.0 / (theta ** (jnp.arange(0, half, dtype=jnp.float32) / half))
     t = jnp.arange(seq_len, dtype=jnp.float32)
@@ -85,6 +98,16 @@ def _rope_freqs(seq_len: int, head_dim: int, theta: float = 500_000.0):
 
 
 def _apply_rope(x, cos, sin):
+    """Apply rotary embeddings to ``x`` using ``cos`` and ``sin`` tables.
+
+    Args:
+        x: Tensor of shape ``(..., seq, heads, head_dim)``.
+        cos: RoPE cosine table.
+        sin: RoPE sine table.
+
+    Returns:
+        Rotated tensor of same shape as ``x``.
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     cos = cos[None, :, None, :]
@@ -93,7 +116,18 @@ def _apply_rope(x, cos, sin):
 
 
 class Llama3Block(spx.Module):
+    """One Llama 3 transformer block: RMSNorm + GQA attn + RMSNorm + SwiGLU FFN."""
+
     def __init__(self, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads (GQA).
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.d = d
         self.n_heads = n_heads
@@ -111,6 +145,16 @@ class Llama3Block(spx.Module):
         self.down = nn.Linear(ffn, d, use_bias=False, rngs=rngs, dtype=jnp.bfloat16)
 
     def forward(self, x, cos, sin):
+        """Run pre-norm GQA+RoPE attention followed by pre-norm SwiGLU FFN.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         h = self.norm1(x)
         q = self.q(h).reshape(b, t, self.n_heads, self.head_dim)
@@ -135,7 +179,18 @@ class Llama3Block(spx.Module):
 
 
 class Llama3BlockTP(spx.Module):
+    """Llama 3 block with role-specific logical sharding annotations for TP."""
+
     def __init__(self, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize TP-aware GQA attention + SwiGLU FFN sublayers.
+
+        Args:
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads (GQA).
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.d = d
         self.n_heads = n_heads
@@ -154,6 +209,16 @@ class Llama3BlockTP(spx.Module):
         self.down = nn.Linear(ffn, d, sharding=("tp_ffn", None), rngs=rngs, **lin)
 
     def forward(self, x, cos, sin):
+        """Run the TP-aware attention + SwiGLU FFN with activation sharding pins.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+            cos: RoPE cosine table.
+            sin: RoPE sine table.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         b, t, _ = x.shape
         x = with_sharding_constraint_by_name(x, (None, None, None))
         h = self.norm1(x)
@@ -190,11 +255,31 @@ class Llama3BlockTP(spx.Module):
 
 
 class Llama3Stage(spx.Module):
+    """A pipeline stage = ``n_blocks`` Llama 3 blocks in sequence."""
+
     def __init__(self, n_blocks, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize ``n_blocks`` :class:`Llama3Block` instances in a Sequential.
+
+        Args:
+            n_blocks: Number of blocks in this stage.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.blocks = nn.Sequential(*[Llama3Block(d, ffn, n_heads, n_kv_heads, rngs=rngs) for _ in range(n_blocks)])
 
     def forward(self, x):
+        """Run every block with RoPE tables recomputed at stage entry.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         head_dim = self.blocks[0].head_dim
         cos, sin = _rope_freqs(t, head_dim)
@@ -204,11 +289,31 @@ class Llama3Stage(spx.Module):
 
 
 class Llama3StageTP(spx.Module):
+    """A pipeline stage of TP-aware Llama 3 blocks (RoPE recomputed inside)."""
+
     def __init__(self, n_blocks, d, ffn, n_heads, n_kv_heads, *, rngs):
+        """Initialize ``n_blocks`` :class:`Llama3BlockTP` instances in a Sequential.
+
+        Args:
+            n_blocks: Number of blocks in this stage.
+            d: Model dimension.
+            ffn: FFN hidden dimension.
+            n_heads: Number of query heads.
+            n_kv_heads: Number of key/value heads.
+            rngs: PRNG source for parameter init.
+        """
         super().__init__()
         self.blocks = nn.Sequential(*[Llama3BlockTP(d, ffn, n_heads, n_kv_heads, rngs=rngs) for _ in range(n_blocks)])
 
     def forward(self, x):
+        """Run every TP-aware block with RoPE tables recomputed at stage entry.
+
+        Args:
+            x: Input tensor ``(b, t, d)``.
+
+        Returns:
+            Output tensor ``(b, t, d)``.
+        """
         _b, t, _d = x.shape
         head_dim = self.blocks[0].head_dim
         cos, sin = _rope_freqs(t, head_dim)
@@ -218,6 +323,15 @@ class Llama3StageTP(spx.Module):
 
 
 def _dummy_batch(cfg: Llama3Config, step: int):
+    """Return a deterministic ``(x, y)`` bf16 batch for ``step``.
+
+    Args:
+        cfg: Model configuration.
+        step: Step index used to fold the PRNG key.
+
+    Returns:
+        ``(x, y)`` tuple of random bf16 tensors.
+    """
     key = jax.random.fold_in(jax.random.PRNGKey(0), step)
     kx, ky = jax.random.split(key)
     x = jax.random.normal(kx, (cfg.batch, cfg.seq_len, cfg.d_model), dtype=jnp.bfloat16)
@@ -226,10 +340,27 @@ def _dummy_batch(cfg: Llama3Config, step: int):
 
 
 def _loss_fn(out, y):
+    """MSE loss between ``out`` and ``y`` computed in float32.
+
+    Args:
+        out: Model output tensor.
+        y: Target tensor.
+
+    Returns:
+        Scalar float32 MSE.
+    """
     return ((out.astype(jnp.float32) - y.astype(jnp.float32)) ** 2).mean()
 
 
 def _median(xs: list[float]) -> float:
+    """Return the median of ``xs``.
+
+    Args:
+        xs: List of float timings.
+
+    Returns:
+        Median value.
+    """
     return sorted(xs)[len(xs) // 2]
 
 
@@ -248,6 +379,15 @@ _VIRTUAL_NAMES = {"interleaved", "interleaved_gpipe", "interleaved_plus_one", "k
 
 
 def _make_schedule(name: str, microbatches: int):
+    """Instantiate the schedule class for ``name``.
+
+    Args:
+        name: Schedule key (e.g. ``"gpipe"``, ``"1f1b"``).
+        microbatches: Number of microbatches.
+
+    Returns:
+        Schedule instance.
+    """
     cls = _SCHEDULE_MAP[name]
     if name in _VIRTUAL_NAMES:
         return cls(microbatches=microbatches, virtual_stages=2)
@@ -255,7 +395,17 @@ def _make_schedule(name: str, microbatches: int):
 
 
 def build_stages(cfg: Llama3Config, pp: int, virtual_stages: int = 1, tp: bool = False):
-    """Build pipeline stages and return (stages_list, gdefs, state_structs, flat_params)."""
+    """Build pipeline stages and return (stages_list, gdefs, state_structs, flat_params).
+
+    Args:
+        cfg: Model configuration.
+        pp: Pipeline parallelism degree.
+        virtual_stages: Virtual stages per rank.
+        tp: Whether to use tensor-parallel block variants.
+
+    Returns:
+        Tuple of ``(stages, gdefs, state_structs, flat_params)``.
+    """
     rngs = spx.Rngs(0)
     n_logical = virtual_stages * pp
     if cfg.n_layers % n_logical:
@@ -278,6 +428,15 @@ def build_stages(cfg: Llama3Config, pp: int, virtual_stages: int = 1, tp: bool =
 
 
 def build_full_model(cfg: Llama3Config, tp: bool = False):
+    """Build a single stage with all layers (for the JIT runtime).
+
+    Args:
+        cfg: Model configuration.
+        tp: Whether to use tensor-parallel block variants.
+
+    Returns:
+        A :class:`Llama3Stage` or :class:`Llama3StageTP` with all blocks.
+    """
     rngs = spx.Rngs(0)
     StageCls = Llama3StageTP if tp else Llama3Stage
     return StageCls(cfg.n_layers, cfg.d_model, cfg.ffn, cfg.n_heads, cfg.n_kv_heads, rngs=rngs)
@@ -297,6 +456,16 @@ def bench_mpmd_jit(cfg: Llama3Config, schedule_name: str, pp: int, tp: int, iter
 
     @sxjit(mesh=mpmd_mesh, schedule=schedule)
     def forward(params, x, y):
+        """MPMD forward with flat params: run stages, compute MSE loss.
+
+        Args:
+            params: Flat tuple of parameter arrays.
+            x: Input tensor.
+            y: Target tensor.
+
+        Returns:
+            Scalar loss.
+        """
         with mesh if tp > 1 else _null_ctx():
             flat_list = list(params)
             idx = 0
@@ -447,9 +616,11 @@ def bench_jit_tp(cfg: Llama3Config, iters: int):
         gdef, state = spx.export(model)
 
     def step_fn(state, x, y):
+        """Jitted step: bind, compute loss, and return ``(loss, grads)``."""
         with mesh, logical_axis_rules(rules):
 
             def loss_fn(state):
+                """Forward + MSE loss under an ephemeral :func:`spx.bind`."""
                 m = spx.bind(gdef, state)
                 return _loss_fn(m(x), y)
 
@@ -480,6 +651,7 @@ def bench_jit_tp(cfg: Llama3Config, iters: int):
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point — parse args, dispatch benchmarks, print table."""
     parser = argparse.ArgumentParser(description="Llama 3 8B: sxjit vs SPMD vs JIT")
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=128)

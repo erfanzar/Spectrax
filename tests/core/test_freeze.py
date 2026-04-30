@@ -16,6 +16,7 @@ class _Tower(Module):
     """Two-layer model used for freeze tests."""
 
     def __init__(self, rngs):
+        """Initialize with a, b."""
         super().__init__()
         self.a = Linear(4, 4, rngs=rngs)
         self.b = Linear(4, 4, rngs=rngs)

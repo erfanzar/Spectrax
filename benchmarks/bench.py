@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _git_sha() -> str:
+    """Return the short git SHA of the current HEAD, or ``'unknown'``."""
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
     except Exception:
@@ -36,7 +37,17 @@ def _git_sha() -> str:
 
 
 def _time_fn(fn: Callable, n_warmup: int, n_iters: int) -> dict:
-    """Run ``fn`` and record per-call wall times in nanoseconds."""
+    """Run ``fn`` and record per-call wall times in nanoseconds.
+
+    Args:
+        fn: Zero-argument callable to benchmark.
+        n_warmup: Number of warm-up calls before timing.
+        n_iters: Number of timed iterations.
+
+    Returns:
+        Dictionary with ``median_ms``, ``p05_ms``, ``p95_ms``,
+        ``n_iters``, and ``n_warmup``.
+    """
     for _ in range(n_warmup):
         fn()
     times = []
@@ -49,6 +60,7 @@ def _time_fn(fn: Callable, n_warmup: int, n_iters: int) -> dict:
     n = len(times)
 
     def pct(p):
+        """Return the ``p``-th percentile of the sorted times in milliseconds."""
         idx = min(n - 1, max(0, int(p * (n - 1))))
         return times[idx] / 1e6
 
@@ -62,6 +74,14 @@ def _time_fn(fn: Callable, n_warmup: int, n_iters: int) -> dict:
 
 
 def _build_cases(selection: set[str]) -> dict[str, tuple[Callable, Callable]]:
+    """Build the benchmark case dictionary from the selected case names.
+
+    Args:
+        selection: Set of case keys to include (e.g. ``{"graph_seam", "e2e"}``).
+
+    Returns:
+        Mapping from case name to ``(spectrax_fn, nnx_fn)`` pairs.
+    """
     cases: dict[str, tuple[Callable, Callable]] = {}
     if "graph_seam" in selection or "all" in selection:
         from .cases import graph_seam
@@ -87,6 +107,7 @@ def _build_cases(selection: set[str]) -> dict[str, tuple[Callable, Callable]]:
 
 
 def _versions() -> dict[str, str]:
+    """Return a dictionary of installed library versions."""
     import flax
     import jax
 
@@ -100,7 +121,14 @@ def _versions() -> dict[str, str]:
 
 
 def _classify(case: str) -> str:
-    """Return a phase label for the JSON rows."""
+    """Return a phase label for the JSON rows.
+
+    Args:
+        case: Benchmark case name string.
+
+    Returns:
+        Phase classification string (e.g. ``"graph_seam"``, ``"e2e"``).
+    """
     if case.startswith(("mlp12x1024/", "xfmr_d512/")):
         return "graph_seam"
     if case.startswith(("jit_dispatch/", "grad/", "value_and_grad/", "vmap/", "scan/", "remat/")):
@@ -115,6 +143,7 @@ def _classify(case: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point — parse args, run benchmarks, write results."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default="all", help="comma-separated: graph_seam,transforms,e2e,rng,all")
     parser.add_argument("--device", default="cpu", choices=["cpu", "gpu", "tpu"])

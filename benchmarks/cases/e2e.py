@@ -17,6 +17,16 @@ from .. import models
 
 
 def _sgd_update_spx(state, grads, lr: float = 0.01):
+    """Apply an SGD update to a spectrax :class:`State`.
+
+    Args:
+        state: Current parameter state.
+        grads: Gradient state from :func:`spectrax.grad`.
+        lr: Learning rate.
+
+    Returns:
+        Updated :class:`State`.
+    """
     from spectrax import State
 
     new = {}
@@ -33,6 +43,11 @@ def _sgd_update_spx(state, grads, lr: float = 0.01):
 
 
 def build():
+    """Build end-to-end training-step benchmark cases for spectrax and nnx.
+
+    Returns:
+        Dictionary mapping case name to ``(spectrax_fn, nnx_fn)`` pairs.
+    """
     cases: dict[str, tuple[Callable, Callable]] = {}
 
     for name, factory in [("mlp12x1024", "mlp"), ("xfmr_d512", "transformer"), ("conv", "conv")]:
@@ -41,7 +56,18 @@ def build():
 
         @spx.jit
         def spx_step(m, x):
+            """Jitted spectrax training step: compute grads of ``m(x).sum()``.
+
+            Args:
+                m: spectrax module.
+                x: Input tensor.
+
+            Returns:
+                Gradient state.
+            """
+
             def loss_fn(m, x):
+                """Scalar loss: sum of model output."""
                 return m(x).sum()
 
             grads = spx.grad(loss_fn)(m, x)
@@ -49,7 +75,18 @@ def build():
 
         @nnx.jit
         def nnx_step(m, x):
+            """Jitted nnx training step: compute grads of ``m(x).sum()``.
+
+            Args:
+                m: nnx module.
+                x: Input tensor.
+
+            Returns:
+                Gradient state.
+            """
+
             def loss_fn(m, x):
+                """Scalar loss: sum of model output."""
                 return m(x).sum()
 
             grads = nnx.grad(loss_fn)(m, x)

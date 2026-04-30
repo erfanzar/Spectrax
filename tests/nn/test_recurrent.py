@@ -190,6 +190,7 @@ def test_rnn_gradient_flows_through_time():
     rnn = RNN(cell)
 
     def loss(W_xh):
+        """Compute the loss."""
         cell.W_xh.value = W_xh
         ys = rnn(jnp.ones((1, 4, 2)))
         return ys.sum()

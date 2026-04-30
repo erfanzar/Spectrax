@@ -319,11 +319,21 @@ class _StateDictProxy(MutableMapping[Any, Any]):
         return False
 
     def as_dict(self) -> dict[Any, Any]:
-        """Return a detached plain-dict snapshot of this view."""
+        """Return a detached plain-dict snapshot of this view.
+
+        Returns:
+            A recursively copied plain ``dict`` representing the
+            current contents of the proxied nested mapping.
+        """
         return _deep_copy_nested(self._target())
 
     def copy(self) -> dict[Any, Any]:
-        """Return a detached plain-dict snapshot, matching ``dict.copy`` ergonomics."""
+        """Return a detached plain-dict snapshot, matching ``dict.copy`` ergonomics.
+
+        Returns:
+            A shallow-top-level but deeply-nested copy of the current
+            view as a plain Python ``dict``.
+        """
         return self.as_dict()
 
 
@@ -412,7 +422,12 @@ class State:
         return obj
 
     def copy(self) -> State:
-        """Return a detached nested structure with shared immutable leaves."""
+        """Return a detached nested structure with shared immutable leaves.
+
+        Returns:
+            A fresh :class:`State` whose nested dict is a deep copy of
+            ``self._data``; leaves (arrays) are shared, not copied.
+        """
         return State._from_raw(_deep_copy_nested(self._data))
 
     def overlay(self, other: State) -> State:
@@ -421,6 +436,12 @@ class State:
         This rebuilds only the nested dictionary structure; leaves are shared.
         It is the internal fast path for temporary bind states where we need a
         merged view but do not want mutable ``merge`` write-through semantics.
+
+        Args:
+            other: The :class:`State` to overlay on top of ``self``.
+
+        Returns:
+            A fresh :class:`State` containing the merged view.
         """
         data = _deep_copy_nested(self._data)
         _merge_nested(data, other._data)
@@ -490,7 +511,12 @@ class State:
         return sum(sum(1 for _ in _nested_paths(d)) for d in self._data.values())
 
     def collections(self) -> set[str]:
-        """Return the set of non-empty collection names."""
+        """Return the set of non-empty collection names.
+
+        Returns:
+            A ``set`` of collection strings that currently hold at
+            least one leaf.
+        """
         return {c for c, v in self._data.items() if v}
 
     def raw(self) -> dict[str, dict[str, Leaf]]:
@@ -499,17 +525,32 @@ class State:
         Direct nested-dict mutation bypasses live write-through hooks.
         Prefer :meth:`set`, :meth:`merge`, or :meth:`map` when you want
         live-backed updates to propagate.
+
+        Returns:
+            The internal two-level ``{collection: {path: leaf}}`` dict.
         """
         return self._data
 
     def items(self) -> Iterator[tuple[str, str, Leaf]]:
-        """Yield ``(collection, dotted_path, leaf)`` tuples over every leaf."""
+        """Yield ``(collection, dotted_path, leaf)`` tuples over every leaf.
+
+        Yields:
+            ``(collection, dotted_path, leaf)`` for every leaf across
+            all collections, sorted by collection then path.
+        """
         for c, d in self._data.items():
             for path_tuple, v in _nested_items(d):
                 yield c, path_to_str(path_tuple), v
 
     def paths(self, collection: str | None = None) -> list[tuple[str, str]]:
-        """Return every ``(collection, dotted_path)`` pair, optionally filtered."""
+        """Return every ``(collection, dotted_path)`` pair, optionally filtered.
+
+        Args:
+            collection: If given, restrict to this collection name.
+
+        Returns:
+            A list of ``(collection, dotted_path)`` tuples.
+        """
         if collection is not None:
             return [(collection, path_to_str(p)) for p in _nested_paths(self._data.get(collection, {}))]
         return [(c, path_to_str(p)) for c, d in self._data.items() for p in _nested_paths(d)]
@@ -518,6 +559,14 @@ class State:
         """Keep only the named collections.
 
         Mutates ``self`` by default; pass ``copy=True`` for a detached result.
+
+        Args:
+            *collections: Collection names to retain.
+            copy: When ``True``, return a new :class:`State`; when
+                ``False`` (default), mutate ``self`` in place.
+
+        Returns:
+            The filtered :class:`State` (``self`` when ``copy=False``).
         """
         if copy:
             filtered = {c: _deep_copy_nested(self._data[c]) for c in collections if c in self._data}
@@ -532,6 +581,14 @@ class State:
         """Drop the named collections.
 
         Mutates ``self`` by default; pass ``copy=True`` for a detached result.
+
+        Args:
+            *collections: Collection names to drop.
+            copy: When ``True``, return a new :class:`State`; when
+                ``False`` (default), mutate ``self`` in place.
+
+        Returns:
+            The remaining :class:`State` (``self`` when ``copy=False``).
         """
         if copy:
             remaining = {c: _deep_copy_nested(d) for c, d in self._data.items() if c not in collections}
@@ -549,6 +606,13 @@ class State:
         shares leaf objects with both inputs; neither input is mutated.
         The ``copy`` parameter is kept for API compatibility but no longer
         affects behaviour.
+
+        Args:
+            other: The :class:`State` to merge on top of ``self``.
+            copy: Kept for API compatibility; does not affect behaviour.
+
+        Returns:
+            A new :class:`State` containing the merged data.
         """
         data = _deep_copy_nested(self._data)
         _merge_nested(data, other._data)
@@ -571,6 +635,16 @@ class State:
 
         where ``path`` is the dotted path within the collection.
         Mutates ``self`` by default; pass ``copy=True`` for a detached result.
+
+        Args:
+            fn: Callback applied to each leaf.
+            *collections: Optional collection names to restrict the map
+                to. When omitted, all collections are mapped.
+            copy: When ``True``, return a new :class:`State`; when
+                ``False`` (default), mutate ``self`` in place.
+
+        Returns:
+            The mapped :class:`State` (``self`` when ``copy=False``).
         """
         target_collections: set[str] | None = set(collections) if collections else None
         arity = _map_fn_arity(fn)
@@ -591,6 +665,16 @@ class State:
         """Set ``value`` at ``(collection, path)``.
 
         Mutates ``self`` by default; pass ``copy=True`` for a detached result.
+
+        Args:
+            collection: The collection name.
+            path: Dotted string or tuple path to the leaf.
+            value: The new leaf value.
+            copy: When ``True``, return a new :class:`State`; when
+                ``False`` (default), mutate ``self`` in place.
+
+        Returns:
+            The updated :class:`State` (``self`` when ``copy=False``).
         """
         path_tuple = str_to_path(path) if isinstance(path, str) else path
         target = self.copy() if copy else self
@@ -598,12 +682,26 @@ class State:
         return target
 
     def get(self, collection: str, path: str | Path, default: Any = None) -> Any:
-        """Return the leaf at ``(collection, path)`` or ``default`` if missing."""
+        """Return the leaf at ``(collection, path)`` or ``default`` if missing.
+
+        Args:
+            collection: The collection name.
+            path: Dotted string or tuple path to the leaf.
+            default: Value to return when the path is absent.
+
+        Returns:
+            The stored leaf, or ``default`` when the path does not exist.
+        """
         path_tuple = str_to_path(path) if isinstance(path, str) else path
         return _nested_get(self._data.get(collection, {}), path_tuple, default)
 
     def flatten(self) -> dict[str, Leaf]:
-        """Return a flat ``{'collection/path': leaf}`` dict."""
+        """Return a flat ``{'collection/path': leaf}`` dict.
+
+        Returns:
+            A one-level dict whose keys are ``"collection/path"`` strings
+            and whose values are the leaves.
+        """
         out: dict[str, Leaf] = {}
         for c, d in self._data.items():
             for path_tuple, v in _nested_items(d):
@@ -615,6 +713,15 @@ class State:
         """Construct a :class:`State` from the dict produced by :meth:`flatten`.
 
         Keys are split on the first ``/``.
+
+        Args:
+            flat: A flat mapping with ``"collection/path"`` keys.
+
+        Returns:
+            A reconstructed :class:`State`.
+
+        Raises:
+            ValueError: If a key does not contain ``/``.
         """
         out: dict[str, dict[str, Leaf]] = {}
         for key, v in flat.items():

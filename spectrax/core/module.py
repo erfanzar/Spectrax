@@ -292,6 +292,9 @@ class _HookHandle:
         Idempotent: if the hook was already removed (or the list has
         been mutated externally so the entry no longer exists) the
         :class:`ValueError` raised by ``list.remove`` is swallowed.
+
+        Returns:
+            ``None``.
         """
         with contextlib.suppress(ValueError):
             self._list.remove(self._fn)
@@ -574,6 +577,10 @@ class Module:
         static fields, opaque metadata such as configs, variable
         collections/metadata, sharing topology, and canonical paths. It
         does **not** hash parameter or buffer array values.
+
+        Returns:
+            A SHA-256 hex digest string representing the structural
+            identity of the module.
         """
         from .graph import export
 
@@ -593,6 +600,10 @@ class Module:
         it includes all information from :meth:`structure_hash` plus
         each exported state leaf's collection, path, shape, and dtype,
         but never hashes array contents.
+
+        Returns:
+            A SHA-256 hex digest string representing the structure and
+            leaf signature of the module.
         """
         from .graph import export
 
@@ -645,7 +656,11 @@ class Module:
         return self
 
     def eval(self) -> Module:
-        """Shorthand for ``self.train(False)``."""
+        """Shorthand for ``self.train(False)``.
+
+        Returns:
+            ``self`` for chaining.
+        """
         return self.train(False)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -718,6 +733,17 @@ class Module:
 
         Subclasses override this method. The default implementation
         raises :class:`NotImplementedError`.
+
+        Args:
+            *args: Positional inputs forwarded by :meth:`__call__`.
+            **kwargs: Keyword inputs forwarded by :meth:`__call__`.
+
+        Returns:
+            The output of the module computation.
+
+        Raises:
+            NotImplementedError: When the subclass does not override
+                this method.
         """
         raise NotImplementedError(f"{type(self).__name__} must override `forward`.")
 
@@ -770,7 +796,13 @@ class Module:
             mesh = jax.sharding.Mesh(devices, ("fsdp", "tp"))
             self.register_context(mesh=mesh)
 
-        Returns a handle with a :meth:`~_HookHandle.remove` method.
+        Args:
+            *contexts: Context managers or zero-argument factories.
+            **scope_values: Keyword values exposed via :func:`spx.scope`.
+                Values that are context managers are also entered.
+
+        Returns:
+            A handle with a :meth:`~_HookHandle.remove` method.
         """
         factories = [_context_factory(ctx) for ctx in contexts]
         for value in scope_values.values():
@@ -836,6 +868,9 @@ class Module:
                 * ``"sum"`` — add ``value`` to the running accumulator.
                 * ``"stack"`` — concatenate ``value`` along a freshly
                   added leading axis.
+
+        Returns:
+            ``None``.
 
         Raises:
             TypeError: If the slot exists but is not a
@@ -963,6 +998,9 @@ class Module:
         Typically called automatically during the first eager forward
         pass (or via :meth:`sequential_init`).  Safe to call repeatedly —
         already-materialized variables are skipped.
+
+        Returns:
+            ``self`` for chaining.
         """
         seen: set[int] = set()
 

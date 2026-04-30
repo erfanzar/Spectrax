@@ -58,6 +58,7 @@ class RuntimeDispatchModel(Module):
     """Module that routes through private runtime attrs."""
 
     def __init__(self, rngs: Rngs):
+        """Initialize with left, right."""
         super().__init__()
         self.left = Linear(4, 4, rngs=rngs)
         self.right = Linear(4, 4, rngs=rngs)
@@ -65,6 +66,7 @@ class RuntimeDispatchModel(Module):
         self._scale = lambda x: x * 2
 
     def forward(self, x):
+        """Run the forward pass."""
         return self._scale(getattr(self, self._target)(x))
 
 
@@ -72,12 +74,14 @@ class RuntimeTargetModel(Module):
     """Module whose private routing attr may be updated after export."""
 
     def __init__(self, rngs: Rngs):
+        """Initialize with left, right."""
         super().__init__()
         self.left = Linear(4, 4, rngs=rngs)
         self.right = Linear(4, 4, rngs=rngs)
         self._target = "left"
 
     def forward(self, x):
+        """Run the forward pass."""
         return getattr(self, self._target)(x)
 
 
@@ -129,10 +133,12 @@ def test_graphdef_inequality_on_different_structure():
         """Different structure than :class:`TinyModel`."""
 
         def __init__(self, rngs):
+            """Initialize with head."""
             super().__init__()
             self.head = Linear(4, 8, rngs=rngs)
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.head(x)
 
     g1, _ = export(TinyModel(Rngs(0)))
@@ -181,10 +187,12 @@ def test_export_detects_cycle():
         """Module that creates a cycle after construction."""
 
         def __init__(self, rngs):
+            """Initialize with fc."""
             super().__init__()
             self.fc = Linear(4, 4, rngs=rngs)
 
         def forward(self, x):
+            """Run the forward pass."""
             return self.fc(x)
 
     m = Cyc(Rngs(0))
@@ -369,11 +377,13 @@ class ModelWithEmptyModuleList(Module):
     """Module containing an empty ModuleList to exercise edge cases."""
 
     def __init__(self):
+        """Initialize with fc, layers."""
         super().__init__()
         self.fc = Linear(4, 4, rngs=Rngs(0))
         self.layers = spectrax.nn.ModuleList([])
 
     def forward(self, x):
+        """Run the forward pass."""
         return self.fc(x)
 
 

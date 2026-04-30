@@ -48,6 +48,7 @@ def test_conv_transpose_gradient_flows():
     x = jnp.ones((1, 3, 3, 2))
 
     def loss(W):
+        """Compute the loss."""
         layer.weight.value = W
         return layer(x).sum()
 

@@ -124,6 +124,10 @@ def snapshot() -> dict[str, Any]:
     Inner frames overwrite outer ones on key collision (matching
     :func:`get` semantics). The returned dict is a fresh copy; mutating
     it does not affect the scope stack.
+
+    Returns:
+        A dict containing the merged key/value bindings of every active
+        scope frame.
     """
     stack = _STACK.get()
     if not stack:

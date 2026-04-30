@@ -8,8 +8,7 @@ This subpackage provides a single :class:`~spectrax.loggers.Logger` that can
 multiplex scalar, histogram, image, text, and hyper-parameter writes to any
 combination of backends:
 
-* **TensorBoard** — via ``tensorboardX``, ``torch.utils.tensorboard``, or
-  ``flax.metrics.tensorboard`` (whichever is installed).
+* **TensorBoard** — via SpectraX's native event-file backend.
 * **Weights & Biases** — via ``wandb`` (if installed).
 * **Console** — plain ``stdout`` for quick debugging.
 
@@ -18,12 +17,9 @@ In multi-process JAX training, only process ``0`` performs actual I/O.
 
 Example::
 
-    from spectrax.loggers import Logger
+    from spectrax.loggers import SummaryWriter
 
-    logger = Logger(
-        tensorboard_dir="./runs/exp-1",
-        console=True,
-    )
+    logger = SummaryWriter(log_dir="./runs/exp-1")
     logger.log_scalar("loss/train", 0.42, step=100)
     logger.log_histogram("weights/l1", params["l1"], step=100)
     logger.close()
@@ -33,6 +29,7 @@ from __future__ import annotations
 
 from .base import BaseBackend, Logger
 from .console import ConsoleBackend
+from .summary_writer import SummaryWriter
 from .tensorboard import TensorBoardBackend
 from .wandb import WandBBackend
 
@@ -40,6 +37,7 @@ __all__ = [
     "BaseBackend",
     "ConsoleBackend",
     "Logger",
+    "SummaryWriter",
     "TensorBoardBackend",
     "WandBBackend",
 ]

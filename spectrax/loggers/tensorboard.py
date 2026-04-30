@@ -4,9 +4,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Native TensorBoard backend — no external TF/TB/Flax dependencies.
 
-Writes TensorBoard event files directly using only ``google.protobuf``
-(which JAX already depends on). Supports scalars, histograms, images,
-text, and hyper-parameters.
+Writes TensorBoard event files directly using ``google.protobuf`` plus a
+small CRC32C helper. Supports scalars, histograms, images, text, and
+hyper-parameters.
 """
 
 from __future__ import annotations
@@ -15,20 +15,46 @@ import os
 import struct
 import time
 import typing as tp
-import zlib
 
 import numpy as np
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+try:
+    import google_crc32c as _google_crc32c  #type:ignore
+except Exception:  # pragma: no cover - fallback is exercised when the package is absent.
+    _google_crc32c = None
 
 from spectrax.serialization._fs import _get_fs, joinpath, mkdir
 
 from .base import ArrayLike, BaseBackend, Scalar
 
 _ProtoCache: dict[str, tp.Any] = {}
+_CRC32C_TABLE: tuple[int, ...] | None = None
+
+
+def _crc32c(data: bytes) -> int:
+    """Compute CRC32C (Castagnoli), the checksum used by TFRecord."""
+    if _google_crc32c is not None:
+        return int(_google_crc32c.value(data)) & 0xFFFFFFFF
+
+    global _CRC32C_TABLE
+    if _CRC32C_TABLE is None:
+        table = []
+        for i in range(256):
+            crc = i
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+            table.append(crc & 0xFFFFFFFF)
+        _CRC32C_TABLE = tuple(table)
+
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc = (crc >> 8) ^ _CRC32C_TABLE[(crc ^ byte) & 0xFF]
+    return (~crc) & 0xFFFFFFFF
 
 
 def _masked_crc(data: bytes) -> int:
-    """Compute the TensorBoard masked CRC32 of *data*.
+    """Compute the TensorBoard masked CRC32C of *data*.
 
     Args:
         data: Raw bytes to checksum.
@@ -36,7 +62,7 @@ def _masked_crc(data: bytes) -> int:
     Returns:
         The 32-bit masked CRC value.
     """
-    crc = zlib.crc32(data) & 0xFFFFFFFF
+    crc = _crc32c(data)
     return ((crc >> 15) | (crc << 17)) + 0xA282EAD8 & 0xFFFFFFFF
 
 
@@ -219,8 +245,9 @@ def _get_protos() -> dict[str, tp.Any]:
 class TensorBoardBackend(BaseBackend):
     """Backend that writes TensorBoard event files natively.
 
-    No dependency on TensorFlow, tensorboardX, torch, or flax.
-    Requires only ``google.protobuf`` (already pulled in by JAX).
+    No dependency on TensorFlow, tensorboardX, torch, or flax. It uses
+    ``google.protobuf`` and ``google-crc32c`` when available, with a pure
+    Python CRC32C fallback.
 
     Args:
         log_dir: Directory to write TensorBoard event files.
@@ -254,6 +281,18 @@ class TensorBoardBackend(BaseBackend):
             self._file = fs.open(plain, "wb")
         else:
             self._file = open(path, "wb")
+        self._write_file_version_event()
+
+    def _write_file_version_event(self) -> None:
+        """Write the standard TensorBoard file-version event."""
+        if self._file is None:
+            return
+        P = _get_protos()
+        event = P["tensorboard.Event"]()
+        event.wall_time = time.time()
+        event.file_version = "brain.Event:2"
+        _write_record(self._file, event.SerializeToString())
+        self._file.flush()
 
     def _ensure_open(self) -> tp.BinaryIO:
         """Return the open file handle, reopening if it was closed.

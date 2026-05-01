@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import numpy as np
 from jax import core
 from jax.extend.core import Jaxpr, JaxprEqn, Primitive, Var
 from jax.interpreters import ad, batching, mlir
@@ -46,6 +47,7 @@ __all__ = [
     "has_stage_regions",
     "marker_edge_shardings",
     "split_by_markers",
+    "stage_region_cluster_boundaries",
     "stage_region_specs",
     "sxenter_loop",
     "sxexit_loop",
@@ -145,7 +147,10 @@ def _make_stage_region_spec(
 
 def _is_marker_leaf(x: Any) -> bool:
     """Return whether ``x`` can safely be used as a JAX primitive operand."""
-    return hasattr(x, "aval") or (hasattr(x, "shape") and hasattr(x, "dtype"))
+    dtype = getattr(getattr(x, "aval", None), "dtype", getattr(x, "dtype", None))
+    if dtype is not None and not np.issubdtype(np.dtype(dtype), np.inexact):
+        return False
+    return hasattr(x, "aval") or isinstance(x, jax.Array)
 
 
 def _bind_stage_region_marker(x: Any, primitive: Primitive, *, spec: StageRegionSpec) -> Any:
@@ -645,14 +650,98 @@ def _collect_defined_vars(eqns: list[JaxprEqn]) -> set[Var]:
     return defined
 
 
-def marker_edge_shardings(jaxpr: Jaxpr) -> list[PartitionSpec | None]:
+def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
+    """Return top-level equation spans covered by stage-region markers.
+
+    Region enter/exit primitives are emitted per traceable leaf, so they do
+    not form a simple balanced parenthesis stream for multi-leaf pytrees. The
+    tracer emits the exit markers together after the wrapped body, though, so
+    a region call is the interval from its first enter marker to the last
+    adjacent exit marker for that call.
+    """
+    spans: list[tuple[int, int]] = []
+    open_starts: dict[StageRegionSpec, int] = {}
+    for idx, eqn in enumerate(jaxpr.eqns):
+        if eqn.primitive is sxstage_region_enter_p:
+            spec = eqn.params["spec"]
+            open_starts.setdefault(spec, idx)
+        elif eqn.primitive is sxstage_region_exit_p:
+            spec = eqn.params["spec"]
+            start = open_starts.get(spec)
+            if start is None:
+                continue
+            next_eqn = jaxpr.eqns[idx + 1] if idx + 1 < len(jaxpr.eqns) else None
+            next_is_same_exit = (
+                next_eqn is not None and next_eqn.primitive is sxstage_region_exit_p and next_eqn.params["spec"] == spec
+            )
+            if not next_is_same_exit:
+                spans.append((start, idx))
+                del open_starts[spec]
+    spans.extend((start, len(jaxpr.eqns) - 1) for start in open_starts.values())
+    return tuple(spans)
+
+
+def _inside_any_span(idx: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    """Return whether ``idx`` lies inside any inclusive region span."""
+    return any(start <= idx <= end for start, end in spans)
+
+
+def stage_region_cluster_boundaries(jaxpr: Jaxpr) -> tuple[int, ...]:
+    """Return extra split points between serial leaf pipeline regions.
+
+    A multimodal graph can contain multiple independently staged towers, e.g.
+    a vision encoder followed by a text decoder. Each tower's
+    :func:`sxstage_iter` markers are local to that tower, so the second tower
+    must start a fresh logical-stage sequence instead of continuing the first
+    tower's stage count.
+
+    The returned indices are equation positions where a new cluster should
+    begin. Only leaf regions are considered: enclosing regions such as a
+    top-level VLM module wrap nested towers but should not add their own
+    split points.
+    """
+    spans = _stage_region_spans(jaxpr)
+    if not spans:
+        return ()
+
+    marker_positions = [idx for idx, eqn in enumerate(jaxpr.eqns) if eqn.primitive is sxstage_iter_p]
+    if not marker_positions:
+        return ()
+
+    pipeline_spans = [
+        (start, end) for start, end in spans if any(start <= marker_idx <= end for marker_idx in marker_positions)
+    ]
+    leaf_spans: list[tuple[int, int]] = []
+    for start, end in pipeline_spans:
+        contains_child = any(child_start > start and child_end < end for child_start, child_end in pipeline_spans)
+        if not contains_child:
+            leaf_spans.append((start, end))
+
+    leaf_spans.sort()
+    return tuple(start for start, _end in leaf_spans[1:])
+
+
+def _sxstage_iter_positions(jaxpr: Jaxpr, *, ignore_region_local_markers: bool) -> list[int]:
+    """Return stage-boundary marker positions visible to the current splitter."""
+    spans = _stage_region_spans(jaxpr) if ignore_region_local_markers else ()
+    return [i for i, eqn in enumerate(jaxpr.eqns) if eqn.primitive is sxstage_iter_p and not _inside_any_span(i, spans)]
+
+
+def marker_edge_shardings(
+    jaxpr: Jaxpr,
+    *,
+    ignore_region_local_markers: bool = False,
+) -> list[PartitionSpec | None]:
     """Return ``sxstage_iter`` edge shardings in marker order.
 
     Entry ``i`` describes the transfer edge leaving logical stage
     ``i``. ``None`` means the runtime should keep its default transfer
     target for that boundary.
     """
-    return [eqn.params.get("sharding") for eqn in jaxpr.eqns if eqn.primitive is sxstage_iter_p]
+    return [
+        jaxpr.eqns[i].params.get("sharding")
+        for i in _sxstage_iter_positions(jaxpr, ignore_region_local_markers=ignore_region_local_markers)
+    ]
 
 
 _REGION_PRIMITIVES = (sxstage_region_enter_p, sxstage_region_exit_p)
@@ -714,10 +803,15 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
 
 def has_stage_regions(jaxpr: Jaxpr) -> bool:
     """Return whether ``jaxpr`` contains any :func:`sxstage_region` markers."""
-    return bool(stage_region_specs(jaxpr))
+    return bool(_stage_region_spans(jaxpr))
 
 
-def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
+def cluster_jaxpr_by_markers(
+    jaxpr: Jaxpr,
+    *,
+    ignore_region_local_markers: bool = False,
+    extra_boundary_positions: tuple[int, ...] = (),
+) -> list[Jaxpr]:
     """Split ``jaxpr`` into sub-jaxprs at every ``sxstage_iter`` eqn.
 
     The marker eqns themselves are dropped (they're identity). Each
@@ -741,6 +835,15 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
     Args:
         jaxpr: The traced :class:`Jaxpr`, typically produced by
             :func:`jax.make_jaxpr`.
+        ignore_region_local_markers: If ``True``, ``sxstage_iter`` markers
+            enclosed by :func:`sxstage_region` enter/exit spans are kept as
+            ordinary identity equations instead of becoming parent pipeline
+            boundaries. This lets a region carry its own local stage metadata
+            without changing the enclosing MPMD schedule's stage count.
+        extra_boundary_positions: Equation indices where a new cluster should
+            begin even though there is no ``sxstage_iter`` marker at that
+            position. Used to restart local stage numbering at serial
+            :func:`sxstage_region` boundaries.
 
     Returns:
         A list of ``n_markers + 1`` sub-jaxprs, in execution order.
@@ -758,8 +861,9 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         invars directly through in place of its outvars — numerically
         identical and avoids needing a pass-through eqn.
     """
-    marker_positions: list[int] = [i for i, eqn in enumerate(jaxpr.eqns) if eqn.primitive is sxstage_iter_p]
-    boundaries = [0, *[p + 1 for p in marker_positions], len(jaxpr.eqns)]
+    marker_positions = _sxstage_iter_positions(jaxpr, ignore_region_local_markers=ignore_region_local_markers)
+    boundary_marker_positions = set(marker_positions)
+    boundaries = sorted({0, *extra_boundary_positions, *[p + 1 for p in marker_positions], len(jaxpr.eqns)})
 
     n_eqns = len(jaxpr.eqns)
     eqn_index_by_id = {id(eqn): i for i, eqn in enumerate(jaxpr.eqns)}
@@ -772,8 +876,8 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
     jaxpr_constvar_ids = {id(v) for v in jaxpr.constvars if isinstance(v, Var)}
     marker_input_ids = {
         id(invar)
-        for eqn in jaxpr.eqns
-        if eqn.primitive is sxstage_iter_p
+        for idx, eqn in enumerate(jaxpr.eqns)
+        if idx in boundary_marker_positions
         for invar in eqn.invars
         if isinstance(invar, Var)
     }
@@ -801,7 +905,11 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
             remat_cache[var_id] = False
             return False
         eqn = producer_by_var_id.get(var_id)
-        if eqn is None or eqn.primitive is sxstage_iter_p or getattr(eqn, "effects", core.no_effects):
+        if (
+            eqn is None
+            or eqn_index_by_id[id(eqn)] in boundary_marker_positions
+            or getattr(eqn, "effects", core.no_effects)
+        ):
             remat_cache[var_id] = False
             return False
         remat_cache[var_id] = False
@@ -832,7 +940,7 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
         if not can_rematerialize(var):
             return
         eqn = producer_by_var_id.get(id(var))
-        if eqn is None or eqn.primitive is sxstage_iter_p:
+        if eqn is None or eqn_index_by_id[id(eqn)] in boundary_marker_positions:
             return
         for invar in eqn.invars:
             if isinstance(invar, Var):
@@ -881,7 +989,9 @@ def cluster_jaxpr_by_markers(jaxpr: Jaxpr) -> list[Jaxpr]:
 
     clusters: list[Jaxpr] = []
     for idx, (start, end) in enumerate(itertools.pairwise(boundaries)):
-        base_eqns = [e for e in jaxpr.eqns[start:end] if e.primitive is not sxstage_iter_p]
+        base_eqns = [
+            e for eqn_idx, e in enumerate(jaxpr.eqns[start:end], start=start) if eqn_idx not in boundary_marker_positions
+        ]
         base_eqn_ids = {id(eqn) for eqn in base_eqns}
         base_defined = _collect_defined_vars(base_eqns)
         base_defined_ids = {id(v) for v in base_defined}

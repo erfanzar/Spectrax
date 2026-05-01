@@ -115,7 +115,13 @@ from ..schedules import (
 )
 from ..types.array import StagesArray
 from ..types.mesh import MpMdMesh, resolve_mpmd_mesh
-from .markers import cluster_jaxpr_by_markers, marker_edge_shardings, stage_region_specs, sxstage_iter_p
+from .markers import (
+    cluster_jaxpr_by_markers,
+    has_stage_regions,
+    marker_edge_shardings,
+    stage_region_cluster_boundaries,
+    sxstage_iter_p,
+)
 from .pscan_compiler import (
     _build_invar_sources,
     _build_logical_locs,
@@ -1142,38 +1148,6 @@ def _schedule_grad_target_for_value(value: Any, stage_mesh: Any) -> Any | None:
     return _canonical_stage_sharding(value, getattr(value, "sharding", None), stage_mesh)
 
 
-def _raise_on_stage_regions(jaxpr: Any, *, path: str) -> None:
-    """Reject region-marked MPMD paths until region-DAG dispatch exists."""
-    specs = stage_region_specs(jaxpr)
-    if not specs:
-        return
-    seen: set[tuple[Any, ...]] = set()
-    region_parts: list[str] = []
-    for spec in specs:
-        key = (
-            spec.name,
-            spec.schedule_name,
-            spec.microbatches,
-            spec.virtual_stages,
-            spec.batch_argnums,
-            spec.static_argnums,
-            spec.donate_argnums,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        label = spec.name or "<unnamed>"
-        schedule = spec.schedule_name or "default"
-        region_parts.append(f"{label}[schedule={schedule}, microbatches={spec.microbatches}, V={spec.virtual_stages}]")
-    regions = ", ".join(region_parts)
-    raise NotImplementedError(
-        f"{path}: sxstage_region markers were found ({regions}). "
-        "Region markers are recorded correctly, but scheduled region-DAG MPMD dispatch is not implemented yet. "
-        "Use one flat sxstage_iter pipeline for now, or implement the region dispatcher before relying on "
-        "separate encoder/decoder PP schedules."
-    )
-
-
 def _build_schedule_plan(
     fn: Callable,
     args: tuple,
@@ -1282,11 +1256,26 @@ def _build_schedule_plan(
 
     mb_dynamic_args = tuple(_make_mb_arg(i) for i in dynamic_argnums)
     closed_jaxpr = jax.make_jaxpr(_wrapper)(*mb_dynamic_args)
-    _raise_on_stage_regions(closed_jaxpr.jaxpr, path="sxjit schedule path")
+    has_regions = has_stage_regions(closed_jaxpr.jaxpr)
 
-    edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
-    clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
-    if len(clusters) != n_logical:
+    if has_regions:
+        extra_boundaries = stage_region_cluster_boundaries(closed_jaxpr.jaxpr)
+        edge_shardings = []
+        clusters = cluster_jaxpr_by_markers(
+            closed_jaxpr.jaxpr,
+            extra_boundary_positions=extra_boundaries,
+        )
+    else:
+        edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
+        clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
+    serial_region_plan = has_regions and len(clusters) != n_logical
+    if serial_region_plan and (len(clusters) < n_logical or len(clusters) % n_logical != 0):
+        raise ValueError(
+            f"sxjit schedule path: stage regions produced {len(clusters)} serial stages, "
+            f"which does not divide evenly into the {n_logical} local stages required by "
+            f"the mesh ({n} ranks, V={v})."
+        )
+    if not serial_region_plan and len(clusters) != n_logical:
         raise ValueError(
             f"sxjit schedule path: function has {len(clusters)} stages "
             f"({len(clusters) - 1} sxstage_iter markers) but mesh has "
@@ -1294,7 +1283,14 @@ def _build_schedule_plan(
             f"{n_logical} stages ({n_logical - 1} markers)."
         )
 
-    loc_for_logical, logical_for_loc, terminal_loc = _build_logical_locs(schedule, n, v)
+    base_loc_for_logical, logical_for_loc, terminal_loc = _build_logical_locs(schedule, n, v)
+    loc_for_logical = (
+        [base_loc_for_logical[i % n_logical] for i in range(len(clusters))]
+        if serial_region_plan
+        else base_loc_for_logical
+    )
+    terminal_logical = len(clusters) - 1
+    terminal_loc = loc_for_logical[terminal_logical]
     invar_sources = _build_invar_sources(closed_jaxpr.jaxpr, clusters)
 
     all_constvars = list(closed_jaxpr.jaxpr.constvars)
@@ -1381,7 +1377,7 @@ def _build_schedule_plan(
 
     donate_nums = set(_normalize_argnums(donate_argnums, len(args))) if donate_argnums is not None else set()
     donatable_nums = donate_nums & batch_nums
-    donate_invars_per_logical: dict[int, set[int]] = {i: set() for i in range(n_logical)}
+    donate_invars_per_logical: dict[int, set[int]] = {i: set() for i in range(len(clusters))}
     if donate_nums:
         for donate_num in donate_nums:
             if donate_num in static_nums:
@@ -1445,9 +1441,14 @@ def _build_schedule_plan(
     bwd_w_jits: dict[tuple[int, int], Callable[..., Any] | None] = {}
     terminal_jit: Callable[..., Any] | None = None
 
+    def _stage_plan_key(logical: int, loc: tuple[int, int]) -> tuple[int, int] | tuple[int, int, int]:
+        """Return a collision-free key for one compiled scheduled stage."""
+        return (logical, loc[0], loc[1]) if serial_region_plan else loc
+
     for logical, cluster in enumerate(clusters):
         loc = loc_for_logical[logical]
         _rank, _virt = loc
+        stage_key = _stage_plan_key(logical, loc)
         used_constvars = _collect_used_constvars(cluster)
         filtered_cluster = _filtered_cluster(cluster, used_constvars)
         const_indices = tuple(all_const_idx_by_id[id(v)] for v in used_constvars)
@@ -1466,37 +1467,37 @@ def _build_schedule_plan(
             for idx in const_indices
         )
 
-        per_loc_consts[loc] = placed_consts
-        const_indices_per_loc[loc] = const_indices
-        n_invars_per_loc[loc] = n_invars
-        cluster_jaxprs_per_loc[loc] = filtered_cluster
+        per_loc_consts[stage_key] = placed_consts
+        const_indices_per_loc[stage_key] = const_indices
+        n_invars_per_loc[stage_key] = n_invars
+        cluster_jaxprs_per_loc[stage_key] = filtered_cluster
         donate_positions = tuple(1 + pos for pos in sorted(donate_invars_per_logical[logical]))
-        fwd_jits[loc] = _make_fwd_jit(filtered_cluster, donate_argnums=donate_positions)
+        fwd_jits[stage_key] = _make_fwd_jit(filtered_cluster, donate_argnums=donate_positions)
         bwd_out_shardings = _bwd_out_shardings_for(logical, loc, placed_consts)
 
-        if loc != terminal_loc:
-            bwd_jits[loc] = _make_bwd_jit(
+        if logical != terminal_logical:
+            bwd_jits[stage_key] = _make_bwd_jit(
                 filtered_cluster,
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings,
             )
-            bwd_i_jits[loc] = _make_bwd_i_jit(
+            bwd_i_jits[stage_key] = _make_bwd_i_jit(
                 filtered_cluster,
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings[1],
             )
-            bwd_w_jits[loc] = _make_bwd_w_jit(
+            bwd_w_jits[stage_key] = _make_bwd_w_jit(
                 filtered_cluster,
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings[0],
             )
         else:
-            bwd_jits[loc] = None
-            bwd_i_jits[loc] = None
-            bwd_w_jits[loc] = None
+            bwd_jits[stage_key] = None
+            bwd_i_jits[stage_key] = None
+            bwd_w_jits[stage_key] = None
             terminal_jit = _make_terminal_jit(
                 filtered_cluster,
                 n_invars,
@@ -1522,11 +1523,12 @@ def _build_schedule_plan(
     vbwd_jits: dict[tuple[int, int], Callable[..., Any]] = {}
     if schedule.lazy_bwd_batching:
         for logical, loc in enumerate(loc_for_logical):
-            if loc == terminal_loc:
+            stage_key = _stage_plan_key(logical, loc)
+            if logical == terminal_logical:
                 continue
-            n_invars = n_invars_per_loc[loc]
+            n_invars = n_invars_per_loc[stage_key]
             n_outs = len(clusters[logical].outvars)
-            bwd = bwd_jits[loc]
+            bwd = bwd_jits[stage_key]
             in_axes = (
                 (None,)
                 + _schedule_invar_microbatch_axes(
@@ -1538,19 +1540,22 @@ def _build_schedule_plan(
                 + (0,) * n_outs
             )
             vbwd = jax.jit(jax.vmap(bwd, in_axes=in_axes))
-            vbwd_jits[loc] = vbwd
+            vbwd_jits[stage_key] = vbwd
 
     grid = _build_schedule_grid(schedule, n)
 
     return {
         "n": n,
         "v": v,
-        "n_logical": n_logical,
+        "n_logical": len(clusters),
+        "schedule_n_logical": n_logical,
         "m": m,
         "schedule": schedule,
         "loc_for_logical": loc_for_logical,
         "logical_for_loc": logical_for_loc,
         "terminal_loc": terminal_loc,
+        "terminal_logical": terminal_logical,
+        "serial_region_plan": serial_region_plan,
         "invar_sources": invar_sources,
         "per_loc_consts": per_loc_consts,
         "const_indices_per_loc": const_indices_per_loc,
@@ -1614,10 +1619,11 @@ def _schedule_per_call_consts(plan: dict[str, Any], args: tuple[Any, ...]) -> di
     leaf_stage_owners = plan["leaf_stage_owners"]
     rebound: dict[tuple[int, int], tuple[Any, ...]] = {}
 
-    for loc, planned_consts in plan["per_loc_consts"].items():
+    for stage_key, planned_consts in plan["per_loc_consts"].items():
+        loc = stage_key[1:] if plan.get("serial_region_plan", False) else stage_key
         consts = list(planned_consts)
         changed = False
-        for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
+        for local_idx, const_idx in enumerate(const_indices_per_loc[stage_key]):
             flat_idx = const_idx_to_flat_idx.get(const_idx)
             if flat_idx is None:
                 continue
@@ -1631,7 +1637,7 @@ def _schedule_per_call_consts(plan: dict[str, Any], args: tuple[Any, ...]) -> di
                 rank_submeshes=rank_submeshes,
             )
             changed = True
-        rebound[loc] = tuple(consts) if changed else planned_consts
+        rebound[stage_key] = tuple(consts) if changed else planned_consts
     return rebound
 
 
@@ -1715,7 +1721,7 @@ def _dispatch_gpipe_fwd(
     invar_sources = plan["invar_sources"]
     fwd_jits = plan["fwd_jits"]
     terminal_jit = plan["terminal_jit"]
-    terminal_loc = plan["terminal_loc"]
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     rank_submeshes = plan["rank_submeshes"]
     stage_shardings = plan["stage_shardings"]
     edge_shardings = plan.get("edge_shardings", ())
@@ -1727,6 +1733,14 @@ def _dispatch_gpipe_fwd(
     leaf_shardings = plan["leaf_shardings"]
     leaf_stage_owners = plan["leaf_stage_owners"]
     flat_args = jax.tree.leaves(args)
+
+    serial_region_plan = bool(plan.get("serial_region_plan", False))
+
+    def _stage_key(logical: int, loc: tuple[int, int]) -> tuple[int, int] | tuple[int, int, int]:
+        return (logical, loc[0], loc[1]) if serial_region_plan else loc
+
+    def _runtime_key(logical: int, loc: tuple[int, int], mb: int) -> tuple[int, ...]:
+        return (logical, loc[0], loc[1], mb) if serial_region_plan else (loc[0], loc[1], mb)
 
     mb_args: list[Any] = []
     for i, arg in enumerate(flat_args):
@@ -1742,8 +1756,9 @@ def _dispatch_gpipe_fwd(
     for mb in range(m):
         for logical in range(n_logical):
             loc = loc_for_logical[logical]
-            rank, virt = loc
-            consts = per_loc_consts[loc]
+            rank, _virt = loc
+            stage_key = _stage_key(logical, loc)
+            consts = per_loc_consts[stage_key]
             submesh = rank_submeshes[rank]
 
             invars: list[Any] = []
@@ -1765,7 +1780,7 @@ def _dispatch_gpipe_fwd(
                     invars.append(val)
                 elif source_kind == "cluster_out":
                     producer_loc = loc_for_logical[source_a]
-                    val = saved_outputs[(producer_loc[0], producer_loc[1], mb)][source_b]
+                    val = saved_outputs[_runtime_key(source_a, producer_loc, mb)][source_b]
                     if producer_loc[0] != rank:
                         val = jax.device_put(
                             val,
@@ -1782,15 +1797,16 @@ def _dispatch_gpipe_fwd(
                     invars.append(val)
 
             with submesh:
-                if loc == terminal_loc:
+                if logical == terminal_logical:
                     loss, _ = terminal_jit(consts, *invars)
                     loss_acc = loss_acc + loss
                 else:
-                    out = fwd_jits[loc](consts, *invars)
+                    out = fwd_jits[stage_key](consts, *invars)
 
-            saved_inputs[(rank, virt, mb)] = tuple(invars)
-            if loc != terminal_loc:
-                saved_outputs[(rank, virt, mb)] = out
+            key = _runtime_key(logical, loc, mb)
+            saved_inputs[key] = tuple(invars)
+            if logical != terminal_logical:
+                saved_outputs[key] = out
 
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     return mean_loss, {
@@ -1817,7 +1833,7 @@ def _dispatch_gpipe_bwd(
     invar_sources = plan["invar_sources"]
     bwd_jits = plan["bwd_jits"]
     terminal_jit = plan["terminal_jit"]
-    terminal_loc = plan["terminal_loc"]
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     rank_submeshes = plan["rank_submeshes"]
     stage_shardings = plan["stage_shardings"]
     edge_shardings = plan.get("edge_shardings", ())
@@ -1835,19 +1851,31 @@ def _dispatch_gpipe_bwd(
     saved_outputs = saved["saved_outputs"]
 
     grad_accums: dict[int, Any] = {}
-    recv_cots: dict[tuple[int, int, int], list[Any | None]] = {}
+    recv_cots: dict[tuple[int, ...], list[Any | None]] = {}
+    serial_region_plan = bool(plan.get("serial_region_plan", False))
+
+    def _stage_key(logical: int) -> tuple[int, int] | tuple[int, int, int]:
+        """Return the compiled stage key for ``logical``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1]) if serial_region_plan else loc
+
+    def _runtime_key(logical: int, mb: int) -> tuple[int, ...]:
+        """Return the saved activation/cotangent key for ``logical`` and ``mb``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1], mb) if serial_region_plan else (loc[0], loc[1], mb)
 
     for mb in range(m):
         for logical in reversed(range(n_logical)):
             loc = loc_for_logical[logical]
-            rank, virt = loc
-            consts = per_loc_consts[loc]
+            rank, _virt = loc
+            stage_key = _stage_key(logical)
+            consts = per_loc_consts[stage_key]
             submesh = rank_submeshes[rank]
-            key = (rank, virt, mb)
+            key = _runtime_key(logical, mb)
             invars = saved_inputs[key]
 
             with submesh:
-                if loc == terminal_loc:
+                if logical == terminal_logical:
                     _, (g_consts, g_invars) = terminal_jit(consts, *invars)
                     cotangent = jnp.asarray(1.0, dtype=jnp.float32) if g is None else g
                     scale = cotangent / jnp.asarray(m, dtype=jnp.float32)
@@ -1858,9 +1886,9 @@ def _dispatch_gpipe_bwd(
                         recv_cots.get(key),
                         saved_outputs[key],
                     )
-                    g_consts, g_invars = bwd_jits[loc](consts, *invars, *cotangents)
+                    g_consts, g_invars = bwd_jits[stage_key](consts, *invars, *cotangents)
 
-            for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][loc]):
+            for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][stage_key]):
                 flat_idx = const_idx_to_flat_idx.get(const_idx)
                 if flat_idx is None:
                     continue
@@ -1888,7 +1916,7 @@ def _dispatch_gpipe_bwd(
                     producer_logical = source_a
                     producer_out_idx = source_b
                     producer_loc = loc_for_logical[producer_logical]
-                    p_key = (producer_loc[0], producer_loc[1], mb)
+                    p_key = _runtime_key(producer_logical, mb)
                     cot = g_invars[invar_idx]
                     cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
                     if producer_loc[0] != rank:
@@ -1946,6 +1974,7 @@ def _dispatch_schedule_faithful_serial(
     """
     m = plan["m"]
     n_logical = plan["n_logical"]
+    schedule_n_logical = plan.get("schedule_n_logical", n_logical)
     grid = plan["grid"]
     loc_for_logical = plan["loc_for_logical"]
     logical_for_loc = plan["logical_for_loc"]
@@ -1953,7 +1982,7 @@ def _dispatch_schedule_faithful_serial(
     fwd_jits = plan["fwd_jits"]
     bwd_jits = plan["bwd_jits"]
     terminal_jit = plan["terminal_jit"]
-    terminal_loc = plan["terminal_loc"]
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     rank_submeshes = plan["rank_submeshes"]
     stage_shardings = plan["stage_shardings"]
     edge_shardings = plan.get("edge_shardings", ())
@@ -1968,6 +1997,18 @@ def _dispatch_schedule_faithful_serial(
     leaf_shardings = plan["leaf_shardings"]
     leaf_stage_owners = plan["leaf_stage_owners"]
     lazy_bwd_batching = plan["schedule"].lazy_bwd_batching
+    serial_region_plan = bool(plan.get("serial_region_plan", False))
+    region_groups = (n_logical // schedule_n_logical) if serial_region_plan else 1
+
+    def _stage_key(logical: int) -> tuple[int, int] | tuple[int, int, int]:
+        """Return the compiled stage key for ``logical``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1]) if serial_region_plan else loc
+
+    def _runtime_key(logical: int, mb: int) -> tuple[int, ...]:
+        """Return the saved activation/cotangent key for ``logical`` and ``mb``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1], mb) if serial_region_plan else (loc[0], loc[1], mb)
 
     flat_args_live = jax.tree.leaves(args)
     grad_targets = _schedule_grad_accum_targets(plan, args)
@@ -1978,189 +2019,197 @@ def _dispatch_schedule_faithful_serial(
         else:
             mb_args.append(arg)
 
-    saved_inputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    saved_outputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    terminal_grads: dict[tuple[int, int, int], tuple[Any, tuple[Any, ...]]] = {}
-    recv_cots: dict[tuple[int, int, int], list[Any | None]] = {}
+    saved_inputs: dict[tuple[int, ...], tuple[Any, ...]] = {}
+    saved_outputs: dict[tuple[int, ...], tuple[Any, ...]] = {}
+    terminal_grads: dict[tuple[int, ...], tuple[Any, tuple[Any, ...]]] = {}
+    recv_cots: dict[tuple[int, ...], list[Any | None]] = {}
     grad_accums: dict[int, Any] = {}
     terminal_const_grad_accums: dict[int, Any] = {}
     loss_acc = jnp.asarray(0.0)
-    lazy_bwd_actions: dict[tuple[int, int], list[tuple[Any, int]]] = {}
+    lazy_bwd_actions: dict[int, list[tuple[Any, int]]] = {}
 
-    for row in grid:
-        for rank, virt, action in _iter_actions(row):
-            mb = action.microbatch
-            phase = action.phase
-            loc = (rank, virt)
-            logical = logical_for_loc[loc]
-            submesh = rank_submeshes[rank]
-            key = (rank, virt, mb)
-            consts = per_loc_consts[loc]
-
-            if phase is Phase.FWD:
-                invars: list[Any] = []
-                for source_kind, source_a, source_b in invar_sources[logical]:
-                    if source_kind == "body_invar":
-                        flat_idx = dynamic_flat_to_global_flat[source_a]
-                        val = mb_args[flat_idx]
-                        if microbatch_mask[flat_idx]:
-                            val = val[mb]
-                        val = _place_schedule_dynamic_invar(
-                            val,
-                            rank=rank,
-                            flat_idx=flat_idx,
-                            leaf_shardings=leaf_shardings,
-                            leaf_stage_owners=leaf_stage_owners,
-                            stage_shardings=stage_shardings,
-                            rank_submeshes=rank_submeshes,
-                        )
-                        invars.append(val)
-                    elif source_kind == "cluster_out":
-                        producer_loc = loc_for_logical[source_a]
-                        val = saved_outputs[(producer_loc[0], producer_loc[1], mb)][source_b]
-                        if producer_loc[0] != rank:
-                            val = _transport(
-                                "device_put",
-                                val,
-                                _transfer_target_for_edge(
-                                    val,
-                                    producer_logical=source_a,
-                                    dst_rank=rank,
-                                    edge_shardings=edge_shardings,
-                                    stage_shardings=stage_shardings,
-                                    rank_submeshes=rank_submeshes,
-                                    mpmd_mesh=mpmd_mesh,
-                                ),
-                                task_name=f"transfer_fwd_stage{source_a}_to_stage{logical}_mb{mb}",
-                            )
-                        invars.append(val)
-
-                with submesh:
-                    if loc == terminal_loc:
-                        loss, (g_consts, g_invars) = _time_call(
-                            f"stage{logical}_terminal_fwd_mb{mb}",
-                            terminal_jit,
-                            consts,
-                            *invars,
-                        )
-                        loss_acc = loss_acc + loss
-                        terminal_grads[key] = (g_consts, g_invars)
-                    else:
-                        out = _time_call(f"stage{logical}_fwd_mb{mb}", fwd_jits[loc], consts, *invars)
-
-                saved_inputs[key] = tuple(invars)
-                if loc != terminal_loc:
-                    saved_outputs[key] = out
-
-            elif phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
-                if lazy_bwd_batching:
-                    lazy_bwd_actions.setdefault(loc, []).append((action, mb))
+    for group in range(region_groups):
+        logical_offset = group * schedule_n_logical
+        for row in grid:
+            for rank, virt, action in _iter_actions(row):
+                loc = (rank, virt)
+                logical = logical_offset + logical_for_loc[loc]
+                if logical >= n_logical:
                     continue
+                mb = action.microbatch
+                phase = action.phase
+                stage_key = _stage_key(logical)
+                submesh = rank_submeshes[rank]
+                key = _runtime_key(logical, mb)
+                consts = per_loc_consts[stage_key]
 
-                invars = saved_inputs[key]
-                phase_label = phase.name.lower()
+                if phase is Phase.FWD:
+                    invars: list[Any] = []
+                    for source_kind, source_a, source_b in invar_sources[logical]:
+                        if source_kind == "body_invar":
+                            flat_idx = dynamic_flat_to_global_flat[source_a]
+                            val = mb_args[flat_idx]
+                            if microbatch_mask[flat_idx]:
+                                val = val[mb]
+                            val = _place_schedule_dynamic_invar(
+                                val,
+                                rank=rank,
+                                flat_idx=flat_idx,
+                                leaf_shardings=leaf_shardings,
+                                leaf_stage_owners=leaf_stage_owners,
+                                stage_shardings=stage_shardings,
+                                rank_submeshes=rank_submeshes,
+                            )
+                            invars.append(val)
+                        elif source_kind == "cluster_out":
+                            producer_loc = loc_for_logical[source_a]
+                            val = saved_outputs[_runtime_key(source_a, mb)][source_b]
+                            if producer_loc[0] != rank:
+                                val = _transport(
+                                    "device_put",
+                                    val,
+                                    _transfer_target_for_edge(
+                                        val,
+                                        producer_logical=source_a,
+                                        dst_rank=rank,
+                                        edge_shardings=edge_shardings,
+                                        stage_shardings=stage_shardings,
+                                        rank_submeshes=rank_submeshes,
+                                        mpmd_mesh=mpmd_mesh,
+                                    ),
+                                    task_name=f"transfer_fwd_stage{source_a}_to_stage{logical}_mb{mb}",
+                                )
+                            invars.append(val)
 
-                with submesh:
-                    if loc == terminal_loc:
-                        cached_terminal_grads = terminal_grads.pop(key, None)
-                        if cached_terminal_grads is None:
-                            _, cached_terminal_grads = _time_call(
-                                f"stage{logical}_terminal_{phase_label}_mb{mb}",
+                    with submesh:
+                        if logical == terminal_logical:
+                            loss, (g_consts, g_invars) = _time_call(
+                                f"stage{logical}_terminal_fwd_mb{mb}",
                                 terminal_jit,
                                 consts,
                                 *invars,
                             )
-                        g_consts, g_invars = cached_terminal_grads
-                        scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
-                        g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
-                    else:
-                        cotangents = _materialize_cotangents(
-                            recv_cots.get(key),
-                            saved_outputs[key],
-                        )
-                        g_consts, g_invars = _time_call(
-                            f"stage{logical}_{phase_label}_mb{mb}",
-                            bwd_jits[loc],
-                            consts,
-                            *invars,
-                            *cotangents,
-                        )
-
-                if phase is not Phase.BWD_I:
-                    const_accums = terminal_const_grad_accums if loc == terminal_loc else grad_accums
-                    for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][loc]):
-                        flat_idx = const_idx_to_flat_idx.get(const_idx)
-                        if flat_idx is None:
-                            continue
-                        grad = g_consts[local_idx]
-                        _accumulate_flat_grad(const_accums, flat_idx, grad, grad_targets)
-
-                if phase is not Phase.BWD_W:
-                    for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
-                        if source_kind != "body_invar":
-                            continue
-                        flat_idx = dynamic_flat_to_global_flat.get(source_a)
-                        if flat_idx is None:
-                            continue
-                        grad = g_invars[invar_idx]
-                        if microbatch_mask[flat_idx]:
-                            if flat_idx not in grad_accums:
-                                grad_accums[flat_idx] = [None] * m
-                            grad_accums[flat_idx][mb] = grad
+                            loss_acc = loss_acc + loss
+                            terminal_grads[key] = (g_consts, g_invars)
                         else:
-                            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
+                            out = _time_call(f"stage{logical}_fwd_mb{mb}", fwd_jits[stage_key], consts, *invars)
 
-                if phase is not Phase.BWD_W:
-                    for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
-                        if source_kind != "cluster_out":
-                            continue
-                        producer_logical = source_a
-                        producer_out_idx = source_b
-                        producer_loc = loc_for_logical[producer_logical]
-                        p_key = (producer_loc[0], producer_loc[1], mb)
-                        cot = g_invars[invar_idx]
-                        cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
-                        if producer_loc[0] != rank:
-                            cot = _transport(
-                                "device_put",
-                                cot,
-                                _transfer_target_for_edge(
-                                    cot,
-                                    producer_logical=producer_logical,
-                                    dst_rank=producer_loc[0],
-                                    edge_shardings=edge_shardings,
-                                    stage_shardings=stage_shardings,
-                                    rank_submeshes=rank_submeshes,
-                                    mpmd_mesh=mpmd_mesh,
-                                ),
-                                task_name=(f"transfer_{phase_label}_stage{logical}_to_stage{producer_logical}_mb{mb}"),
+                    saved_inputs[key] = tuple(invars)
+                    if logical != terminal_logical:
+                        saved_outputs[key] = out
+
+                elif phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
+                    if lazy_bwd_batching:
+                        lazy_bwd_actions.setdefault(logical, []).append((action, mb))
+                        continue
+
+                    invars = saved_inputs[key]
+                    phase_label = phase.name.lower()
+
+                    with submesh:
+                        if logical == terminal_logical:
+                            cached_terminal_grads = terminal_grads.pop(key, None)
+                            if cached_terminal_grads is None:
+                                _, cached_terminal_grads = _time_call(
+                                    f"stage{logical}_terminal_{phase_label}_mb{mb}",
+                                    terminal_jit,
+                                    consts,
+                                    *invars,
+                                )
+                            g_consts, g_invars = cached_terminal_grads
+                            scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                            g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
+                        else:
+                            cotangents = _materialize_cotangents(
+                                recv_cots.get(key),
+                                saved_outputs[key],
                             )
-                        slots = recv_cots.setdefault(
-                            p_key,
-                            [None] * len(saved_outputs[p_key]),
-                        )
-                        if slots[producer_out_idx] is None:
-                            slots[producer_out_idx] = cot
-                        else:
-                            slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
+                            g_consts, g_invars = _time_call(
+                                f"stage{logical}_{phase_label}_mb{mb}",
+                                bwd_jits[stage_key],
+                                consts,
+                                *invars,
+                                *cotangents,
+                            )
+
+                    if phase is not Phase.BWD_I:
+                        const_accums = terminal_const_grad_accums if logical == terminal_logical else grad_accums
+                        for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][stage_key]):
+                            flat_idx = const_idx_to_flat_idx.get(const_idx)
+                            if flat_idx is None:
+                                continue
+                            grad = g_consts[local_idx]
+                            _accumulate_flat_grad(const_accums, flat_idx, grad, grad_targets)
+
+                    if phase is not Phase.BWD_W:
+                        for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
+                            if source_kind != "body_invar":
+                                continue
+                            flat_idx = dynamic_flat_to_global_flat.get(source_a)
+                            if flat_idx is None:
+                                continue
+                            grad = g_invars[invar_idx]
+                            if microbatch_mask[flat_idx]:
+                                if flat_idx not in grad_accums:
+                                    grad_accums[flat_idx] = [None] * m
+                                grad_accums[flat_idx][mb] = grad
+                            else:
+                                _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
+
+                    if phase is not Phase.BWD_W:
+                        for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
+                            if source_kind != "cluster_out":
+                                continue
+                            producer_logical = source_a
+                            producer_out_idx = source_b
+                            producer_loc = loc_for_logical[producer_logical]
+                            p_key = _runtime_key(producer_logical, mb)
+                            cot = g_invars[invar_idx]
+                            cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
+                            if producer_loc[0] != rank:
+                                cot = _transport(
+                                    "device_put",
+                                    cot,
+                                    _transfer_target_for_edge(
+                                        cot,
+                                        producer_logical=producer_logical,
+                                        dst_rank=producer_loc[0],
+                                        edge_shardings=edge_shardings,
+                                        stage_shardings=stage_shardings,
+                                        rank_submeshes=rank_submeshes,
+                                        mpmd_mesh=mpmd_mesh,
+                                    ),
+                                    task_name=(
+                                        f"transfer_{phase_label}_stage{logical}_to_stage{producer_logical}_mb{mb}"
+                                    ),
+                                )
+                            slots = recv_cots.setdefault(
+                                p_key,
+                                [None] * len(saved_outputs[p_key]),
+                            )
+                            if slots[producer_out_idx] is None:
+                                slots[producer_out_idx] = cot
+                            else:
+                                slots[producer_out_idx] = _add_grad_on_common_sharding(slots[producer_out_idx], cot)
 
     if lazy_bwd_batching:
         vbwd_jits = plan.get("vbwd_jits", {})
         for logical in reversed(range(n_logical)):
             loc = loc_for_logical[logical]
             rank = loc[0]
-            actions = lazy_bwd_actions.get(loc, [])
+            stage_key = _stage_key(logical)
+            actions = lazy_bwd_actions.get(logical, [])
             if not actions:
                 continue
             actions.sort(key=lambda x: x[1])
             mbs = [mb for _, mb in actions]
             submesh = rank_submeshes[rank]
-            consts = per_loc_consts[loc]
+            consts = per_loc_consts[stage_key]
 
-            if loc == terminal_loc:
+            if logical == terminal_logical:
                 scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
                 for mb in mbs:
-                    key = (rank, loc[1], mb)
+                    key = _runtime_key(logical, mb)
                     invars = saved_inputs[key]
                     with submesh:
                         cached_terminal_grads = terminal_grads.pop(key, None)
@@ -2173,7 +2222,7 @@ def _dispatch_schedule_faithful_serial(
                             )
                         g_consts, g_invars = cached_terminal_grads
                         g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
-                    for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][loc]):
+                    for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][stage_key]):
                         flat_idx = const_idx_to_flat_idx.get(const_idx)
                         if flat_idx is None:
                             continue
@@ -2198,7 +2247,7 @@ def _dispatch_schedule_faithful_serial(
                         producer_logical = source_a
                         producer_out_idx = source_b
                         producer_loc = loc_for_logical[producer_logical]
-                        p_key = (producer_loc[0], producer_loc[1], mb)
+                        p_key = _runtime_key(producer_logical, mb)
                         cot = g_invars[invar_idx]
                         cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
                         if producer_loc[0] != rank:
@@ -2234,20 +2283,20 @@ def _dispatch_schedule_faithful_serial(
                 invars_stack = []
                 for invar_idx, axis in enumerate(in_axes):
                     if axis is None:
-                        invars_stack.append(saved_inputs[(rank, loc[1], mbs[0])][invar_idx])
+                        invars_stack.append(saved_inputs[_runtime_key(logical, mbs[0])][invar_idx])
                     else:
                         stacked = jnp.stack(
-                            [saved_inputs[(rank, loc[1], mb)][invar_idx] for mb in mbs],
+                            [saved_inputs[_runtime_key(logical, mb)][invar_idx] for mb in mbs],
                             axis=0,
                         )
                         invars_stack.append(stacked)
 
-                n_outs = len(saved_outputs[(rank, loc[1], mbs[0])])
+                n_outs = len(saved_outputs[_runtime_key(logical, mbs[0])])
                 cots_stack = []
                 for out_idx in range(n_outs):
                     cots_mb = []
                     for mb in mbs:
-                        key = (rank, loc[1], mb)
+                        key = _runtime_key(logical, mb)
                         slots = recv_cots.get(key, [None] * n_outs)
                         out = saved_outputs[key][out_idx]
                         cot = slots[out_idx]
@@ -2265,13 +2314,13 @@ def _dispatch_schedule_faithful_serial(
                 with submesh:
                     g_consts, g_invars = _time_call(
                         f"stage{logical}_vbwd_mbs{mbs[0]}_{mbs[-1]}",
-                        vbwd_jits[loc],
+                        vbwd_jits[stage_key],
                         consts,
                         *invars_stack,
                         *cots_stack,
                     )
 
-                for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][loc]):
+                for local_idx, const_idx in enumerate(plan["const_indices_per_loc"][stage_key]):
                     flat_idx = const_idx_to_flat_idx.get(const_idx)
                     if flat_idx is None:
                         continue
@@ -2301,7 +2350,7 @@ def _dispatch_schedule_faithful_serial(
                     producer_out_idx = source_b
                     producer_loc = loc_for_logical[producer_logical]
                     for idx, mb in enumerate(mbs):
-                        p_key = (producer_loc[0], producer_loc[1], mb)
+                        p_key = _runtime_key(producer_logical, mb)
                         cot = g_invars[invar_idx][idx]
                         cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
                         if producer_loc[0] != rank:
@@ -2573,6 +2622,7 @@ def _schedule_action_unit(
     rank: int,
     action: Any,
     logical_for_loc: dict[tuple[int, int], int],
+    logical_override: int | None = None,
 ) -> _ScheduleUnit:
     """Wrap a single :class:`Action` cell as a :class:`_ScheduleUnit`.
 
@@ -2593,7 +2643,7 @@ def _schedule_action_unit(
         A :class:`_ScheduleUnit` reflecting the action's phase.
     """
     virt = action.virtual_stage
-    logical = logical_for_loc[(rank, virt)]
+    logical = logical_for_loc[(rank, virt)] if logical_override is None else logical_override
     if action.phase is Phase.FWD:
         return _ScheduleUnit(
             index=index,
@@ -2630,6 +2680,7 @@ def _schedule_fused_unit(
     rank: int,
     fused: FusedTask,
     logical_for_loc: dict[tuple[int, int], int],
+    logical_override: int | None = None,
 ) -> _ScheduleUnit:
     """Wrap a paired FWD+BWD :class:`FusedTask` as a single :class:`_ScheduleUnit`.
 
@@ -2649,7 +2700,7 @@ def _schedule_fused_unit(
         A :class:`_ScheduleUnit` with ``kind="fused"``.
     """
     virt = fused.virtual_stage
-    logical = logical_for_loc[(rank, virt)]
+    logical = logical_for_loc[(rank, virt)] if logical_override is None else logical_override
     return _ScheduleUnit(
         index=index,
         row=row,
@@ -2697,58 +2748,136 @@ def _build_schedule_units_from_plan(plan: dict[str, Any]) -> list[_ScheduleUnit]
     units: list[_ScheduleUnit] = []
     next_index = 0
     logical_for_loc = plan["logical_for_loc"]
-    terminal_loc = plan["terminal_loc"]
+    n_logical = plan["n_logical"]
+    schedule_n_logical = plan.get("schedule_n_logical", n_logical)
+    serial_region_plan = bool(plan.get("serial_region_plan", False))
+    region_groups = (n_logical // schedule_n_logical) if serial_region_plan else 1
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     eager_terminal_bwd = True
-    for row_idx, row in enumerate(plan["grid"]):
-        for rank, cell in enumerate(row):
-            if cell is None:
-                continue
-            if isinstance(cell, FusedTask):
-                if cell.fwd.phase is Phase.FWD and cell.bwd.phase is Phase.BWD:
-                    units.append(
-                        _schedule_fused_unit(
-                            index=next_index,
-                            row=row_idx,
-                            rank=rank,
-                            fused=cell,
-                            logical_for_loc=logical_for_loc,
-                        )
-                    )
-                    next_index += 1
-                else:
-                    units.append(
-                        _schedule_action_unit(
-                            index=next_index,
-                            row=row_idx,
-                            rank=rank,
-                            action=cell.fwd,
-                            logical_for_loc=logical_for_loc,
-                        )
-                    )
-                    next_index += 1
-                    units.append(
-                        _schedule_action_unit(
-                            index=next_index,
-                            row=row_idx,
-                            rank=rank,
-                            action=cell.bwd,
-                            logical_for_loc=logical_for_loc,
-                        )
-                    )
-                    next_index += 1
-            else:
-                if eager_terminal_bwd and cell.phase is Phase.BWD and (rank, cell.virtual_stage) == terminal_loc:
-                    continue
-                units.append(
-                    _schedule_action_unit(
-                        index=next_index,
-                        row=row_idx,
-                        rank=rank,
-                        action=cell,
-                        logical_for_loc=logical_for_loc,
-                    )
+    grid = plan["grid"]
+    if serial_region_plan:
+
+        def append_action(
+            *,
+            logical: int,
+            synthetic_row: int,
+            rank: int,
+            action: Any,
+        ) -> None:
+            nonlocal next_index
+            if eager_terminal_bwd and action.phase is Phase.BWD and logical == terminal_logical:
+                return
+            units.append(
+                _schedule_action_unit(
+                    index=next_index,
+                    row=synthetic_row,
+                    rank=rank,
+                    action=action,
+                    logical_for_loc=logical_for_loc,
+                    logical_override=logical,
                 )
-                next_index += 1
+            )
+            next_index += 1
+
+        for group in range(region_groups):
+            logical_offset = group * schedule_n_logical
+            row_offset = group * len(grid)
+            for row_idx, row in enumerate(grid):
+                for rank, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    fwd_action = cell.fwd if isinstance(cell, FusedTask) else cell
+                    if fwd_action.phase is not Phase.FWD:
+                        continue
+                    logical = logical_offset + logical_for_loc[(rank, fwd_action.virtual_stage)]
+                    if logical < n_logical:
+                        append_action(logical=logical, synthetic_row=row_offset + row_idx, rank=rank, action=fwd_action)
+
+        bwd_row_base = region_groups * len(grid)
+        for reverse_group, group in enumerate(reversed(range(region_groups))):
+            logical_offset = group * schedule_n_logical
+            row_offset = bwd_row_base + reverse_group * len(grid)
+            for row_idx, row in enumerate(grid):
+                for rank, cell in enumerate(row):
+                    if cell is None:
+                        continue
+                    bwd_actions = (cell.bwd,) if isinstance(cell, FusedTask) else (cell,)
+                    for bwd_action in bwd_actions:
+                        if bwd_action.phase not in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
+                            continue
+                        logical = logical_offset + logical_for_loc[(rank, bwd_action.virtual_stage)]
+                        if logical < n_logical:
+                            append_action(
+                                logical=logical,
+                                synthetic_row=row_offset + row_idx,
+                                rank=rank,
+                                action=bwd_action,
+                            )
+        return _fuse_cross_virtual_schedule_units(plan, units)
+
+    for group in range(region_groups):
+        logical_offset = group * schedule_n_logical
+        row_offset = group * len(grid)
+        for row_idx, row in enumerate(grid):
+            for rank, cell in enumerate(row):
+                if cell is None:
+                    continue
+                base_logical = logical_for_loc[(rank, cell.virtual_stage)]
+                logical = logical_offset + base_logical
+                if logical >= n_logical:
+                    continue
+                synthetic_row = row_offset + row_idx
+                if isinstance(cell, FusedTask):
+                    if cell.fwd.phase is Phase.FWD and cell.bwd.phase is Phase.BWD:
+                        units.append(
+                            _schedule_fused_unit(
+                                index=next_index,
+                                row=synthetic_row,
+                                rank=rank,
+                                fused=cell,
+                                logical_for_loc=logical_for_loc,
+                                logical_override=logical,
+                            )
+                        )
+                        next_index += 1
+                    else:
+                        units.append(
+                            _schedule_action_unit(
+                                index=next_index,
+                                row=synthetic_row,
+                                rank=rank,
+                                action=cell.fwd,
+                                logical_for_loc=logical_for_loc,
+                                logical_override=logical,
+                            )
+                        )
+                        next_index += 1
+                        if not (eager_terminal_bwd and cell.bwd.phase is Phase.BWD and logical == terminal_logical):
+                            units.append(
+                                _schedule_action_unit(
+                                    index=next_index,
+                                    row=synthetic_row,
+                                    rank=rank,
+                                    action=cell.bwd,
+                                    logical_for_loc=logical_for_loc,
+                                    logical_override=logical,
+                                )
+                            )
+                            next_index += 1
+                else:
+                    if eager_terminal_bwd and cell.phase is Phase.BWD and logical == terminal_logical:
+                        continue
+                    units.append(
+                        _schedule_action_unit(
+                            index=next_index,
+                            row=synthetic_row,
+                            rank=rank,
+                            action=cell,
+                            logical_for_loc=logical_for_loc,
+                            logical_override=logical,
+                        )
+                    )
+                    next_index += 1
     return _fuse_cross_virtual_schedule_units(plan, units)
 
 
@@ -2792,7 +2921,7 @@ def _build_schedule_unit_dependencies(plan: dict[str, Any], units: list[_Schedul
         if unit.bwd_logical is not None and unit.bwd_mb is not None and unit.bwd_phase is not Phase.BWD_W:
             bwd_cot_units[(unit.bwd_logical, unit.bwd_mb)] = unit.index
 
-    terminal_logical = plan["logical_for_loc"][plan["terminal_loc"]]
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     for mb in range(plan["m"]):
         fwd_idx = fwd_units.get((terminal_logical, mb))
         if fwd_idx is not None:
@@ -2892,7 +3021,7 @@ def _dispatch_schedule_fused_async(
     bwd_i_jits = plan.get("bwd_i_jits", {})
     bwd_w_jits = plan.get("bwd_w_jits", {})
     terminal_jit = plan["terminal_jit"]
-    terminal_loc = plan["terminal_loc"]
+    terminal_logical = plan.get("terminal_logical", n_logical - 1)
     rank_submeshes = plan["rank_submeshes"]
     stage_shardings = plan["stage_shardings"]
     edge_shardings = plan.get("edge_shardings", ())
@@ -2911,6 +3040,17 @@ def _dispatch_schedule_fused_async(
     plan.get("cluster_jaxprs_per_loc", {})
     cache_terminal_grads = True
     eager_terminal_bwd = True
+    serial_region_plan = bool(plan.get("serial_region_plan", False))
+
+    def _stage_key(logical: int) -> tuple[int, int] | tuple[int, int, int]:
+        """Return the compiled stage key for ``logical``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1]) if serial_region_plan else loc
+
+    def _runtime_key(logical: int, mb: int) -> tuple[int, ...]:
+        """Return the saved activation/cotangent key for ``logical`` and ``mb``."""
+        loc = loc_for_logical[logical]
+        return (logical, loc[0], loc[1], mb) if serial_region_plan else (loc[0], loc[1], mb)
 
     flat_args_live = jax.tree.leaves(args)
     grad_targets = _schedule_grad_accum_targets(plan, args)
@@ -2921,14 +3061,14 @@ def _dispatch_schedule_fused_async(
         else:
             mb_args.append(arg)
 
-    saved_inputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    saved_outputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    pretransferred_outputs: dict[tuple[int, tuple[int, int, int]], tuple[Any, ...] | concurrent.futures.Future[Any]] = {}
-    terminal_grads: dict[tuple[int, int, int], tuple[Any, tuple[Any, ...]]] = {}
-    recv_cots: dict[tuple[int, int, int], list[Any | None]] = {}
+    saved_inputs: dict[tuple[int, ...], tuple[Any, ...]] = {}
+    saved_outputs: dict[tuple[int, ...], tuple[Any, ...]] = {}
+    pretransferred_outputs: dict[tuple[int, tuple[int, ...]], tuple[Any, ...] | concurrent.futures.Future[Any]] = {}
+    terminal_grads: dict[tuple[int, ...], tuple[Any, tuple[Any, ...]]] = {}
+    recv_cots: dict[tuple[int, ...], list[Any | None]] = {}
     grad_accums: dict[int, Any] = {}
-    const_tuple_accums: dict[tuple[int, int], Any] = {}
-    terminal_const_tuple_accums: dict[tuple[int, int], Any] = {}
+    const_tuple_accums: dict[tuple[int, ...], Any] = {}
+    terminal_const_tuple_accums: dict[tuple[int, ...], Any] = {}
     loss_acc = jnp.asarray(0.0)
     state_lock = threading.Lock()
     stats_collector: _ScheduleStatsCollector | None = None
@@ -2982,7 +3122,7 @@ def _dispatch_schedule_fused_async(
                 invars.append(val)
             elif source_kind == "cluster_out":
                 producer_loc = loc_for_logical[source_a]
-                producer_key = (producer_loc[0], producer_loc[1], mb)
+                producer_key = _runtime_key(source_a, mb)
                 with state_lock:
                     pretransferred = pretransferred_outputs.get((rank, producer_key))
                     producer_outputs = saved_outputs[producer_key]
@@ -3013,7 +3153,7 @@ def _dispatch_schedule_fused_async(
 
     def _pretransfer_fwd_outputs(logical: int, rank: int, virt: int, mb: int, outputs: tuple[Any, ...]) -> None:
         """Start cross-rank activation movement as soon as producer FWD returns."""
-        key = (rank, virt, mb)
+        key = _runtime_key(logical, mb)
         for consumer_logical in consumers_by_producer.get(logical, ()):
             consumer_loc = loc_for_logical[consumer_logical]
             dst_rank = consumer_loc[0]
@@ -3056,7 +3196,7 @@ def _dispatch_schedule_fused_async(
         phase: Phase,
         g_consts: Any,
         g_invars: tuple[Any, ...],
-        const_grad_accums: dict[tuple[int, int], Any] | None = None,
+        const_grad_accums: dict[tuple[int, ...], Any] | None = None,
         consts_already_accumulated: bool = False,
     ) -> None:
         """Fold one backward unit's gradients into accumulators / cotangent buffers.
@@ -3079,7 +3219,7 @@ def _dispatch_schedule_fused_async(
                 producer_logical = source_a
                 producer_out_idx = source_b
                 producer_loc = loc_for_logical[producer_logical]
-                p_key = (producer_loc[0], producer_loc[1], mb)
+                p_key = _runtime_key(producer_logical, mb)
                 cot = g_invars[invar_idx]
                 cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
                 if producer_loc[0] != rank:
@@ -3118,12 +3258,13 @@ def _dispatch_schedule_fused_async(
 
         with state_lock:
             if phase is not Phase.BWD_I and g_consts is not None:
+                loc_key = _stage_key(logical)
                 if consts_already_accumulated:
-                    const_accums[loc] = g_consts
-                elif loc not in const_accums:
-                    const_accums[loc] = g_consts
+                    const_accums[loc_key] = g_consts
+                elif loc_key not in const_accums:
+                    const_accums[loc_key] = g_consts
                 else:
-                    const_accums[loc] = _accumulate_grad_tree(const_accums[loc], g_consts)
+                    const_accums[loc_key] = _accumulate_grad_tree(const_accums[loc_key], g_consts)
 
             if phase is not Phase.BWD_W:
                 for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
@@ -3157,7 +3298,7 @@ def _dispatch_schedule_fused_async(
                         cot = cot_result()
                     slots[producer_out_idx] = _add_grad_on_common_sharding(existing, cot)
 
-    def _run_fwd(rank: int, virt: int, action: Any) -> None:
+    def _run_fwd(logical: int, rank: int, virt: int, action: Any) -> None:
         """Execute one forward action for the given (rank, virt) location.
 
         Two paths: terminal (loss) stages compute loss-and-grads in
@@ -3169,12 +3310,12 @@ def _dispatch_schedule_fused_async(
         nonlocal loss_acc
         mb = action.microbatch
         loc = (rank, virt)
-        logical = logical_for_loc[loc]
-        key = (rank, virt, mb)
-        consts = per_loc_consts[loc]
+        stage_key = _stage_key(logical)
+        key = _runtime_key(logical, mb)
+        consts = per_loc_consts[stage_key]
         invars = _collect_fwd_invars(logical, rank, mb)
         with rank_submeshes[rank]:
-            if loc == terminal_loc:
+            if logical == terminal_logical:
                 if cache_terminal_grads:
                     loss, (g_consts, g_invars) = _stage_call(
                         rank,
@@ -3187,7 +3328,7 @@ def _dispatch_schedule_fused_async(
                     loss_out = _stage_call(
                         rank,
                         f"stage{logical}_terminal_loss_mb{mb}",
-                        fwd_jits[loc],
+                        fwd_jits[stage_key],
                         consts,
                         *invars,
                     )
@@ -3210,13 +3351,13 @@ def _dispatch_schedule_fused_async(
                         const_grad_accums=terminal_const_tuple_accums,
                     )
             else:
-                out = _stage_call(rank, f"stage{logical}_fwd_mb{mb}", fwd_jits[loc], consts, *invars)
+                out = _stage_call(rank, f"stage{logical}_fwd_mb{mb}", fwd_jits[stage_key], consts, *invars)
                 with state_lock:
                     saved_inputs[key] = tuple(invars)
                     saved_outputs[key] = out
                 _pretransfer_fwd_outputs(logical, rank, virt, mb, out)
 
-    def _run_bwd(rank: int, virt: int, action: Any) -> None:
+    def _run_bwd(logical: int, rank: int, virt: int, action: Any) -> None:
         """Execute one backward action (full BWD, BWD_I, or BWD_W).
 
         Picks the appropriate compiled jit based on the action's
@@ -3228,15 +3369,15 @@ def _dispatch_schedule_fused_async(
         mb = action.microbatch
         phase = action.phase
         loc = (rank, virt)
-        logical = logical_for_loc[loc]
-        key = (rank, virt, mb)
-        consts = per_loc_consts[loc]
+        stage_key = _stage_key(logical)
+        key = _runtime_key(logical, mb)
+        consts = per_loc_consts[stage_key]
         invars = saved_inputs[key]
         phase_label = phase.name.lower()
         consts_already_accumulated = False
 
         with rank_submeshes[rank]:
-            if loc == terminal_loc:
+            if logical == terminal_logical:
                 if eager_terminal_bwd:
                     return
                 cached_terminal_grads = terminal_grads.pop(key, None)
@@ -3256,21 +3397,21 @@ def _dispatch_schedule_fused_async(
                     recv_cots.get(key),
                     saved_outputs[key],
                 )
-                if phase is Phase.BWD_I and bwd_i_jits.get(loc) is not None:
+                if phase is Phase.BWD_I and bwd_i_jits.get(stage_key) is not None:
                     g_consts = None
                     g_invars = _stage_call(
                         rank,
                         f"stage{logical}_{phase_label}_mb{mb}",
-                        bwd_i_jits[loc],
+                        bwd_i_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
                     )
-                elif phase is Phase.BWD_W and bwd_w_jits.get(loc) is not None:
+                elif phase is Phase.BWD_W and bwd_w_jits.get(stage_key) is not None:
                     g_consts = _stage_call(
                         rank,
                         f"stage{logical}_{phase_label}_mb{mb}",
-                        bwd_w_jits[loc],
+                        bwd_w_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
@@ -3280,7 +3421,7 @@ def _dispatch_schedule_fused_async(
                     g_consts, g_invars = _stage_call(
                         rank,
                         f"stage{logical}_{phase_label}_mb{mb}",
-                        bwd_jits[loc],
+                        bwd_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
@@ -3294,11 +3435,11 @@ def _dispatch_schedule_fused_async(
             phase=phase,
             g_consts=g_consts,
             g_invars=g_invars,
-            const_grad_accums=terminal_const_tuple_accums if loc == terminal_loc else None,
+            const_grad_accums=terminal_const_tuple_accums if logical == terminal_logical else None,
             consts_already_accumulated=consts_already_accumulated,
         )
 
-    def _run_fused(rank: int, virt: int, fused: FusedTask) -> None:
+    def _run_fused(logical: int, rank: int, virt: int, fused: FusedTask) -> None:
         """Execute a paired (fwd_A + bwd_B) action as a single compiled stage.
 
         Used in 1F1B-style schedules where a forward microbatch and
@@ -3312,15 +3453,15 @@ def _dispatch_schedule_fused_async(
         fwd_mb = fwd_action.microbatch
         bwd_mb = bwd_action.microbatch
         loc = (rank, virt)
-        logical = logical_for_loc[loc]
-        if loc == terminal_loc or bwd_action.phase is not Phase.BWD or fwd_action.phase is not Phase.FWD:
-            _run_fwd(rank, virt, fwd_action)
-            _run_bwd(rank, virt, bwd_action)
+        if logical == terminal_logical or bwd_action.phase is not Phase.BWD or fwd_action.phase is not Phase.FWD:
+            _run_fwd(logical, rank, virt, fwd_action)
+            _run_bwd(logical, rank, virt, bwd_action)
             return
 
-        consts = per_loc_consts[loc]
-        fwd_key = (rank, virt, fwd_mb)
-        bwd_key = (rank, virt, bwd_mb)
+        stage_key = _stage_key(logical)
+        consts = per_loc_consts[stage_key]
+        fwd_key = _runtime_key(logical, fwd_mb)
+        bwd_key = _runtime_key(logical, bwd_mb)
         fwd_invars = _collect_fwd_invars(logical, rank, fwd_mb)
         bwd_invars = saved_inputs[bwd_key]
         cotangents = _materialize_cotangents(
@@ -3328,9 +3469,9 @@ def _dispatch_schedule_fused_async(
             saved_outputs[bwd_key],
         )
         fused_jit = _get_schedule_fused_fwd_bwd_jit(
-            fwd_jits[loc],
-            bwd_jits[loc],
-            n_invars_per_loc[loc],
+            fwd_jits[stage_key],
+            bwd_jits[stage_key],
+            n_invars_per_loc[stage_key],
         )
         with rank_submeshes[rank]:
             fwd_outs, g_consts, g_bwd_invars = _stage_call(
@@ -3445,11 +3586,11 @@ def _dispatch_schedule_fused_async(
         t0 = time.perf_counter_ns()
         try:
             if unit.kind == "fused":
-                _run_fused(unit.rank, unit.virt, unit.payload)
+                _run_fused(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
             elif unit.payload.phase is Phase.FWD:
-                _run_fwd(unit.rank, unit.virt, unit.payload)
+                _run_fwd(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
             else:
-                _run_bwd(unit.rank, unit.virt, unit.payload)
+                _run_bwd(unit.bwd_logical, unit.rank, unit.virt, unit.payload)
         finally:
             if stats_collector is not None:
                 stats_collector.record_unit(unit.index, unit.rank, (time.perf_counter_ns() - t0) / 1e6)
@@ -3573,9 +3714,9 @@ def _dispatch_schedule_fused_async(
 
     use_async = _active_profiler() is None
     if units is None:
-        units = _build_schedule_units()
+        units = _build_schedule_units_from_plan(plan)
     if deps is None:
-        deps = _build_unit_dependencies(units)
+        deps = _build_schedule_unit_dependencies(plan, units)
     action_count = sum(2 if unit.kind == "fused" else 1 for unit in units)
     fused_count = sum(1 for unit in units if unit.kind == "fused")
     stats_collector = _ScheduleStatsCollector(
@@ -3963,7 +4104,17 @@ def sxjit(
                         full_args[idx] = darg
                     return fn(*full_args, **static_kwargs, **dyn_kwargs)
 
-                dynamic_args = tuple(args[i] for i in dynamic_nums)
+                if schedule is not None and batch_argnums is not None:
+                    schedule_batch_nums = set(_normalize_argnums(batch_argnums, len(args)))
+                    microbatches = int(getattr(schedule, "microbatches", 1) or 1)
+                    dynamic_args = tuple(
+                        jax.tree.map(lambda leaf: _microbatch_sample(leaf, microbatches), args[i])
+                        if i in schedule_batch_nums
+                        else args[i]
+                        for i in dynamic_nums
+                    )
+                else:
+                    dynamic_args = tuple(args[i] for i in dynamic_nums)
                 closed_jaxpr, out_shape = jax.make_jaxpr(_wrapper, return_shape=True)(
                     *dynamic_args,
                     **dynamic_kwargs,
@@ -4031,10 +4182,9 @@ def sxjit(
                 _state["schedule_plan"] = plan
                 return
 
-            _raise_on_stage_regions(closed_jaxpr.jaxpr, path="sxjit")
-
-            edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
-            clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
+            has_regions = has_stage_regions(closed_jaxpr.jaxpr)
+            edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr, ignore_region_local_markers=has_regions)
+            clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr, ignore_region_local_markers=has_regions)
             consts = closed_jaxpr.consts
 
             if len(clusters) != n:

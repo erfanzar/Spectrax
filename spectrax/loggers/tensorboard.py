@@ -20,7 +20,7 @@ import numpy as np
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 try:
-    import google_crc32c as _google_crc32c  #type:ignore
+    import google_crc32c as _google_crc32c  # type:ignore
 except Exception:  # pragma: no cover - fallback is exercised when the package is absent.
     _google_crc32c = None
 

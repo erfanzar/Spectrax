@@ -408,6 +408,44 @@ def _stage_place_trace_carry(layer: Module, carry: Any) -> Any:
     return _device_put_first_carry_leaf(carry, stage_mesh)
 
 
+def _trace_layer_static_index(layer: Module) -> int | None:
+    """Return the concrete layer index stored on a trace-mode module view."""
+    for attr in ("layer_idx", "layer_index"):
+        value = getattr(layer, attr, None)
+        if isinstance(value, int):
+            return int(value)
+    return None
+
+
+def _is_scalar_integer_like(value: Any) -> bool:
+    """Return whether ``value`` looks like the carried layer-index scalar."""
+    if isinstance(value, int):
+        return True
+    aval = getattr(value, "aval", None)
+    shape = getattr(aval, "shape", getattr(value, "shape", None))
+    dtype = getattr(aval, "dtype", getattr(value, "dtype", None))
+    return shape == () and dtype is not None and jnp.issubdtype(dtype, jnp.integer)
+
+
+def _inject_trace_layer_index(layer: Module, carry: Any) -> Any:
+    """Keep trace-mode scan layer indices concrete for Python-side users.
+
+    EasyDeL layer loops conventionally carry ``idx`` as the final carry item
+    and pass it into helpers that need a Python ``int`` for PP stage markers.
+    During ``jax.make_jaxpr`` that carry scalar becomes a tracer. When the
+    module view already has a concrete ``layer_idx``/``layer_index``, restore
+    it in the trailing carry slot so those helpers see the intended index.
+    """
+    layer_index = _trace_layer_static_index(layer)
+    if layer_index is None:
+        return carry
+    if isinstance(carry, tuple) and carry and _is_scalar_integer_like(carry[-1]):
+        return (*carry[:-1], layer_index)
+    if isinstance(carry, list) and carry and _is_scalar_integer_like(carry[-1]):
+        return [*carry[:-1], layer_index]
+    return carry
+
+
 def _device_put_first_carry_leaf(carry: Any, stage_mesh: Any) -> Any:
     """Place the leading array carry on ``stage_mesh`` while preserving carry shape."""
 
@@ -950,6 +988,7 @@ class ModuleList(_ListContainer):
         if trace:
             carry = init_carry
             for layer in self:
+                carry = _inject_trace_layer_index(layer, carry)
                 carry = _stage_place_trace_carry(layer, carry)
                 carry = fn(layer, carry)
             return carry
@@ -1275,6 +1314,7 @@ class StackedModuleList(Module):
         if trace:
             carry = init_carry
             for layer in self:
+                carry = _inject_trace_layer_index(layer, carry)
                 carry = _stage_place_trace_carry(layer, carry)
                 carry = fn(layer, carry)
             return carry

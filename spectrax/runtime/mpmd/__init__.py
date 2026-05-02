@@ -4,7 +4,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """True MPMD pipeline runtime.
 
-Each rank compiles and executes its own distinct JAX program.
+Each physical pipeline rank compiles and executes its own distinct JAX program.
+The public entry points here cover both training-style schedules
+(``sxcall``, ``sxgrad``, ``sxvalue_and_grad``) and forward-only inference
+dispatch (``sxjit`` plus ``MpmdPipelineExecutor``). The executor reuses the
+``sxjit`` prepared stage plan to run same-shaped microbatches as a host
+wavefront, while the schedule APIs drive full forward/backward MPMD execution.
 """
 
 from __future__ import annotations
@@ -29,6 +34,10 @@ from .per_rank import (
     compile_per_rank_fwd,
     extract_rank_actions,
     run_gpipe_per_rank,
+)
+from .pipeline_executor import (
+    MpmdPipelineDispatchStats,
+    MpmdPipelineExecutor,
 )
 from .pscan_compiler import (
     PscanPlan,
@@ -57,6 +66,8 @@ __all__ = [
     "Add",
     "Concat",
     "Max",
+    "MpmdPipelineDispatchStats",
+    "MpmdPipelineExecutor",
     "Op",
     "PscanPlan",
     "build_pscan_plan",

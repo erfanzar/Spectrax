@@ -673,6 +673,7 @@ def _compute_donation(
     donate_nums: set[int],
     static_nums: set[int],
     n: int,
+    body_jaxpr: Any | None = None,
 ) -> list[tuple[int, ...]]:
     """Translate user-facing ``donate_argnums`` into per-stage jit donate-argnum tuples.
 
@@ -695,6 +696,13 @@ def _compute_donation(
         donate_nums: User's donate-argnum spec.
         static_nums: Argnums that are treated as static.
         n: Number of physical pipeline ranks.
+        body_jaxpr: Optional outer jaxpr used to resolve marker aliases.
+            Stage-region and stage-iteration markers are identity equations in
+            the traced program. A donated value may appear in a later cluster
+            as the marker output variable rather than the original input
+            variable. Resolving those aliases lets donation still work for
+            stage-local recurrent state such as decode KV/cache pages, while
+            preserving the single-consumer safety check.
 
     Returns:
         ``donate_per_stage[rank]`` is the sorted tuple of cluster
@@ -712,6 +720,7 @@ def _compute_donation(
             )
         flat_start = sum(len(jax.tree.leaves(args[i])) for i in range(donate_num))
         n_leaves = len(jax.tree.leaves(args[donate_num]))
+        resolve_alias = _marker_alias_resolver(body_jaxpr) if body_jaxpr is not None else (lambda v: v)
         for leaf_offset in range(n_leaves):
             orig_flat = flat_start + leaf_offset
             dyn_flat = orig_flat_to_dynamic_flat.get(orig_flat)
@@ -720,7 +729,8 @@ def _compute_donation(
             used_by: list[tuple[int, int]] = []
             for rank, cluster in enumerate(clusters):
                 for pos, v in enumerate(cluster.invars):
-                    if original_id_to_idx.get(id(v)) == dyn_flat:
+                    canonical = resolve_alias(v)
+                    if original_id_to_idx.get(id(canonical)) == dyn_flat:
                         used_by.append((rank, pos))
             if len(used_by) == 1:
                 rank, pos = used_by[0]
@@ -4215,6 +4225,7 @@ def sxjit(
                     donate_nums,
                     static_nums,
                     n,
+                    body_jaxpr=closed_jaxpr.jaxpr,
                 )
 
             cluster_plans = _build_cluster_plans(
@@ -4836,12 +4847,50 @@ def _assemble_invars(
     rank_submeshes: list[Any],
     mpmd_mesh: MpMdMesh,
     dynamic_flat_to_orig_flat: dict[int, int] | None = None,
+    runtime_static_flat_indices: set[int] | None = None,
+    runtime_static_cache: dict[tuple[int, int], Any] | None = None,
 ) -> list:
-    """Assemble invars for one stage dispatch from placed params, dynamic args,
-    and previous stage outputs.
+    """Assemble positional inputs for one compiled MPMD stage dispatch.
 
-    Dynamic args use the same placement priority as static args: explicit
-    sharding > already on correct devices > fallback replicated.
+    ``invar_map`` is the flat routing table emitted by the marker splitter. Each
+    entry names one input to the stage executable and one of its sources:
+    an original function argument, an output from an earlier traced stage, or an
+    output from the immediately previous physical stage. This helper resolves
+    those sources into concrete JAX values with the destination stage's expected
+    placement.
+
+    Dynamic original arguments use the same placement priority as static leaves:
+    explicit input sharding first, already-on-rank values second, and the rank's
+    replicated fallback sharding last. ``runtime_static_flat_indices`` and
+    ``runtime_static_cache`` let an inference runtime mark large dynamic-looking
+    leaves as stable for a decode bucket; those leaves are device-placed once per
+    stage and reused on later dispatches. Inter-stage values are routed through
+    :func:`_transport` so transfer telemetry and skip logic stay centralized.
+
+    Args:
+        invar_map: Per-stage flat source map generated during MPMD preparation.
+        flat_args: Flattened original call arguments for this microbatch.
+        placed: Pre-placed non-dynamic argument leaves keyed by ``(rank,
+            orig_flat_idx)``.
+        dynamic: Original flat-leaf indices that come from runtime arguments.
+        explicit_in_sh: Optional caller-provided input shardings by original
+            flat-leaf index.
+        prev_outputs: Outputs from the immediately previous physical stage.
+        all_cluster_outputs: Outputs from all earlier traced stage clusters.
+        ri: Destination physical pipeline rank.
+        my_sh: Fallback sharding for ``ri``.
+        rank_devices: Concrete device set owned by ``ri``.
+        rank_submeshes: Physical stage-local meshes.
+        mpmd_mesh: Owning MPMD mesh used for marker-edge sharding resolution.
+        dynamic_flat_to_orig_flat: Optional remap from traced dynamic leaves
+            back to original call-argument leaf indices.
+        runtime_static_flat_indices: Dynamic leaves that should use the
+            stage-local placement cache.
+        runtime_static_cache: Mutable cache keyed by ``(rank, orig_flat_idx)``
+            containing already-placed runtime-static leaves.
+
+    Returns:
+        Positional argument list ready to pass to the compiled stage executable.
     """
     invars = []
     for source in invar_map:
@@ -4853,37 +4902,219 @@ def _assemble_invars(
             else:
                 orig_idx = idx
             if orig_idx in dynamic:
+                if runtime_static_flat_indices is not None and orig_idx in runtime_static_flat_indices:
+                    cache_key = (ri, orig_idx)
+                    if runtime_static_cache is not None and cache_key in runtime_static_cache:
+                        invars.append(runtime_static_cache[cache_key])
+                        continue
                 leaf = flat_args[orig_idx]
                 if orig_idx in explicit_in_sh:
                     target = (
                         _canonical_stage_sharding(leaf, explicit_in_sh[orig_idx], rank_submeshes[ri])
                         or explicit_in_sh[orig_idx]
                     )
-                    invars.append(jax.device_put(leaf, target))
+                    if _same_sharding(getattr(leaf, "sharding", None), target):
+                        value = leaf
+                    else:
+                        value = jax.device_put(leaf, target)
                 elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
-                    invars.append(leaf)
+                    value = leaf
                 else:
-                    invars.append(jax.device_put(leaf, my_sh))
+                    value = jax.device_put(leaf, my_sh)
+                if runtime_static_flat_indices is not None and orig_idx in runtime_static_flat_indices:
+                    if runtime_static_cache is not None:
+                        runtime_static_cache[cache_key] = value
+                invars.append(value)
             else:
                 invars.append(placed[(ri, orig_idx)])
         elif kind == "stage":
             src_rank, src_pos = source[1], source[2]
             value = all_cluster_outputs[src_rank][src_pos]
-            invars.append(
-                jax.device_put(
-                    value,
-                    _edge_transfer_sharding(
-                        value,
-                        edge_sharding=source[3] if len(source) > 3 else None,
-                        fallback_sharding=my_sh,
-                        dst_rank=ri,
-                        rank_submeshes=rank_submeshes,
-                        mpmd_mesh=mpmd_mesh,
-                    ),
-                )
+            target = _edge_transfer_sharding(
+                value,
+                edge_sharding=source[3] if len(source) > 3 else None,
+                fallback_sharding=my_sh,
+                dst_rank=ri,
+                rank_submeshes=rank_submeshes,
+                mpmd_mesh=mpmd_mesh,
             )
+            invars.append(_transport("device_put", value, target, src_rank=src_rank, dst_rank=ri))
         else:
-            invars.append(jax.device_put(prev_outputs[idx], my_sh))
+            invars.append(_transport("device_put", prev_outputs[idx], my_sh, dst_rank=ri))
+    return invars
+
+
+@dataclass(frozen=True)
+class _InvarAssemblyPlan:
+    """Pre-classified stage input routing plan for repeated dispatch.
+
+    The generic invar assembler is easy to reason about but branches over every
+    source map entry on every token. Decode workloads execute the same stage map
+    many times, so this plan stores a static template and compact slot lists for
+    only the values that change per dispatch.
+
+    Attributes:
+        template: Tuple of stage inputs with pre-filled static leaves and
+            ``None`` placeholders for dynamic/inter-stage values.
+        dynamic_slots: Pairs of ``(template_position, orig_flat_idx)`` for
+            dynamic original function arguments.
+        stage_slots: Tuples of ``(template_position, src_rank, src_output_pos,
+            edge_sharding)`` for values read from an earlier traced stage.
+        prev_slots: Pairs of ``(template_position, prev_output_pos)`` for values
+            read from the immediately previous physical stage.
+    """
+
+    template: tuple[Any, ...]
+    dynamic_slots: tuple[tuple[int, int], ...]
+    stage_slots: tuple[tuple[int, int, int, Any], ...]
+    prev_slots: tuple[tuple[int, int], ...]
+
+
+def _prepare_invar_assembly_plan(
+    invar_map: list[tuple],
+    placed: dict[tuple[int, int], Any],
+    dynamic: set[int],
+    ri: int,
+    dynamic_flat_to_orig_flat: dict[int, int] | None = None,
+) -> _InvarAssemblyPlan:
+    """Pre-classify a stage's invar map for repeated low-latency dispatch.
+
+    The regular ``_assemble_invars`` path is intentionally straightforward:
+    it walks the full map, branches on every source kind, and appends static
+    placed parameters on every call. Decode servers call the same stage plan
+    thousands of times with identical static inputs, so cache the static slots
+    once and leave holes only for dynamic args and inter-stage values.
+
+    Args:
+        invar_map: Per-stage flat source map generated during MPMD preparation.
+        placed: Pre-placed non-dynamic leaves keyed by ``(rank, orig_flat_idx)``.
+        dynamic: Original flat-leaf indices that must be read from runtime
+            arguments on every dispatch.
+        ri: Destination physical pipeline rank.
+        dynamic_flat_to_orig_flat: Optional remap from traced dynamic leaves
+            back to original call-argument leaf indices.
+
+    Returns:
+        A compact plan consumed by :func:`_assemble_invars_from_plan`.
+    """
+    template: list[Any] = []
+    dynamic_slots: list[tuple[int, int]] = []
+    stage_slots: list[tuple[int, int, int, Any]] = []
+    prev_slots: list[tuple[int, int]] = []
+
+    for source in invar_map:
+        out_pos = len(template)
+        kind = source[0]
+        idx = source[1]
+        if kind == "orig":
+            if dynamic_flat_to_orig_flat is not None:
+                orig_idx = dynamic_flat_to_orig_flat.get(idx, idx)
+            else:
+                orig_idx = idx
+            if orig_idx in dynamic:
+                template.append(None)
+                dynamic_slots.append((out_pos, orig_idx))
+            else:
+                template.append(placed[(ri, orig_idx)])
+        elif kind == "stage":
+            template.append(None)
+            stage_slots.append((out_pos, int(source[1]), int(source[2]), source[3] if len(source) > 3 else None))
+        else:
+            template.append(None)
+            prev_slots.append((out_pos, int(idx)))
+
+    return _InvarAssemblyPlan(
+        template=tuple(template),
+        dynamic_slots=tuple(dynamic_slots),
+        stage_slots=tuple(stage_slots),
+        prev_slots=tuple(prev_slots),
+    )
+
+
+def _assemble_invars_from_plan(
+    plan: _InvarAssemblyPlan,
+    flat_args: list,
+    explicit_in_sh: dict[int, Any],
+    prev_outputs: tuple,
+    all_cluster_outputs: list[tuple],
+    ri: int,
+    my_sh: Any,
+    rank_devices: set,
+    rank_submeshes: list[Any],
+    mpmd_mesh: MpMdMesh,
+    runtime_static_flat_indices: set[int] | None = None,
+    runtime_static_cache: dict[tuple[int, int], Any] | None = None,
+) -> list:
+    """Assemble stage inputs from a pre-classified routing template.
+
+    This is the hot-path companion to :func:`_prepare_invar_assembly_plan`.
+    Static leaves are already present in ``plan.template``; this function only
+    fills the holes for runtime arguments and inter-stage values. It preserves
+    the same placement rules as :func:`_assemble_invars`, including explicit
+    input shardings, already-on-rank fast paths, fallback replicated sharding,
+    and runtime-static placement caching.
+
+    Args:
+        plan: Pre-classified stage input routing template.
+        flat_args: Flattened original call arguments for this microbatch.
+        explicit_in_sh: Optional caller-provided input shardings by original
+            flat-leaf index.
+        prev_outputs: Outputs from the immediately previous physical stage.
+        all_cluster_outputs: Outputs from all earlier traced stage clusters.
+        ri: Destination physical pipeline rank.
+        my_sh: Fallback sharding for ``ri``.
+        rank_devices: Concrete device set owned by ``ri``.
+        rank_submeshes: Physical stage-local meshes.
+        mpmd_mesh: Owning MPMD mesh used for marker-edge sharding resolution.
+        runtime_static_flat_indices: Dynamic leaves that should use the
+            stage-local placement cache.
+        runtime_static_cache: Mutable cache keyed by ``(rank, orig_flat_idx)``
+            containing already-placed runtime-static leaves.
+
+    Returns:
+        Positional argument list ready to pass to the compiled stage executable.
+    """
+    invars = list(plan.template)
+
+    for out_pos, orig_idx in plan.dynamic_slots:
+        if runtime_static_flat_indices is not None and orig_idx in runtime_static_flat_indices:
+            cache_key = (ri, orig_idx)
+            if runtime_static_cache is not None and cache_key in runtime_static_cache:
+                invars[out_pos] = runtime_static_cache[cache_key]
+                continue
+        leaf = flat_args[orig_idx]
+        if orig_idx in explicit_in_sh:
+            target = (
+                _canonical_stage_sharding(leaf, explicit_in_sh[orig_idx], rank_submeshes[ri]) or explicit_in_sh[orig_idx]
+            )
+            if _same_sharding(getattr(leaf, "sharding", None), target):
+                value = leaf
+            else:
+                value = jax.device_put(leaf, target)
+        elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
+            value = leaf
+        else:
+            value = jax.device_put(leaf, my_sh)
+        if runtime_static_flat_indices is not None and orig_idx in runtime_static_flat_indices:
+            if runtime_static_cache is not None:
+                runtime_static_cache[cache_key] = value
+        invars[out_pos] = value
+
+    for out_pos, src_rank, src_pos, edge_sharding in plan.stage_slots:
+        value = all_cluster_outputs[src_rank][src_pos]
+        target = _edge_transfer_sharding(
+            value,
+            edge_sharding=edge_sharding,
+            fallback_sharding=my_sh,
+            dst_rank=ri,
+            rank_submeshes=rank_submeshes,
+            mpmd_mesh=mpmd_mesh,
+        )
+        invars[out_pos] = _transport("device_put", value, target, src_rank=src_rank, dst_rank=ri)
+
+    for out_pos, prev_idx in plan.prev_slots:
+        invars[out_pos] = _transport("device_put", prev_outputs[prev_idx], my_sh, dst_rank=ri)
+
     return invars
 
 
@@ -5118,17 +5349,35 @@ def _transport(
 ) -> Any:
     """Move ``x`` to ``dest_sharding`` via :func:`jax.device_put`.
 
+    All MPMD activation and carry transfers flow through this helper so the
+    runtime has one place for placement skip checks, per-edge byte accounting,
+    cache-hit reporting, and optional wall-clock profiling. The only supported
+    transport kind today is ``"device_put"`` because it is portable across CPU,
+    TPU, and single-process GPU backends while still letting XLA choose the
+    actual device-side copy path.
+
+    Before issuing a copy, the helper retargets marker-edge shardings to the
+    destination stage when possible and asks :func:`_can_skip_device_put` whether
+    the value already lives on the requested sharding. When a stats collector is
+    supplied, both real transfers and skipped transfers are recorded with source
+    and destination rank metadata.
+
     Args:
         kind: Currently only ``"device_put"`` is supported. Portable
             across CPU / TPU / single-process GPU backends.
-        x: The source :class:`jax.Array`.
+        x: The source value or pytree of values.
         dest_sharding: A :class:`jax.sharding.NamedSharding` whose mesh
             is the destination sub-mesh.
         task_name: Optional profiler label so :func:`collect_task_times_ms`
             can attribute the wall time to a specific transfer.
+        stats: Optional schedule stats collector used by ``sxcall`` to count
+            bytes moved, skipped transfers, and cache hits.
+        src_rank: Optional physical pipeline rank that produced ``x``.
+        dst_rank: Optional physical pipeline rank that will consume ``x``.
 
     Returns:
-        A :class:`jax.Array` placed according to ``dest_sharding``.
+        ``x`` unchanged when it already satisfies the destination sharding, or a
+        value placed according to ``dest_sharding``/the retargeted sharding.
     """
     if kind != "device_put":
         raise ValueError(f"Unknown transport kind: {kind!r}.")

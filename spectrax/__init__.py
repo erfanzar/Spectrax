@@ -31,7 +31,8 @@ Submodules imported here for qualified access:
 * :mod:`spectrax.runtime` — pipeline-parallel runtimes and schedules
   (:class:`GPipe`, :class:`Std1F1B`, :class:`ZeroBubbleH1`, …),
   :func:`sxcall` / :func:`sxjit`, :class:`MpMdMesh`,
-  :class:`PipelineSequential`.
+  :class:`PipelineSequential`, and :class:`MpmdPipelineExecutor` for
+  forward-only MPMD inference wavefronts.
 
 Most names re-exported from this package are documented on their
 defining module; this file only adds them to :data:`__all__`.
@@ -158,6 +159,8 @@ from .runtime import (
     InterleavedGPipe,
     InterleavedH1,
     KimiK2,
+    MpmdPipelineDispatchStats,
+    MpmdPipelineExecutor,
     Schedule,
     Std1F1B,
     ZeroBubbleH1,
@@ -237,6 +240,8 @@ __all__ = [
     "KimiK2",
     "LazyInitUnderTransformError",
     "Module",
+    "MpmdPipelineDispatchStats",
+    "MpmdPipelineExecutor",
     "Nothing",
     "Opaque",
     "Parameter",

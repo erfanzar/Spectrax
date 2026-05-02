@@ -33,14 +33,17 @@ Top-level re-exports
 This module re-exports the MPMD entry points (:func:`sxcall`,
 :func:`sxjit`, :func:`sxgrad`, :func:`sxvalue_and_grad`,
 :func:`sxloop`, :func:`sxenter_loop`, :func:`sxexit_loop`,
-:func:`sxstage_region`, :func:`sxstage_iter`) and every schedule class plus the fusion
-helpers, so users typically only need ``from spectrax.runtime import
-...``.
+:func:`sxstage_region`, :func:`sxstage_iter`), the forward-only
+:class:`MpmdPipelineExecutor` used by inference runtimes, and every schedule
+class plus the fusion helpers, so users typically only need
+``from spectrax.runtime import ...``.
 """
 
 from __future__ import annotations
 
 from .mpmd import (
+    MpmdPipelineDispatchStats,
+    MpmdPipelineExecutor,
     sxcall,
     sxenter_loop,
     sxexit_loop,
@@ -80,6 +83,8 @@ __all__ = (
     "InterleavedGPipe",
     "InterleavedH1",
     "KimiK2",
+    "MpmdPipelineDispatchStats",
+    "MpmdPipelineExecutor",
     "Phase",
     "Schedule",
     "Std1F1B",

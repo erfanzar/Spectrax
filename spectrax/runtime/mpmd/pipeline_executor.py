@@ -511,7 +511,9 @@ class MpmdPipelineExecutor:
                 and runtime_static_plan_updates is not None
                 and all(plan is not None for plan in runtime_static_plan_updates)
             ):
-                cached_entry.runtime_static_invar_plan_cache[runtime_static_plan_key] = tuple(runtime_static_plan_updates)
+                cached_entry.runtime_static_invar_plan_cache[runtime_static_plan_key] = tuple(
+                    runtime_static_plan_updates
+                )
             self._last_stats = MpmdPipelineDispatchStats(
                 stage_launches=len(compiled),
                 microbatches=1,

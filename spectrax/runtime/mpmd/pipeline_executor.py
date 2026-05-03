@@ -158,6 +158,11 @@ class _PrepareCacheEntry:
 
     Attributes:
         state: Cached private ``sxjit`` MPMD state for the bucket.
+        flat_args_template: Flattened argument list from the first call. Leaves
+            belonging to runtime-static arguments are reused as-is; leaves for
+            dynamic arguments are overwritten on each dispatch. Keeping this
+            template avoids appending hundreds of stable graph/state leaves on
+            every decode token.
         runtime_static_cache: Per-stage device-placed dynamic leaves that the
             caller declares stable for the bucket. Keys are ``(stage, flat_idx)``
             because each stage may require a different destination sharding.
@@ -174,6 +179,7 @@ class _PrepareCacheEntry:
     """
 
     state: _MpmdState
+    flat_args_template: list[tp.Any]
     runtime_static_cache: dict[tuple[int, int], tp.Any]
     runtime_static_flat_args: dict[int, tp.Any]
     arg_offsets: tuple[int, ...]
@@ -447,6 +453,79 @@ class MpmdPipelineExecutor:
         stage_assemble_times_ms = [0.0] * len(compiled)
         stage_execute_times_ms = [0.0] * len(compiled)
 
+        if not self.use_workers and len(prepared) == 1:
+            call = prepared[0]
+            cluster_outputs: list[tuple | None] = [None] * len(compiled)
+            for stage_idx, (stage_jit, _submesh, my_sh, _, invar_map) in enumerate(compiled):
+                t_submit = time.time()
+                prev_outputs = cluster_outputs[stage_idx - 1] if stage_idx > 0 else ()
+                if prev_outputs is None:
+                    raise RuntimeError(f"internal error: missing previous output for stage {stage_idx}")
+
+                t_assemble_stage = time.time()
+                with jax.named_scope(f"spectrax/mpmd/pipeline/single/stage_{stage_idx}/assemble"):
+                    invar_plan = invar_plans[stage_idx] if invar_plans is not None else None
+                    invars = self._assemble_stage_invars(
+                        call=call,
+                        stage_idx=stage_idx,
+                        invar_map=invar_map,
+                        invar_plan=invar_plan,
+                        my_sh=my_sh,
+                        rank_devices=rank_device_sets[stage_idx],
+                        rank_submeshes=rank_submeshes,
+                        mpmd_mesh=mpmd_mesh,
+                        prev_outputs=prev_outputs,
+                        all_cluster_outputs=cluster_outputs,
+                        runtime_static_flat_indices=runtime_static_flat_indices,
+                        runtime_static_cache=runtime_static_cache,
+                    )
+                    if (
+                        runtime_static_plan_updates is not None
+                        and invar_plan is not None
+                        and runtime_static_flat_indices is not None
+                    ):
+                        runtime_static_plan_updates[stage_idx] = self._fold_runtime_static_slots_into_plan(
+                            invar_plan,
+                            invars,
+                            runtime_static_flat_indices,
+                        )
+                stage_assemble_elapsed = time.time() - t_assemble_stage
+                stage_assemble_times_ms[stage_idx] += stage_assemble_elapsed * 1000.0
+
+                t_execute_stage = time.time()
+                with jax.named_scope(f"spectrax/mpmd/pipeline/single/stage_{stage_idx}/execute"):
+                    cluster_outputs[stage_idx] = stage_jit(*invars)
+                stage_execute_elapsed = time.time() - t_execute_stage
+                stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
+
+                stage_submit_elapsed = time.time() - t_submit
+                submit_time += stage_submit_elapsed
+                stage_submit_times_ms[stage_idx] += stage_submit_elapsed * 1000.0
+
+            t_assemble = time.time()
+            result = self._assemble_result(call, cluster_outputs)
+            assemble_time = time.time() - t_assemble
+            if (
+                cached_entry is not None
+                and runtime_static_plan_key is not None
+                and runtime_static_plan_updates is not None
+                and all(plan is not None for plan in runtime_static_plan_updates)
+            ):
+                cached_entry.runtime_static_invar_plan_cache[runtime_static_plan_key] = tuple(runtime_static_plan_updates)
+            self._last_stats = MpmdPipelineDispatchStats(
+                stage_launches=len(compiled),
+                microbatches=1,
+                stage_dispatch_time=0.0,
+                queue_wait_time=0.0,
+                prepare_time=prepare_time,
+                assemble_time=assemble_time,
+                submit_time=submit_time,
+                stage_submit_times_ms=tuple(stage_submit_times_ms),
+                stage_assemble_times_ms=tuple(stage_assemble_times_ms),
+                stage_execute_times_ms=tuple(stage_execute_times_ms),
+            )
+            return [result]
+
         def wait_stage(mb_idx: int, stage_idx: int) -> tuple:
             nonlocal stage_dispatch_time, queue_wait_time
             ready = cluster_outputs[mb_idx][stage_idx]
@@ -661,6 +740,7 @@ class MpmdPipelineExecutor:
                 static_flat_args[flat_idx] = flat_args[flat_idx]
         return _PrepareCacheEntry(
             state=state,
+            flat_args_template=list(flat_args),
             runtime_static_cache={},
             runtime_static_flat_args=static_flat_args,
             arg_offsets=tuple(offsets),
@@ -750,13 +830,11 @@ class MpmdPipelineExecutor:
         flat-leaf routing maps invalid.
         """
         static_argnums = self._normalize_runtime_static_argnums(runtime_static_argnums, len(args))
-        flat_args: list[tp.Any] = []
+        flat_args = list(entry.flat_args_template)
         for argnum, arg in enumerate(args):
             start = entry.arg_offsets[argnum]
             expected_count = entry.arg_leaf_counts[argnum]
             if argnum in static_argnums:
-                for flat_idx in range(start, start + expected_count):
-                    flat_args.append(entry.runtime_static_flat_args[flat_idx])
                 continue
             leaves = jax.tree.leaves(arg)
             if len(leaves) != expected_count:
@@ -764,7 +842,7 @@ class MpmdPipelineExecutor:
                     "MpmdPipelineExecutor cached prepare shape changed: "
                     f"arg {argnum} had {expected_count} leaves, now has {len(leaves)}."
                 )
-            flat_args.extend(leaves)
+            flat_args[start : start + expected_count] = leaves
         return flat_args
 
     def _runtime_static_flat_indices(

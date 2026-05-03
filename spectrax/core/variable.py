@@ -400,7 +400,7 @@ class Variable:
 
         * an integer ``mpmd_dim``
         * a :class:`~spectrax.sharding.SpxMesh`
-        * a :class:`~spectrax.pipeline.MpMdMesh`
+        * a :class:`~spectrax.runtime.types.MpMdMesh`
 
         Returns ``None`` when the variable has no stage hint or when an
         ``SpxMesh`` without an MPMD axis is supplied.

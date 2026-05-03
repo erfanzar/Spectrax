@@ -8,8 +8,9 @@ This package gathers spectrax's two pipeline runtimes plus the
 schedule library and the types they share. The two runtimes are
 complementary: the SPMD path emits a single HLO program that XLA
 partitions across pipeline ranks via ``shard_map`` with the pipeline
-axis manual; the MPMD path emits one program per rank and orchestrates
-them in Python, supporting genuinely heterogeneous stage shapes.
+axis manual; the MPMD path emits one program per rank through the
+scheduled MPMD dispatcher, supporting genuinely heterogeneous stage
+shapes.
 
 Subpackages
 -----------
@@ -17,8 +18,8 @@ Subpackages
   HLOs). Use for heterogeneous pipelines or when you need explicit
   per-rank dispatch control.
 * :mod:`spectrax.runtime.spmd` — SPMD runtime (single HLO via
-  :func:`jax.shard_map`). Faster compile and dispatch, requires
-  homogeneous stages.
+  :func:`jax.shard_map`). Requires homogeneous stages and rejects
+  MPMD-tagged meshes at the public API boundary.
 * :mod:`spectrax.runtime.schedules` — Pipeline schedules
   (:class:`GPipe`, :class:`Std1F1B`, :class:`ZeroBubbleH1`,
   :class:`InterleavedH1`, :class:`KimiK2`, :class:`DualPipeV`, ...).

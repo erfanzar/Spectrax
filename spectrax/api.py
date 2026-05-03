@@ -38,8 +38,10 @@ The SPMD path keeps a small per-``GraphDef`` cache for the placed
 state and the jitted forward / train step, so repeated calls
 (notably autoregressive decode loops) reuse the compiled program.
 The MPMD path requires exactly one positional input (microbatched
-along its leading axis) and routes everything through
-:func:`spectrax.runtime.sxcall`.
+along its leading axis) and routes train-mode calls through
+:func:`spectrax.runtime.sxcall`, whose train wrapper uses the same
+schedule-faithful ``sxjit`` / ``sxvalue_and_grad`` dispatcher as the
+lower-level MPMD API.
 """
 
 from __future__ import annotations
@@ -273,14 +275,15 @@ def _run_mpmd(
     """Auto-split ``model`` into per-rank stages and dispatch via :func:`sxcall`.
 
     Whether or not ``schedule`` is supplied the call routes through
-    :func:`spectrax.runtime.sxcall`, which handles all bundled
-    schedules (flat and virtual-stage) at any model scale. When
+    :func:`spectrax.runtime.sxcall`. In train mode that public wrapper
+    lowers the model to scheduled ``sxjit`` and uses the true
+    schedule-faithful MPMD forward/backward dispatcher. When
     ``schedule`` is ``None``, a default :class:`GPipe` schedule with
     ``microbatches`` microbatches is used.
 
-    ``fuse_1f1b`` / ``fuse_zb`` toggle :class:`FusedTask` steady-state
-    fusion (dispatch-count reduction for 1F1B and ZeroBubble families);
-    ``None`` enables fusion automatically when the schedule supports it.
+    ``fuse_1f1b`` / ``fuse_zb`` are legacy schedule-walker knobs.  The
+    true scheduled MPMD path rejects explicit ``True`` values; use a
+    schedule that emits the desired fused cells directly.
 
     For ``mode='train'`` with keyword loss targets, the ``loss_fn`` is
     rewrapped to take its target arguments positionally so they can
@@ -300,8 +303,10 @@ def _run_mpmd(
             schedule when ``schedule`` is ``None``. Forced to be at
             least 1.
         schedule: Optional pipeline-parallel schedule.
-        fuse_1f1b: Override for 1F1B steady-state fusion.
-        fuse_zb: Override for ZeroBubble steady-state fusion.
+        fuse_1f1b: Legacy schedule-walker knob. Explicit ``True`` is
+            rejected by the true scheduled MPMD path.
+        fuse_zb: Legacy schedule-walker knob. Explicit ``True`` is
+            rejected by the true scheduled MPMD path.
         has_aux: Whether ``loss_fn`` returns ``(loss, aux)``; forwarded
             to :func:`sxcall`.
 
@@ -421,8 +426,10 @@ def run(
         schedule: Pipeline schedule for MPMD execution. Pass ``None``
             to use a default :class:`GPipe`. Must be ``None`` under
             an SPMD mesh.
-        fuse_1f1b: Override for 1F1B steady-state fusion (MPMD only).
-        fuse_zb: Override for ZeroBubble steady-state fusion (MPMD only).
+        fuse_1f1b: Legacy schedule-walker knob. Explicit ``True`` is
+            rejected on the true scheduled MPMD path.
+        fuse_zb: Legacy schedule-walker knob. Explicit ``True`` is
+            rejected on the true scheduled MPMD path.
         has_aux: Whether ``loss_fn`` returns ``(loss, aux)`` (MPMD only).
 
     Returns:

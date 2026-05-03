@@ -650,6 +650,27 @@ def _collect_defined_vars(eqns: list[JaxprEqn]) -> set[Var]:
     return defined
 
 
+def _collect_defined_vars_ordered(eqns: list[JaxprEqn]) -> list[Var]:
+    """Return vars written by ``eqns`` in jaxpr definition order.
+
+    Stage output ordering is part of the executable ABI when buffers are
+    donated. In decode, large KV cache leaves enter a stage, are updated by the
+    attention custom call, and leave the same stage as donated outputs. If this
+    list is built from a ``set`` the output tuple can be permuted relative to
+    the input tuple, forcing XLA to copy full cache-page buffers to satisfy the
+    input/output alias contract. Keeping definition order makes cache carry
+    leaves line up with the calls that produced them.
+    """
+    ordered: list[Var] = []
+    seen: set[int] = set()
+    for eqn in eqns:
+        for outvar in eqn.outvars:
+            if isinstance(outvar, Var) and id(outvar) not in seen:
+                ordered.append(outvar)
+                seen.add(id(outvar))
+    return ordered
+
+
 def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
     """Return top-level equation spans covered by stage-region markers.
 
@@ -977,15 +998,20 @@ def cluster_jaxpr_by_markers(
             read_after_at[i] = set(post)
 
     defined_up_to_at: dict[int, set[Var]] = {}
+    defined_order_up_to_at: dict[int, list[Var]] = {}
     pre: set[Var] = set(jaxpr.invars)
+    pre_order: list[Var] = [v for v in jaxpr.invars if isinstance(v, Var)]
     if 0 in boundary_set:
         defined_up_to_at[0] = set(pre)
+        defined_order_up_to_at[0] = list(pre_order)
     for idx, eqn in enumerate(jaxpr.eqns, start=1):
         for outvar in eqn.outvars:
             if isinstance(outvar, Var):
                 pre.add(outvar)
+                pre_order.append(outvar)
         if idx in boundary_set:
             defined_up_to_at[idx] = set(pre)
+            defined_order_up_to_at[idx] = list(pre_order)
 
     clusters: list[Jaxpr] = []
     for idx, (start, end) in enumerate(itertools.pairwise(boundaries)):
@@ -1007,13 +1033,15 @@ def cluster_jaxpr_by_markers(
         eqns = [*remat_eqns, *base_eqns]
         used = _collect_used_vars(eqns)
         defined_before = defined_up_to_at[start]
+        defined_before_ordered = defined_order_up_to_at[start]
         defined_here = _collect_defined_vars(eqns)
-        invars = [v for v in defined_before if v in used and v not in defined_here]
+        defined_here_ordered = _collect_defined_vars_ordered(eqns)
+        invars = [v for v in defined_before_ordered if v in defined_before and v in used and v not in defined_here]
         if end < n_eqns:
             needed_downstream = read_after_at[end]
             outvars: list[Var] = [
                 v
-                for v in defined_here
+                for v in defined_here_ordered
                 if v in needed_downstream and (id(v) in jaxpr_outvar_ids or not can_rematerialize(v))
             ]
         else:
@@ -1032,12 +1060,12 @@ def cluster_jaxpr_by_markers(
                     if mv not in outvars:
                         outvars.append(mv)
 
-        seen: set[Var] = set()
+        seen: set[int] = set()
         dedup_outvars = []
         for v in outvars:
-            if v not in seen:
+            if id(v) not in seen:
                 dedup_outvars.append(v)
-                seen.add(v)
+                seen.add(id(v))
 
         sub = Jaxpr(
             constvars=list(jaxpr.constvars),

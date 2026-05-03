@@ -7,15 +7,14 @@
 The primary way to declare pipeline stages in spectrax. Each positional
 argument to the constructor is a distinct stage — the modules run
 sequentially in eager mode (identical to :class:`spectrax.nn.Sequential`),
-and under :func:`spectrax.pipeline.pipeline` each stage is assigned to
-a separate device along the mesh's pipeline axis.
+and under :func:`spectrax.runtime.sxcall` each stage becomes one
+logical MPMD stage.
 
 Declaring stages explicitly at the container level (rather than inline
-via :func:`spectrax.pipeline.boundary` calls) makes the split
-introspectable: :func:`spectrax.export` records the stage boundaries in
-the :class:`~spectrax.GraphDef`, and ``model.stages`` returns the live
-per-stage :class:`~spectrax.Module` instances for per-stage inspection
-or surgery.
+via :func:`spectrax.runtime.sxstage_iter` markers) makes the split
+introspectable: ``model.stages`` returns the live per-stage
+:class:`~spectrax.Module` instances for per-stage inspection or
+surgery.
 """
 
 from __future__ import annotations
@@ -37,9 +36,8 @@ class PipelineSequential(Module):
     :class:`spectrax.nn.Sequential` — calls each stage in order,
     threading the output of stage *k* into the input of stage *k+1*.
 
-    Under :func:`spectrax.pipeline.pipeline`, the container's stage
-    count must match the mesh's pipeline-axis size; the decorator uses
-    the container's stage list to shard the model across that axis.
+    Under :func:`spectrax.runtime.sxcall`, the container's stage count
+    must match the MPMD mesh layout implied by the selected schedule.
 
     Args:
         *stages: One :class:`Module` per pipeline stage, in
@@ -58,7 +56,7 @@ class PipelineSequential(Module):
                 return jax.nn.gelu(self.fc(x))
 
 
-        model = spx.pipeline.PipelineSequential(
+        model = spx.nn.PipelineSequential(
             Block(128, rngs=spx.Rngs(0)),
             Block(128, rngs=spx.Rngs(1)),
             Block(128, rngs=spx.Rngs(2)),
@@ -68,9 +66,14 @@ class PipelineSequential(Module):
         # Eager:
         y = model(x)
 
-        # Under pipeline:
-        @spx.pipeline.pipeline(mesh=mesh, schedule=spx.pipeline.GPipe(microbatches=8))
-        def step(m, x, y): ...
+        # Under true MPMD:
+        loss, grads = spx.sxcall(
+            model,
+            (x, y),
+            mesh=mpmd_mesh,
+            schedule=spx.GPipe(microbatches=8),
+            loss_fn=loss_fn,
+        )
     """
 
     _spx_container_kind = "list"
@@ -121,11 +124,9 @@ class PipelineSequential(Module):
         """Apply every stage in order (eager / single-device path).
 
         Each stage is called as ``stage(x)`` and its return value
-        becomes the input of the next stage. Under
-        :func:`spectrax.pipeline.pipeline` the orchestrator calls
-        each stage's ``forward`` on its assigned device instead of
-        invoking this method directly — i.e. this code path is only
-        used in eager / single-device execution.
+        becomes the input of the next stage. True MPMD entry points
+        compile logical stages separately instead of invoking this
+        eager loop directly.
 
         Args:
             x: Input passed to the first stage; subsequent stages

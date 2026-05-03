@@ -9,6 +9,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.extend.core import Var
 from jax.sharding import Mesh, PartitionSpec
 
 from spectrax.runtime.mpmd import (
@@ -130,6 +131,44 @@ def test_cluster_jaxpr_three_segments():
     for c in clusters:
         prims = {str(e.primitive) for e in c.eqns}
         assert "sxstage_iter" not in prims
+
+
+def test_cluster_outvars_preserve_definition_order_for_donated_carry():
+    """Stage carry outputs must stay in definition order for XLA aliasing.
+
+    eSurge decode donates KV cache pages into a stage and returns the updated
+    pages from attention calls. If the splitter permutes those output vars, XLA
+    aliases each input buffer to the wrong result slot and inserts full-page
+    copies. This regression test checks the splitter's structural contract
+    without depending on a TPU or the attention kernel.
+    """
+
+    def model(a, b, c, x):
+        a1 = a + 1.0
+        b1 = b + 2.0
+        c1 = c + 3.0
+        h = sxstage_iter(x * 2.0, stage=0)
+        return b1 + h, c1 + h, a1 + h
+
+    jxpr = jax.make_jaxpr(model)(
+        jnp.ones((2,), dtype=jnp.float32),
+        jnp.ones((2,), dtype=jnp.float32),
+        jnp.ones((2,), dtype=jnp.float32),
+        jnp.ones((2,), dtype=jnp.float32),
+    )
+    clusters = cluster_jaxpr_by_markers(jxpr.jaxpr)
+
+    defined_before_marker: list[Var] = []
+    for eqn in jxpr.jaxpr.eqns:
+        if str(eqn.primitive) == "sxstage_iter":
+            break
+        defined_before_marker.extend(outvar for outvar in eqn.outvars if isinstance(outvar, Var))
+
+    cluster0_ids = {id(v) for v in clusters[0].outvars}
+    expected = [v for v in defined_before_marker if id(v) in cluster0_ids]
+    actual = clusters[0].outvars[: len(expected)]
+
+    assert [id(v) for v in actual] == [id(v) for v in expected]
 
 
 def test_split_by_markers_matches_original():

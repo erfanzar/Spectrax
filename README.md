@@ -165,6 +165,12 @@ executes its own distinct JAX program. This is not SPMD-with-barriers
 — stages can have different classes, different parameter shapes, and
 different I/O shapes.
 
+The public MPMD surface is intentionally narrow and honest:
+`sxjit`, `sxgrad`, `sxvalue_and_grad`, `sxcall`, `spx.run` with an
+MPMD mesh, and `MpmdPipelineExecutor` all route through the true MPMD
+runtime. SPMD-only helpers reject MPMD-tagged meshes instead of
+silently taking a shard-map or host-jit fallback.
+
 ### `spx.run` — the unified entry point
 
 `spx.run` routes to SPMD (`pjit`) or MPMD (`sxcall`) based on the mesh:
@@ -192,14 +198,15 @@ SpectraX threads them into `model.forward(...)` and `loss_fn(...)`.
 
 ### Lower-level primitives
 
-| Primitive                     | Purpose                                                                                                  |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `sxcall`                      | Execute a `PipelineSequential` under a schedule — Python dispatch loop over per-rank compiled callables. |
-| `sxjit`                       | Decorator: trace → split at `sxstage_iter` markers → compile one XLA executable per stage / rank.        |
-| `sxgrad` / `sxvalue_and_grad` | Schedule-faithful gradients of an `sxjit` function.                                                      |
-| `treduce`                     | Schedule-driven microbatch reduction — binds a body + schedule into the traced jaxpr.                    |
-| `sxstage_iter`                | Marker primitive for stage boundaries inside `sxjit`.                                                    |
-| `spx.assign_stage`            | Context manager that stamps subsequently-created variables with a `(current, total)` stage tag.          |
+| Primitive                     | Purpose                                                                                           |
+| ----------------------------- | ------------------------------------------------------------------------------------------------- |
+| `sxcall`                      | Execute a `PipelineSequential` through the same scheduled MPMD dispatcher used by `sxjit`.        |
+| `sxjit`                       | Decorator: trace -> split at `sxstage_iter` markers -> compile one XLA executable per stage/rank. |
+| `sxgrad` / `sxvalue_and_grad` | Schedule-faithful gradients of an `sxjit` function.                                               |
+| `treduce`                     | Schedule-driven microbatch reduction — binds a body + schedule into the traced jaxpr.             |
+| `sxstage_iter`                | Marker primitive for stage boundaries inside `sxjit`.                                             |
+| `sxstage_region`              | Region marker for multimodal/branched pipelines that need separate logical stage sequences.       |
+| `spx.assign_stage`            | Context manager that stamps subsequently-created variables with a `(current, total)` stage tag.   |
 
 ### Supported schedules
 
@@ -264,27 +271,18 @@ def step(model, x):
     ...
 ```
 
-Two optional fusion flags on `spx.run` flatten extra schedule overhead
-when applicable:
-
-```python
-spx.run(
-    model, ..., schedule=Std1F1B(m),
-    fuse_1f1b=True,    # collapse the 1F1B steady-state into a single fused stage call
-    fuse_zb=True,      # pair ZeroBubble's BWD_I + BWD_W when the schedule allows it
-)
-```
-
-`fuse_1f1b` only applies to 1F1B-family schedules; `fuse_zb` only to
-`ZeroBubbleH1`. Leave them at `None` (default) to let `spx.run` pick.
+Legacy knobs that forced host-side schedule walking (`fuse_1f1b`,
+`fuse_zb`, `chunks`, non-`device_put` transports, activation donation)
+are rejected on the true scheduled MPMD path. Use schedules that emit
+the desired fused cells directly.
 
 Rough rule of thumb:
 
 | Goal                                     | Pick                              |
 | ---------------------------------------- | --------------------------------- |
-| Simplest, lowest dispatch                | `GPipe`                           |
-| Steady-state memory `O(n_stages)`        | `Std1F1B` (`+ fuse_1f1b=True`)    |
-| Fill the 1F1B bubble                     | `ZeroBubbleH1` (`+ fuse_zb=True`) |
+| Simplest schedule                        | `GPipe`                           |
+| Steady-state memory `O(n_stages)`        | `Std1F1B`                         |
+| Fill the 1F1B bubble                     | `ZeroBubbleH1`                    |
 | Shrink bubble further at extra transport | `InterleavedH1(virtual_stages=v)` |
 | DeepSeek-style V-shape                   | `DualPipeV`                       |
 | Long-context / Moonshot-K2-style         | `KimiK2`                          |
@@ -537,14 +535,14 @@ If your project uses SpectraX, open a PR to add it here.
 
 ## Design
 
-1. **True MPMD first.** `sxcall` compiles one XLA program per
-   physical rank. Stages can differ in class, shape, and parameters.
-   No SPMD-same-shape constraint.
+1. **True MPMD first.** `sxcall` and `sxjit` use the scheduled MPMD
+   dispatcher, compiling distinct per-rank programs. Stages can differ
+   in class, shape, and parameters. No SPMD-same-shape constraint.
 2. **Unified runtime.** `spx.run` dispatches on the mesh. Same model,
    same script; change the mesh and you change the parallelism strategy.
-3. **Schedule-faithful execution.** The dispatch loop walks the
-   schedule grid exactly as planned. No hidden reordering, no
-   implicit fusing.
+3. **Schedule-faithful execution.** The runtime follows the schedule
+   grid exactly as planned. No hidden SPMD fallback, no implicit legacy
+   schedule walker.
 4. **Modules are JAX pytrees.** Flatten/unflatten via `export`/`bind`.
    `jax.jit`, `jax.tree.map`, `jax.value_and_grad` work directly.
 5. **State lives in `Variable` cells.** `Parameter`, `Buffer`, and

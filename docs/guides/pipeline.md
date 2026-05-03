@@ -8,23 +8,28 @@ careful scheduling, stages overlap forward and backward work across
 different microbatches so the devices stay busy instead of idling
 during the pipeline bubble.
 
-spectrax's `spectrax.pipeline` module provides:
+SpectraX exposes pipeline pieces from `spectrax.nn`,
+`spectrax.runtime`, and `spectrax.runtime.spmd`:
 
 - **[`PipelineSequential`](#pipelinesequential)** — the stage
   container (primary API).
-- **Four schedules** — [`GPipe`](#gpipe), [`Std1F1B`](#std1f1b),
-  [`ZeroBubbleH1`](#zerobubbleh1), [`InterleavedH1`](#interleavedh1).
+- **Pipeline schedules** — [`GPipe`](#gpipe), [`Std1F1B`](#std1f1b),
+  [`ZeroBubbleH1`](#zerobubbleh1), [`InterleavedH1`](#interleavedh1),
+  plus the other schedules exported by `spectrax.runtime`.
 - **[`pipeline_step`](#pipeline_step)** — one-call SPMD training
   step (same-shape stages, high-throughput).
-- **[`mpmd_run`](#heterogeneous-stages-mpmd_run)** — MPMD runtime for
+- **[`sxcall`](#heterogeneous-stages-sxcall)** — MPMD runtime for
   **heterogeneous stages** (embed -> blocks -> head).
-- **[`boundary`](#inline-boundary-marker)** — inline stage marker
-  (advisory; will drive a jaxpr-splitting pass in a future release).
+- **[`sxstage_iter` / `sxstage_region`](#inline-stage-markers)** —
+  true MPMD stage markers for `sxjit`.
 
-Under the hood, execution is **SPMD via `shard_map`**: one jaxpr
-compiled across the whole pipeline axis of the mesh, with
-`jax.lax.ppermute` transporting activations forward and cotangents
-backward between adjacent stages.
+There are two explicit runtimes:
+
+- `pipeline_step` is **SPMD-only**: one jaxpr is compiled across the
+  whole pipeline axis through `shard_map`. It rejects MPMD-tagged
+  meshes.
+- `sxcall` / `sxjit` / `spx.run(..., mesh=<MPMD>)` are **true MPMD**:
+  each physical pipeline rank gets its own scheduled program.
 
 ## When to use pipeline parallelism
 
@@ -51,7 +56,7 @@ each child is a stage:
 ```python
 import spectrax as spx
 from spectrax import nn
-from spectrax.pipeline import PipelineSequential
+from spectrax.nn import PipelineSequential
 
 
 class Block(spx.Module):
@@ -86,10 +91,10 @@ signature — fit natively.
 For models where stages have **different shapes, classes, or
 parameter structures** — e.g. a transformer with a bulky embedding
 stage, uniform middle blocks, and an lm-head — use the
-[`mpmd_run`](#heterogeneous-stages-mpmd_run) runtime instead. It
+[`sxcall`](#heterogeneous-stages-sxcall) runtime instead. It
 compiles each stage's forward / backward separately and orchestrates
-them in Python with explicit `jax.device_put` transfers. Lower peak
-throughput than SPMD but fully flexible.
+them through the true MPMD scheduler. It is fully flexible and keeps
+the MPMD boundary explicit.
 
 ### Eager mode
 
@@ -107,7 +112,7 @@ y = model(x)         # runs sequentially on one device; debug as normal
 ### GPipe
 
 ```python
-from spectrax.pipeline import GPipe
+from spectrax.runtime import GPipe
 
 schedule = GPipe(microbatches=8)
 ```
@@ -124,7 +129,7 @@ forward (the all-forward phase stays busy).
 ### Std1F1B
 
 ```python
-from spectrax.pipeline import Std1F1B
+from spectrax.runtime import Std1F1B
 
 schedule = Std1F1B(microbatches=8)
 ```
@@ -140,7 +145,7 @@ default.
 ### ZeroBubbleH1
 
 ```python
-from spectrax.pipeline import ZeroBubbleH1
+from spectrax.runtime import ZeroBubbleH1
 
 schedule = ZeroBubbleH1(microbatches=8)
 ```
@@ -165,7 +170,7 @@ the main overhead.
 ### InterleavedH1
 
 ```python
-from spectrax.pipeline import InterleavedH1
+from spectrax.runtime import InterleavedH1
 
 schedule = InterleavedH1(microbatches=8, virtual_stages=2)
 ```
@@ -192,7 +197,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
-from spectrax.pipeline import pipeline_step, Std1F1B
+from spectrax.runtime import Std1F1B
+from spectrax.runtime.spmd import pipeline_step
 
 
 def loss_fn(out, y):
@@ -221,7 +227,7 @@ def pipeline_step(
     model: PipelineSequential,
     batch: tuple[Any, ...],
     *,
-    mesh: jax.sharding.Mesh,
+    mesh: jax.sharding.Mesh | SpxMesh,
     axis: str = "pp",
     schedule: Schedule,
     loss_fn: Callable[..., jax.Array],
@@ -235,6 +241,9 @@ def pipeline_step(
   args passed to `loss_fn` at the final stage. Every element's
   leading axis is microbatched by `schedule.microbatches`.
 - `loss_fn` — scalar loss: `loss_fn(final_stage_output, *batch[1:])`.
+- `mesh` — raw JAX `Mesh` or a pure-SPMD `SpxMesh`. `MpMdMesh` and
+  `SpxMesh(..., mpmd_axis=...)` are rejected so MPMD-marked calls
+  cannot accidentally run through the SPMD runtime.
 
 ### Return value
 
@@ -268,7 +277,9 @@ from jax.sharding import Mesh
 
 import spectrax as spx
 from spectrax import nn, functional as F
-from spectrax.pipeline import PipelineSequential, Std1F1B, pipeline_step
+from spectrax.nn import PipelineSequential
+from spectrax.runtime import Std1F1B
+from spectrax.runtime.spmd import pipeline_step
 
 
 # --- Stages (identical shape) ---
@@ -343,15 +354,19 @@ with mesh:
             print(f"step {step_i}: loss = {float(loss):.4f}")
 ```
 
-## Heterogeneous stages: `mpmd_run`
+## Heterogeneous stages: `sxcall`
 
 When the SPMD same-shape constraint doesn't fit your model,
-[`mpmd_run`](../api_docs/pipeline/mpmd.rst) provides the flexible
-path — **each stage can have a different class, different parameter
-structure, and different input / output shapes**.
+`sxcall` provides the true MPMD path — **each stage can have a
+different class, different parameter structure, and different input /
+output shapes**.
 
 ```python
-from spectrax.pipeline import PipelineSequential, GPipe, mpmd_run
+from jax.sharding import Mesh
+
+from spectrax.runtime import GPipe, sxcall
+from spectrax.runtime.types import MpMdMesh
+from spectrax.nn import PipelineSequential
 
 
 # Heterogeneous: embed + blocks + head
@@ -401,9 +416,12 @@ def loss_fn(logits, targets):
 
 
 devices = jax.devices()[:4]
-loss, per_stage_grads = mpmd_run(
-    model, (ids, targets),
-    devices=devices,
+mpmd_mesh = MpMdMesh(Mesh(devices, axis_names=("pp",)), "pp")
+loss, per_stage_grads = sxcall(
+    model,
+    (ids, targets),
+    mesh=mpmd_mesh,
+    mode="train",
     schedule=GPipe(microbatches=8),
     loss_fn=loss_fn,
 )
@@ -411,12 +429,12 @@ loss, per_stage_grads = mpmd_run(
 
 ### When to use MPMD vs SPMD
 
-| Dimension            | SPMD (`pipeline_step`)             | MPMD (`mpmd_run`)            |
+| Dimension            | SPMD (`pipeline_step`)             | MPMD (`sxcall`)              |
 | -------------------- | ---------------------------------- | ---------------------------- |
 | Stage constraint     | Same-`GraphDef`                    | None                         |
-| Compilation          | One fused jaxpr                    | One jit per stage            |
-| Dispatch overhead    | Single `shard_map` call            | Python loop over schedule    |
-| Max throughput       | Higher on homogeneous              | Slightly lower (Python loop) |
+| Compilation          | One fused jaxpr                    | One true scheduled MPMD plan |
+| Dispatch overhead    | Single `shard_map` call            | Scheduled per-rank dispatch  |
+| Max throughput       | Best on homogeneous same-shape     | Best for heterogeneous stages |
 | Heterogeneous layers | Wrap in uniform `Block`            | Native                       |
 | Debug ease           | Harder (one big compile)           | Easier (per-stage jit)       |
 | Schedule support     | GPipe / 1F1B / ZB-H1 / Interleaved | Same                         |
@@ -451,30 +469,29 @@ For 3D (DP + TP + PP), add a TP axis and annotate the inside of each
 stage's weights — see the [sharding guide](sharding.md) for TP
 conventions. The pipeline layer is orthogonal.
 
-## Inline `boundary` marker
+## Inline stage markers
 
-For models that aren't naturally expressible as a flat sequence of
-identical stages, `spx.pipeline.boundary(x)` marks a stage split
-inline:
+For marker-based true MPMD, use `sxstage_iter` inside an `sxjit`
+function. It is an identity at runtime but becomes a stage boundary
+for the MPMD compiler:
 
 ```python
+from spectrax.runtime import sxstage_iter, sxstage_region
+
+
 class Net(spx.Module):
     def forward(self, x):
         x = self.embed(x)
-        x = spx.pipeline.boundary(x)    # split — stage 0 / stage 1
+        x = sxstage_iter(x)    # split — stage 0 / stage 1
         x = self.blocks[0](x)
-        x = spx.pipeline.boundary(x)    # split — stage 1 / stage 2
+        x = sxstage_iter(x)    # split — stage 1 / stage 2
         x = self.blocks[1](x)
         return self.head(x)
 ```
 
-In v1, `boundary` is a **no-op identity** in both eager and pipeline
-contexts — preserved in the jaxpr as a named op but not yet used by
-the orchestrator (which requires the explicit `PipelineSequential`
-container for now). A future release will add the jaxpr-splitting
-pass that lowers each sub-graph between boundaries into its own
-stage; writing `boundary` calls today keeps your model compatible
-with that upgrade.
+For multimodal or branched pipelines, `sxstage_region` creates
+independent logical stage sequences before the scheduler maps them to
+physical ranks.
 
 ## Debugging tips
 
@@ -535,7 +552,7 @@ pipeline_step(model, ..., schedule=...)  # ❌ ValueError
 Switch to MPMD:
 
 ```python
-mpmd_run(model, ..., devices=devices, schedule=...)  # ✓
+sxcall(model, ..., mesh=mpmd_mesh, schedule=...)  # ✓
 ```
 
 Or keep SPMD by wrapping heterogeneous layers in a uniform `Block`.
@@ -573,19 +590,14 @@ sharded weights) do need it.
 
 ## API reference
 
-- [`spectrax.pipeline`](../api_docs/pipeline/index.rst) — package
-  overview.
-- [`spectrax.pipeline.container`](../api_docs/pipeline/container.rst)
-  — `PipelineSequential`.
-- [`spectrax.pipeline.schedule`](../api_docs/pipeline/schedule.rst)
-  — `Schedule`, `GPipe`, `Std1F1B`, `ZeroBubbleH1`, `InterleavedH1`,
-  `Action`, `Phase`.
-- [`spectrax.pipeline.runtime`](../api_docs/pipeline/runtime.rst) —
-  `spmd_run` (low-level).
-- [`spectrax.pipeline.transform`](../api_docs/pipeline/transform.rst)
-  — `pipeline_step` (public).
-- [`spectrax.pipeline.boundary`](../api_docs/pipeline/boundary.rst) —
-  inline `boundary` marker.
+- [`spectrax.nn.PipelineSequential`](../api_docs/nn/pipeline_sequential.rst)
+  — stage container.
+- [`spectrax.runtime.schedules`](../api_docs/runtime/schedules/index.rst)
+  — schedules, actions, phases, and fusion helpers.
+- [`spectrax.runtime.mpmd`](../api_docs/runtime/mpmd/index.rst)
+  — true MPMD `sxcall`, `sxjit`, `sxgrad`, `sxvalue_and_grad`, markers.
+- [`spectrax.runtime.spmd`](../api_docs/runtime/spmd/index.rst)
+  — SPMD-only `pipeline_step`, `spmd_run`, and `make_scheduled_body`.
 
 ## References
 

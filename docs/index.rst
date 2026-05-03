@@ -65,7 +65,7 @@ fine-grained control, :func:`~spectrax.export` still returns the
       :link: guides/pipeline
       :link-type: doc
 
-      Stage-parallel training with GPipe / 1F1B / ZB-H1 / Interleaved.
+      SPMD ``pipeline_step`` plus true MPMD ``sxcall`` / ``sxjit`` schedules.
 
    .. grid-item-card:: 🧠 Design
       :link: design

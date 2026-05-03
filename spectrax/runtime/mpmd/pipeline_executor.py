@@ -106,6 +106,15 @@ class MpmdPipelineDispatchStats:
             pytrees from per-stage flat outputs.
         submit_time: Wall-clock seconds spent assembling stage inputs and
             enqueueing/executing stage work on the host.
+        stage_submit_times_ms: Per-stage wall-clock milliseconds spent from
+            stage input assembly through the ``stage_jit`` enqueue/worker
+            submission call. JAX execution is asynchronous, so this is a
+            boundary/launch timing signal, not a device-compute measurement.
+        stage_assemble_times_ms: Per-stage wall-clock milliseconds spent
+            materializing the positional input list for the stage call.
+        stage_execute_times_ms: Per-stage wall-clock milliseconds spent inside
+            the actual ``stage_jit`` enqueue call or resident-worker submit.
+            This is still host dispatch time, not device execution time.
     """
 
     stage_launches: int
@@ -115,6 +124,9 @@ class MpmdPipelineDispatchStats:
     prepare_time: float = 0.0
     assemble_time: float = 0.0
     submit_time: float = 0.0
+    stage_submit_times_ms: tuple[float, ...] = ()
+    stage_assemble_times_ms: tuple[float, ...] = ()
+    stage_execute_times_ms: tuple[float, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,6 +168,9 @@ class _PrepareCacheEntry:
             argument.
         invar_plans: Pre-classified stage input assembly plans derived from the
             cached state.
+        runtime_static_invar_plan_cache: Invar plans with runtime-static dynamic
+            slots already folded into the template. The key is the set of flat
+            argument leaves treated as runtime-static for this bucket.
     """
 
     state: _MpmdState
@@ -164,6 +179,7 @@ class _PrepareCacheEntry:
     arg_offsets: tuple[int, ...]
     arg_leaf_counts: tuple[int, ...]
     invar_plans: tuple[tp.Any, ...]
+    runtime_static_invar_plan_cache: dict[frozenset[int], tuple[tp.Any, ...]] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -236,7 +252,7 @@ class _StageWorker:
                 return
             if task.future.set_running_or_notify_cancel():
                 try:
-                    with task.submesh:
+                    with jax.named_scope(f"spectrax/mpmd/pipeline/worker/stage_{self.rank}"):
                         out = task.stage_jit(*task.invars)
                     task.future.set_result(out)
                 except BaseException as exc:
@@ -410,6 +426,15 @@ class MpmdPipelineExecutor:
         )
         runtime_static_cache = cached_entry.runtime_static_cache if cached_entry is not None else None
         invar_plans = cached_entry.invar_plans if cached_entry is not None else None
+        runtime_static_plan_key: frozenset[int] | None = None
+        runtime_static_plan_updates: list[tp.Any | None] | None = None
+        if cached_entry is not None and runtime_static_flat_indices:
+            runtime_static_plan_key = frozenset(runtime_static_flat_indices)
+            resolved_plans = cached_entry.runtime_static_invar_plan_cache.get(runtime_static_plan_key)
+            if resolved_plans is not None:
+                invar_plans = resolved_plans
+            elif invar_plans is not None:
+                runtime_static_plan_updates = [None] * len(invar_plans)
         rank_submeshes = [stage[1] for stage in compiled]
         rank_device_sets = [set(submesh.devices.flat) for submesh in rank_submeshes]
         mpmd_mesh = self._resolve_mpmd_mesh(prepared[0].state, rank_submeshes, sxjit_fn=sxjit_fn)
@@ -418,6 +443,9 @@ class MpmdPipelineExecutor:
         stage_dispatch_time = 0.0
         queue_wait_time = 0.0
         submit_time = 0.0
+        stage_submit_times_ms = [0.0] * len(compiled)
+        stage_assemble_times_ms = [0.0] * len(compiled)
+        stage_execute_times_ms = [0.0] * len(compiled)
 
         def wait_stage(mb_idx: int, stage_idx: int) -> tuple:
             nonlocal stage_dispatch_time, queue_wait_time
@@ -464,20 +492,37 @@ class MpmdPipelineExecutor:
                         flat_args[orig_flat_idx] = previous_stage_outputs[stage_out_pos]
                     call = _PreparedCall(state=call.state, flat_args=flat_args)
 
-                invars = self._assemble_stage_invars(
-                    call=call,
-                    stage_idx=stage_idx,
-                    invar_map=invar_map,
-                    invar_plan=invar_plans[stage_idx] if invar_plans is not None else None,
-                    my_sh=my_sh,
-                    rank_devices=rank_devices,
-                    rank_submeshes=rank_submeshes,
-                    mpmd_mesh=mpmd_mesh,
-                    prev_outputs=prev_outputs,
-                    all_cluster_outputs=cluster_outputs[mb_idx],
-                    runtime_static_flat_indices=runtime_static_flat_indices,
-                    runtime_static_cache=runtime_static_cache,
-                )
+                t_assemble_stage = time.time()
+                with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/assemble"):
+                    invar_plan = invar_plans[stage_idx] if invar_plans is not None else None
+                    invars = self._assemble_stage_invars(
+                        call=call,
+                        stage_idx=stage_idx,
+                        invar_map=invar_map,
+                        invar_plan=invar_plan,
+                        my_sh=my_sh,
+                        rank_devices=rank_devices,
+                        rank_submeshes=rank_submeshes,
+                        mpmd_mesh=mpmd_mesh,
+                        prev_outputs=prev_outputs,
+                        all_cluster_outputs=cluster_outputs[mb_idx],
+                        runtime_static_flat_indices=runtime_static_flat_indices,
+                        runtime_static_cache=runtime_static_cache,
+                    )
+                    if (
+                        runtime_static_plan_updates is not None
+                        and mb_idx == 0
+                        and invar_plan is not None
+                        and runtime_static_flat_indices is not None
+                    ):
+                        runtime_static_plan_updates[stage_idx] = self._fold_runtime_static_slots_into_plan(
+                            invar_plan,
+                            invars,
+                            runtime_static_flat_indices,
+                        )
+                stage_assemble_elapsed = time.time() - t_assemble_stage
+                stage_assemble_times_ms[stage_idx] += stage_assemble_elapsed * 1000.0
+                t_execute_stage = time.time()
                 if self.use_workers:
                     futures[mb_idx][stage_idx] = self._workers[stage_idx].submit(
                         stage_jit=stage_jit,
@@ -485,9 +530,13 @@ class MpmdPipelineExecutor:
                         invars=invars,
                     )
                 else:
-                    with submesh:
+                    with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/execute"):
                         cluster_outputs[mb_idx][stage_idx] = stage_jit(*invars)
-                submit_time += time.time() - t_submit
+                stage_execute_elapsed = time.time() - t_execute_stage
+                stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
+                stage_submit_elapsed = time.time() - t_submit
+                submit_time += stage_submit_elapsed
+                stage_submit_times_ms[stage_idx] += stage_submit_elapsed * 1000.0
 
         final_stage = num_stages - 1
         for mb_idx in range(num_microbatches):
@@ -496,6 +545,13 @@ class MpmdPipelineExecutor:
         t_assemble = time.time()
         results = [self._assemble_result(call, outputs) for call, outputs in zip(prepared, cluster_outputs, strict=True)]
         assemble_time = time.time() - t_assemble
+        if (
+            cached_entry is not None
+            and runtime_static_plan_key is not None
+            and runtime_static_plan_updates is not None
+            and all(plan is not None for plan in runtime_static_plan_updates)
+        ):
+            cached_entry.runtime_static_invar_plan_cache[runtime_static_plan_key] = tuple(runtime_static_plan_updates)
         self._last_stats = MpmdPipelineDispatchStats(
             stage_launches=len(compiled) * len(prepared),
             microbatches=len(prepared),
@@ -504,6 +560,9 @@ class MpmdPipelineExecutor:
             prepare_time=prepare_time,
             assemble_time=assemble_time,
             submit_time=submit_time,
+            stage_submit_times_ms=tuple(stage_submit_times_ms),
+            stage_assemble_times_ms=tuple(stage_assemble_times_ms),
+            stage_execute_times_ms=tuple(stage_execute_times_ms),
         )
         return results
 
@@ -607,6 +666,38 @@ class MpmdPipelineExecutor:
             arg_offsets=tuple(offsets),
             arg_leaf_counts=tuple(counts),
             invar_plans=self._make_invar_plans(state),
+        )
+
+    def _fold_runtime_static_slots_into_plan(
+        self,
+        plan: tp.Any,
+        invars: list[tp.Any],
+        runtime_static_flat_indices: set[int],
+    ) -> tp.Any:
+        """Return an invar plan with stable dynamic slots pre-filled.
+
+        Runtime integrations such as eSurge pass graph definitions and weights
+        as normal dynamic arguments so they are not JAX compile-time constants.
+        They are nevertheless stable for a decode bucket. The generic hot path
+        used to visit every such slot on every token, doing set membership and
+        cache lookups for roughly a hundred weight leaves per stage. After the
+        first call has materialized those leaves with the correct stage
+        placement, this helper folds them into the plan template. Later decode
+        steps only iterate over truly changing slots: KV/cache leaves, metadata,
+        and inter-stage activations.
+        """
+        template = list(plan.template)
+        dynamic_slots: list[tuple[int, int]] = []
+        for out_pos, orig_idx in plan.dynamic_slots:
+            if int(orig_idx) in runtime_static_flat_indices:
+                template[int(out_pos)] = invars[int(out_pos)]
+            else:
+                dynamic_slots.append((int(out_pos), int(orig_idx)))
+        return type(plan)(
+            template=tuple(template),
+            dynamic_slots=tuple(dynamic_slots),
+            stage_slots=plan.stage_slots,
+            prev_slots=plan.prev_slots,
         )
 
     def _normalize_runtime_static_argnums(

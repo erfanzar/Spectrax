@@ -7,8 +7,8 @@
 When ``sxjit`` traces a function that calls :func:`treduce` internally,
 the outer jaxpr contains a single ``pscan_p`` equation whose parameters
 carry the user body's jaxpr, the pipeline schedule, and accumulator ops.
-This module turns that equation into a per-stage compilation plan and a
-schedule-aware Python dispatch loop.
+This module turns that equation into a per-stage compilation plan and
+schedule-aware per-rank dispatch.
 
 Algorithm:
 
@@ -232,7 +232,8 @@ def _make_fwd_jit(cluster_jaxpr: Jaxpr, donate_argnums: tuple[int, ...] = ()) ->
         Returns:
             Tuple of cluster outputs matching the sub-jaxpr's outvars.
         """
-        return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
+        with jax.named_scope("spectrax/mpmd/schedule/stage_forward"):
+            return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
 
     if donate_argnums:
         return jax.jit(fwd, donate_argnums=donate_argnums)
@@ -271,18 +272,20 @@ def _make_bwd_jit(
             ``consts`` and ``g_invars`` is a tuple aligned with the
             cluster's invars.
         """
-        invars = invars_and_cotangents[:n_invars]
-        cotangents = invars_and_cotangents[n_invars:]
+        with jax.named_scope("spectrax/mpmd/schedule/stage_backward"):
+            invars = invars_and_cotangents[:n_invars]
+            cotangents = invars_and_cotangents[n_invars:]
 
-        def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument."""
-            return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
+            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+                """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument."""
+                with jax.named_scope("spectrax/mpmd/schedule/stage_backward/pure_forward"):
+                    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
-        _, vjp_fn = jax.vjp(pure, consts, *invars)
-        grads = vjp_fn(tuple(cotangents))
-        g_consts = grads[0]
-        g_invars = tuple(grads[1:])
-        return g_consts, g_invars
+            _, vjp_fn = jax.vjp(pure, consts, *invars)
+            grads = vjp_fn(tuple(cotangents))
+            g_consts = grads[0]
+            g_invars = tuple(grads[1:])
+            return g_consts, g_invars
 
     jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
@@ -321,16 +324,18 @@ def _make_bwd_i_jit(
         Returns:
             ``g_invars`` aligned with the cluster's invars.
         """
-        invars = invars_and_cotangents[:n_invars]
-        cotangents = invars_and_cotangents[n_invars:]
+        with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input"):
+            invars = invars_and_cotangents[:n_invars]
+            cotangents = invars_and_cotangents[n_invars:]
 
-        def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
-            return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
+            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
+                with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input/pure_forward"):
+                    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
-        _, vjp_fn = jax.vjp(pure, consts, *invars)
-        grads = vjp_fn(tuple(cotangents))
-        return tuple(grads[1:])
+            _, vjp_fn = jax.vjp(pure, consts, *invars)
+            grads = vjp_fn(tuple(cotangents))
+            return tuple(grads[1:])
 
     jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
@@ -364,16 +369,18 @@ def _make_bwd_w_jit(
         Returns:
             ``g_consts`` matching the structure of ``consts``.
         """
-        invars = invars_and_cotangents[:n_invars]
-        cotangents = invars_and_cotangents[n_invars:]
+        with jax.named_scope("spectrax/mpmd/schedule/stage_backward_weight"):
+            invars = invars_and_cotangents[:n_invars]
+            cotangents = invars_and_cotangents[n_invars:]
 
-        def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
-            """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
-            return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
+            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
+                with jax.named_scope("spectrax/mpmd/schedule/stage_backward_weight/pure_forward"):
+                    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
-        _, vjp_fn = jax.vjp(pure, consts, *invars)
-        grads = vjp_fn(tuple(cotangents))
-        return grads[0]
+            _, vjp_fn = jax.vjp(pure, consts, *invars)
+            grads = vjp_fn(tuple(cotangents))
+            return grads[0]
 
     jit_kwargs: dict[str, Any] = {}
     if donate_argnums:
@@ -417,21 +424,24 @@ def _make_terminal_jit(
             its gradients.
         """
 
-        def pure(c: tuple[Any, ...], *xs: Any) -> Any:
-            """Scalar-loss evaluator, asserts a single cluster output."""
-            outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
-            if len(outs) != 1:
-                raise ValueError(
-                    f"Terminal cluster must produce exactly one scalar output "
-                    f"(the per-microbatch loss); got {len(outs)}."
-                )
-            return outs[0]
+        with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward"):
 
-        argnums = tuple(range(1 + n_invars))
-        loss, grads = jax.value_and_grad(pure, argnums=argnums, allow_int=True)(consts, *invars)
-        g_consts = grads[0]
-        g_invars = tuple(grads[1:])
-        return loss, (g_consts, g_invars)
+            def pure(c: tuple[Any, ...], *xs: Any) -> Any:
+                """Scalar-loss evaluator, asserts a single cluster output."""
+                with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward/pure_forward"):
+                    outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
+                    if len(outs) != 1:
+                        raise ValueError(
+                            f"Terminal cluster must produce exactly one scalar output "
+                            f"(the per-microbatch loss); got {len(outs)}."
+                        )
+                    return outs[0]
+
+            argnums = tuple(range(1 + n_invars))
+            loss, grads = jax.value_and_grad(pure, argnums=argnums, allow_int=True)(consts, *invars)
+            g_consts = grads[0]
+            g_invars = tuple(grads[1:])
+            return loss, (g_consts, g_invars)
 
     jit_kwargs: dict[str, Any] = {}
     if donate_argnums:

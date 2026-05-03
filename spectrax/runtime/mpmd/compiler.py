@@ -230,69 +230,64 @@ def compile_ranked_executables(
                 Returns ``(per_stage_grads, outgoing_activations,
                 outgoing_cotangents, loss_sum)``.
                 """
-                num_microbatches = mb_inputs.shape[0]
-                saved_inputs: dict[tuple[int, int], Any] = {}
-                saved_outputs: dict[tuple[int, int], Any] = {}
-                outgoing_acts: list[Any | None] = [None] * int(num_microbatches)
-                outgoing_cots = jnp.zeros_like(mb_inputs)
-                g_params_accum: dict[int, Any] = {}
-                loss_sum = jnp.zeros((), dtype=jnp.float32)
+                with jax.named_scope(f"spectrax/mpmd/compiler/rank_{rank}"):
+                    num_microbatches = mb_inputs.shape[0]
+                    saved_inputs: dict[tuple[int, int], Any] = {}
+                    saved_outputs: dict[tuple[int, int], Any] = {}
+                    outgoing_acts: list[Any | None] = [None] * int(num_microbatches)
+                    outgoing_cots = jnp.zeros_like(mb_inputs)
+                    g_params_accum: dict[int, Any] = {}
+                    loss_sum = jnp.zeros((), dtype=jnp.float32)
 
-                for action in rank_actions:
-                    mb = action.microbatch
-                    virt = action.virtual_stage
-                    logical = schedule.logical_at(rank, virt, n_stages)
-                    sfn = rank_fns[logical]
+                    for action in rank_actions:
+                        mb = action.microbatch
+                        virt = action.virtual_stage
+                        logical = schedule.logical_at(rank, virt, n_stages)
+                        sfn = rank_fns[logical]
 
-                    if action.phase == Phase.FWD:
-                        x_in = mb_inputs[mb]
-                        y = sfn(*all_stage_params[logical], x_in)
-                        if not isinstance(y, jax.Array):
-                            y = y[0] if isinstance(y, (tuple, list)) else y
-                        saved_inputs[(virt, mb)] = x_in
-                        saved_outputs[(virt, mb)] = y
-                        outgoing_acts[mb] = y
+                        if action.phase == Phase.FWD:
+                            with jax.named_scope(f"spectrax/mpmd/compiler/rank_{rank}/fwd_logical_{logical}_mb_{mb}"):
+                                x_in = mb_inputs[mb]
+                                y = sfn(*all_stage_params[logical], x_in)
+                                if not isinstance(y, jax.Array):
+                                    y = y[0] if isinstance(y, (tuple, list)) else y
+                                saved_inputs[(virt, mb)] = x_in
+                                saved_outputs[(virt, mb)] = y
+                                outgoing_acts[mb] = y
 
-                    elif action.phase == Phase.BWD:
-                        x_in = saved_inputs.get((virt, mb), mb_inputs[mb])
-                        g_y = mb_cotangents[mb]
+                        elif action.phase == Phase.BWD:
+                            with jax.named_scope(f"spectrax/mpmd/compiler/rank_{rank}/bwd_logical_{logical}_mb_{mb}"):
+                                x_in = saved_inputs.get((virt, mb), mb_inputs[mb])
+                                g_y = mb_cotangents[mb]
 
-                        params = tuple(all_stage_params[logical])
+                                params = tuple(all_stage_params[logical])
 
-                        def _stage_primary(*p_and_x, _fn=sfn, _n=len(params)):
-                            """Return the stage's primary activation as a function of ``(params, x)``.
+                                def _stage_primary(*p_and_x, _fn=sfn, _n=len(params)):
+                                    """Return the stage's primary activation as a function of ``(params, x)``."""
+                                    p = p_and_x[:_n]
+                                    x = p_and_x[_n]
+                                    out = _fn(*p, x)
+                                    return out[0] if isinstance(out, (tuple, list)) else out
 
-                            Used as the :func:`jax.vjp` target so the
-                            backward call differentiates with respect
-                            to both parameters and the staged input.
-                            ``_fn`` and ``_n`` are bound at definition
-                            time to avoid closure leaks across
-                            consecutive backward equations.
-                            """
-                            p = p_and_x[:_n]
-                            x = p_and_x[_n]
-                            out = _fn(*p, x)
-                            return out[0] if isinstance(out, (tuple, list)) else out
+                                _y, vjp_fn = jax.vjp(_stage_primary, *params, x_in)
+                                grads = vjp_fn(g_y)
+                                g_p = tuple(grads[:-1])
+                                g_x = grads[-1]
+                                outgoing_cots = outgoing_cots.at[mb].set(g_x)
 
-                        _y, vjp_fn = jax.vjp(_stage_primary, *params, x_in)
-                        grads = vjp_fn(g_y)
-                        g_p = tuple(grads[:-1])
-                        g_x = grads[-1]
-                        outgoing_cots = outgoing_cots.at[mb].set(g_x)
+                                if logical not in g_params_accum:
+                                    g_params_accum[logical] = g_p
+                                else:
+                                    g_params_accum[logical] = jax.tree.map(
+                                        lambda u, v: u + v,
+                                        g_params_accum[logical],
+                                        g_p,
+                                    )
 
-                        if logical not in g_params_accum:
-                            g_params_accum[logical] = g_p
-                        else:
-                            g_params_accum[logical] = jax.tree.map(
-                                lambda u, v: u + v,
-                                g_params_accum[logical],
-                                g_p,
-                            )
-
-                missing = [mb for mb, value in enumerate(outgoing_acts) if value is None]
-                if missing:
-                    raise RuntimeError(f"rank {rank} did not produce forward outputs for microbatches {missing}.")
-                return g_params_accum, jnp.stack(outgoing_acts, axis=0), outgoing_cots, loss_sum
+                    missing = [mb for mb, value in enumerate(outgoing_acts) if value is None]
+                    if missing:
+                        raise RuntimeError(f"rank {rank} did not produce forward outputs for microbatches {missing}.")
+                    return g_params_accum, jnp.stack(outgoing_acts, axis=0), outgoing_cots, loss_sum
 
             return rank_fn
 

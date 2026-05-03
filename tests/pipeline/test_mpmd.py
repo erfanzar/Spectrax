@@ -339,27 +339,26 @@ def test_mpmd_profiler_records_per_task_times(hom_model, xy, mpmd_mesh):
             schedule=GPipe(microbatches=_M),
             loss_fn=_loss_fn,
         )
-    assert any(name.startswith("L0_fwd_") for name in times)
+    assert any(name.startswith("stage0_fwd_") for name in times)
     assert any("bwd_" in name for name in times)
-    assert any("loss" in name for name in times)
+    assert any("terminal_fwd" in name for name in times)
     for ms_list in times.values():
         for t in ms_list:
             assert t >= 0.0
 
 
-def test_mpmd_donate_activations_preserves_loss(hom_model, xy, mpmd_mesh, hom_reference):
-    """``donate_activations=True`` does not change the numerical result."""
+def test_mpmd_donate_activations_rejected_on_true_schedule_path(hom_model, xy, mpmd_mesh):
+    """Legacy activation donation is not part of the true scheduled train path."""
     x, y = xy
-    ref_loss, _ = hom_reference
-    loss, _ = sxcall(
-        hom_model,
-        (x, y),
-        mesh=mpmd_mesh,
-        schedule=GPipe(microbatches=_M),
-        loss_fn=_loss_fn,
-        donate_activations=True,
-    )
-    assert jnp.allclose(loss, ref_loss, atol=1e-4, rtol=1e-4)
+    with pytest.raises(NotImplementedError, match="donate_activations"):
+        sxcall(
+            hom_model,
+            (x, y),
+            mesh=mpmd_mesh,
+            schedule=GPipe(microbatches=_M),
+            loss_fn=_loss_fn,
+            donate_activations=True,
+        )
 
 
 def test_mpmd_mesh_dim_mismatch(hom_model, mpmd_mesh):

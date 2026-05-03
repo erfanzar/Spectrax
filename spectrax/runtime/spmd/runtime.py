@@ -101,7 +101,7 @@ def _extract_stages(container: PipelineSequential) -> tuple[Any, tuple[State, ..
             stage 0's.
     """
     if not isinstance(container, PipelineSequential):
-        raise TypeError(f"spx.pipeline expects a PipelineSequential, got {type(container).__name__}.")
+        raise TypeError(f"spmd_run expects a PipelineSequential, got {type(container).__name__}.")
     stages = container.stages
     gdef0, state0 = export(stages[0])
     states = [state0]

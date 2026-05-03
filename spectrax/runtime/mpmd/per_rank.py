@@ -167,11 +167,13 @@ def compile_per_rank_fwd(
             unchanged so the matching backward sweep can consume the
             exact inputs observed here without recomputation.
         """
-        mb_outputs = [None] * microbatches
-        for mb in fwd_order:
-            y = fwd_fn(params, rest, mb_inputs[mb])
-            mb_outputs[mb] = y
-        return jnp.stack(tuple(mb_outputs), axis=0), mb_inputs
+        with jax.named_scope(f"spectrax/mpmd/per_rank/forward_rank_{rank}"):
+            mb_outputs = [None] * microbatches
+            for mb in fwd_order:
+                with jax.named_scope(f"spectrax/mpmd/per_rank/forward_rank_{rank}/microbatch_{mb}"):
+                    y = fwd_fn(params, rest, mb_inputs[mb])
+                mb_outputs[mb] = y
+            return jnp.stack(tuple(mb_outputs), axis=0), mb_inputs
 
     return fwd_step
 
@@ -228,25 +230,27 @@ def compile_per_rank_bwd(
     @jax.jit
     def bwd_step(params, rest, mb_saved_inputs, mb_saved_outputs, mb_incoming_cots, *mb_targets):
         """Run every BWD for this rank back-to-back (terminal: loss + g_y)."""
-        mb_outgoing_cots = jnp.zeros_like(mb_saved_inputs)
-        g_params = jax.tree.map(jnp.zeros_like, params)
-        loss_sum = None
+        with jax.named_scope(f"spectrax/mpmd/per_rank/backward_rank_{rank}"):
+            mb_outgoing_cots = jnp.zeros_like(mb_saved_inputs)
+            g_params = jax.tree.map(jnp.zeros_like, params)
+            loss_sum = None
 
-        for mb in bwd_order:
-            if is_terminal:
-                y_out = mb_saved_outputs[mb]
-                loss_mb, g_y = loss_and_g_y(y_out, *(t[mb] for t in mb_targets))
-                loss_sum = loss_mb if loss_sum is None else loss_sum + loss_mb
-            else:
-                g_y = mb_incoming_cots[mb]
-            x_in = mb_saved_inputs[mb]
-            g_p, g_x = bwd_fn(params, rest, x_in, g_y)
-            g_params = jax.tree.map(lambda a, b: a + b, g_params, g_p)
-            mb_outgoing_cots = mb_outgoing_cots.at[mb].set(g_x)
+            for mb in bwd_order:
+                with jax.named_scope(f"spectrax/mpmd/per_rank/backward_rank_{rank}/microbatch_{mb}"):
+                    if is_terminal:
+                        y_out = mb_saved_outputs[mb]
+                        loss_mb, g_y = loss_and_g_y(y_out, *(t[mb] for t in mb_targets))
+                        loss_sum = loss_mb if loss_sum is None else loss_sum + loss_mb
+                    else:
+                        g_y = mb_incoming_cots[mb]
+                    x_in = mb_saved_inputs[mb]
+                    g_p, g_x = bwd_fn(params, rest, x_in, g_y)
+                    g_params = jax.tree.map(lambda a, b: a + b, g_params, g_p)
+                    mb_outgoing_cots = mb_outgoing_cots.at[mb].set(g_x)
 
-        if loss_sum is None:
-            loss_sum = jnp.zeros((), dtype=jnp.float32)
-        return g_params, mb_outgoing_cots, loss_sum
+            if loss_sum is None:
+                loss_sum = jnp.zeros((), dtype=jnp.float32)
+            return g_params, mb_outgoing_cots, loss_sum
 
     return bwd_step
 

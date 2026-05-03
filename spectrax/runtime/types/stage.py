@@ -11,9 +11,9 @@ hidden, etc.). One :class:`PipelineStage` corresponds to one
 *logical* stage of the pipeline; how those logical stages map onto
 physical mesh ranks is the runtime's job, not the dataclass'.
 
-Both the SPMD pipeline runtime
-(:func:`spectrax.runtime.spmd.pipeline_call`) and the MPMD runtime
-(:func:`spectrax.runtime.mpmd.sxcall`) accept lists of these.
+The MPMD runtime (:func:`spectrax.runtime.mpmd.sxcall`) accepts lists
+of these directly.  SPMD ``PipelineSequential`` execution uses the same
+logical stage concept after extracting stages from the module.
 """
 
 from __future__ import annotations
@@ -74,8 +74,8 @@ class PipelineStage:
         fn: The stage's forward callable. Must be a pure function of
             its three arguments.
         parameters: The parameter pytree consumed by ``fn``. Shape
-            and dtype determine whether the SPMD runtime takes its
-            homogeneous fast path or falls back to per-rank MPMD.
+            and dtype determine whether a runtime can stack stages on
+            a shared SPMD axis.
         init_state: Initial state pytree. Defaults to ``()`` for
             stateless stages; see :func:`_is_empty_state` for the
             sentinel handling.

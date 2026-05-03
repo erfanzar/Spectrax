@@ -214,7 +214,7 @@ DEFAULT_MESH_AXIS_NAMES: tuple[str, ...] = ("pp", "dp", "fsdp", "ep", "tp", "sp"
 """Default axis names for :func:`create_mesh`.
 
 - ``pp``: pipeline parallelism (split model by stages — see
-  :mod:`spectrax.pipeline`)
+  :mod:`spectrax.runtime.mpmd`)
 - ``dp``: data parallelism (replicate model, split batch)
 - ``fsdp``: fully-sharded data parallelism (ZeRO-3-like)
 - ``ep``: expert parallelism (mixture-of-experts)

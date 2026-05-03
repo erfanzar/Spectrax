@@ -2,50 +2,42 @@
 # This file is part of EasyDeL.
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
-""":func:`sxcall`: multiple-program pipeline runtime for **heterogeneous stages**.
+""":func:`sxcall`: public MPMD compatibility API.
 
-Single-HLO pipeline runtimes compile one jaxpr shared by every
-pipeline device and rely on the same-shape constraint to keep that
-jaxpr consistent. For models whose stages
-have **different shapes** — e.g. a transformer with a bulky
-embedding stage, many uniform middle stages, and an lm-head stage —
-this runtime compiles a **separate jitted function per stage** and
-orchestrates them in Python. Activation and cotangent transfers use
-:func:`jax.device_put` between per-stage sub-meshes.
+The canonical scheduled training path in SpectraX is
+``sxjit(..., schedule=...)`` plus :func:`sxvalue_and_grad`. ``sxcall``
+keeps the older :class:`~spectrax.nn.PipelineSequential` entry point,
+but train mode now lowers that container into a marker-instrumented
+loss function and routes through the same schedule-faithful MPMD
+dispatcher. Forward mode remains a stage-local MPMD forward executor
+for inference-style calls where no backward schedule exists.
 
 Trade-offs:
 
 * **Flexibility**: every stage can have a different class, different
   parameter shapes, different input/output shapes. The
-  :class:`~spectrax.pipeline.PipelineSequential` container still
+  :class:`~spectrax.nn.PipelineSequential` container still
   represents the model; the MPMD runtime just doesn't require
   matching ``GraphDef`` s.
 * **Mesh composition**: stages live on the
-  :class:`~spectrax.pipeline.MpMdMesh`'s MPMD axis; other mesh axes
+  :class:`~spectrax.runtime.types.MpMdMesh`'s MPMD axis; other mesh axes
   are free for intra-stage FSDP / TP / DP.
 * **Lower throughput**: no :func:`shard_map` fusion, so cross-device
   communication is coarser-grained. The upside is that each rank keeps
   a separate compiled program instead of seeing a union graph.
-* **Python orchestration overhead**: the schedule loop runs in
-  Python at dispatch time. Each step's stage work is jitted, so the
-  compute cost inside each step is compiled to XLA, but the outer
-  loop doesn't fuse across time steps.
+* **Explicit schedule dispatch**: the runtime follows the selected
+  schedule through per-rank programs instead of hiding work inside a
+  shared SPMD union graph.
 
-**Architecture.** :func:`sxcall` is the public entry point. It
-builds per-(rank, virt) jitted forward/backward callables, places
-each stage's params+rest state on its rank's sub-mesh, microbatches
-the batch, and then runs the schedule. GPipe + flat (V=1) schedules
-hit a vmap fast-path (:func:`_gpipe_run`) that collapses M microbatch
-dispatches into 1 per stage/phase; other schedules fall through to
-the per-action Python loop that honours :class:`Schedule` ordering.
-
-The schedule parameter actually controls execution order here: GPipe
-queues all forwards then all backwards, Std1F1B interleaves forward
-and backward microbatches in the steady state, ZeroBubbleH1 splits
-each backward into input-grad and weight-grad to slot weight-grads
-into bubble time, and so on. This gives MPMD its real value over
-SPMD's auto-pipelined single-jit step: different schedules produce
-measurably different step times and activation-memory profiles.
+**Architecture.** In train mode, :func:`sxcall` builds a cached
+scheduled ``sxjit`` wrapper over ``(model, *batch)``, inserts
+``sxstage_iter`` boundaries between logical stages, and asks
+:func:`sxvalue_and_grad` for the model gradient. The public return
+shape is adapted back to ``(loss, StagesArray[State])`` so existing
+callers do not need to rewrite their optimizer plumbing. Legacy-only
+knobs whose implementation depended on the removed Python schedule
+walker now fail loudly instead of falling back to non-schedule-faithful
+execution.
 
 **Virtual-stage support.** ``V`` logical stages live on each physical
 rank (V=1 for flat schedules like GPipe / Std1F1B). The schedule
@@ -72,6 +64,8 @@ free of retracing and repeated ``jax.device_put`` costs:
   ``loss_and_g_y`` wrappers (scalar and vmapped) keyed by
   ``(id(loss_fn), has_aux, donate_argnums)`` and
   ``(id(loss_fn), donate_argnums)`` respectively.
+* ``_SXCALL_SCHEDULED_TRAIN_CACHE``: public ``sxcall`` train wrappers
+  backed by scheduled ``sxjit``.
 
 **Observability.** :func:`collect_task_times_ms` is a context manager
 that attributes wall-clock milliseconds to named sub-tasks (each
@@ -120,6 +114,7 @@ from .markers import (
     has_stage_regions,
     marker_edge_shardings,
     stage_region_cluster_boundaries,
+    sxstage_iter,
     sxstage_iter_p,
 )
 from .pscan_compiler import (
@@ -167,9 +162,11 @@ _FUSED_FWDBWD_CACHE: dict[tuple[int, int], Callable[..., Any]] = {}
 _SCHEDULE_FUSED_FWDBWD_CACHE: dict[tuple[int, ...], Callable[..., Any]] = {}
 _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE: dict[tuple[int, int], Callable[..., Any]] = {}
 _TRANSFER_SHARDING_DECISION_CACHE: dict[tuple[int | None, int | None, tuple[int, ...] | None], bool] = {}
+_RESHARD_IDENTITY_CACHE: dict[tuple[Any, ...], Callable[..., Any]] = {}
 _LOSS_JIT_CACHE: dict[int, Callable[..., Any]] = {}
 _MPMD_CALL_NORMALIZED_CACHE: dict[tuple[int, int], PipelineSequential] = {}
 _FWD_ONLY_VMAP_CACHE: dict[int, Callable[..., Any]] = {}
+_SXCALL_SCHEDULED_TRAIN_CACHE: dict[tuple[Any, ...], Callable[..., Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -843,6 +840,101 @@ def _same_sharding(a: Any, b: Any) -> bool:
     return _sharding_device_set(a) == _sharding_device_set(b)
 
 
+def _sharding_cache_key(sharding: Any) -> tuple[Any, ...] | None:
+    """Return a stable cache key for a concrete JAX sharding object.
+
+    Cross-stage pipeline decode repeatedly moves same-shaped activations between
+    the same physical sub-meshes. JAX sharding objects are not guaranteed to be
+    hash-stable by value, so the reshard executable cache keys by the sharding
+    class, partition spec, mesh axis names, and concrete destination devices.
+
+    Args:
+        sharding: A JAX sharding-like object.
+
+    Returns:
+        A hashable description of ``sharding`` or ``None`` when the object does
+        not expose enough metadata to safely cache a transfer executable.
+    """
+    if sharding is None:
+        return None
+    devices = _device_id_tuple(_sharding_device_set(sharding))
+    if devices is None:
+        return None
+    mesh = getattr(sharding, "mesh", None)
+    axis_names = tuple(getattr(mesh, "axis_names", ())) if mesh is not None else ()
+    return (
+        type(sharding).__module__,
+        type(sharding).__qualname__,
+        repr(getattr(sharding, "spec", None)),
+        axis_names,
+        devices,
+    )
+
+
+def _reshard_identity_cache_key(value: Any, src_sharding: Any, dst_sharding: Any) -> tuple[Any, ...] | None:
+    """Build the cache key for a jitted identity reshard executable.
+
+    The executable is only valid for one leaf shape/dtype and one concrete
+    source/destination sharding pair. Returning ``None`` asks callers to use the
+    conservative ``jax.device_put`` path instead.
+    """
+    if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+        return None
+    src_key = _sharding_cache_key(src_sharding)
+    dst_key = _sharding_cache_key(dst_sharding)
+    if src_key is None or dst_key is None:
+        return None
+    return (
+        tuple(value.shape),
+        str(jnp.dtype(value.dtype)),
+        src_key,
+        dst_key,
+    )
+
+
+def _reshard_with_jitted_identity(value: Any, dst_sharding: Any) -> Any | None:
+    """Move one JAX array leaf through a cached device-side identity executable.
+
+    ``jax.device_put`` is perfectly fine for setup and occasional placement, but
+    it is a poor hot-path abstraction for pipeline decode where every token has
+    stage-to-stage activation handoffs. A jitted identity with explicit
+    ``in_shardings`` and ``out_shardings`` gives XLA a real reshard program to
+    enqueue and cache. On TPU this avoids making the Python runtime the owner of
+    every inter-stage transfer decision.
+
+    The helper intentionally handles only single array leaves, which is what the
+    MPMD invar assemblers pass to :func:`_transport`. Complex pytrees fall back
+    to ``jax.device_put`` until a caller has a measured need for tree-wide
+    transfer fusion.
+
+    Args:
+        value: Source JAX array.
+        dst_sharding: Destination sharding for the consuming stage.
+
+    Returns:
+        The resharded array, or ``None`` when the fast path is not applicable or
+        JAX rejects the explicit reshard executable.
+    """
+    src_sharding = getattr(value, "sharding", None)
+    key = _reshard_identity_cache_key(value, src_sharding, dst_sharding)
+    if key is None:
+        return None
+    fn = _RESHARD_IDENTITY_CACHE.get(key)
+    if fn is None:
+
+        def _sx_mpmd_reshard_identity(leaf: Any) -> Any:
+            """Named reshard executable for repeated MPMD activation handoffs."""
+            with jax.named_scope("spectrax/mpmd/transport/reshard_identity"):
+                return leaf
+
+        fn = jax.jit(_sx_mpmd_reshard_identity, in_shardings=src_sharding, out_shardings=dst_sharding)
+        _RESHARD_IDENTITY_CACHE[key] = fn
+    try:
+        return fn(value)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
 def _stage_axis_size(mesh: Any, axis: Any) -> int:
     """Return the size of ``axis`` on ``mesh``; unknown axes behave replicated."""
     if axis is None:
@@ -903,6 +995,37 @@ def _canonical_stage_sharding(value: Any, sharding: Any, stage_mesh: Any) -> Any
     )
     spec = _trim_trailing_replicated_stage_axes(spec, stage_mesh)
     return jax.sharding.NamedSharding(stage_mesh, spec)
+
+
+def _is_replicated_partition_spec(spec: Any) -> bool:
+    """Return whether ``spec`` carries no real intra-stage partitioning."""
+    if spec is None:
+        return True
+    try:
+        parts = tuple(spec)
+    except Exception:
+        return True
+    return not parts or all(part is None for part in parts)
+
+
+def _prefer_existing_nonreplicated_sharding(value: Any, target: Any, stage_mesh: Any) -> Any:
+    """Keep a live leaf's non-replicated stage-local sharding over fallback replication.
+
+    ``get_named_sharding`` may return a replicated fallback for unannotated
+    leaves. If the live array is already sharded across the same stage submesh
+    with a real partition spec, that physical placement is stronger evidence
+    than the fallback. Preserving it prevents scheduled stage boundaries from
+    silently weakening TP/FSDP layouts on rebinding.
+    """
+    target_spec = getattr(target, "spec", None)
+    if not _is_replicated_partition_spec(target_spec):
+        return target
+    current = getattr(value, "sharding", None)
+    current_spec = getattr(current, "spec", None)
+    if _is_replicated_partition_spec(current_spec):
+        return target
+    existing = _canonical_stage_sharding(value, current, stage_mesh)
+    return existing if existing is not None else target
 
 
 def _partition_spec_axes(spec: Any) -> set[str]:
@@ -1059,6 +1182,8 @@ def _place_schedule_const_value(
         target = None
 
     target = _canonical_stage_sharding(value, target, rank_submeshes[rank]) or target
+    if target is not None:
+        target = _prefer_existing_nonreplicated_sharding(value, target, rank_submeshes[rank])
     rank_devices = set(rank_submeshes[rank].devices.flat)
     value_devices = _array_device_set(value)
     current_sharding = getattr(value, "sharding", None)
@@ -1099,6 +1224,8 @@ def _place_schedule_dynamic_invar(
         )
 
     target = _canonical_stage_sharding(value, leaf_shardings[rank].get(flat_idx), rank_submeshes[rank])
+    if target is not None:
+        target = _prefer_existing_nonreplicated_sharding(value, target, rank_submeshes[rank])
     rank_devices = set(rank_submeshes[rank].devices.flat)
     value_devices = _array_device_set(value)
     current_sharding = getattr(value, "sharding", None)
@@ -1549,7 +1676,12 @@ def _build_schedule_plan(
                 )
                 + (0,) * n_outs
             )
-            vbwd = jax.jit(jax.vmap(bwd, in_axes=in_axes))
+
+            def _lazy_bwd_body(*xs: Any, _bwd=bwd, _scope=f"spectrax/mpmd/schedule/lazy_bwd/logical_{logical}"):
+                with jax.named_scope(_scope):
+                    return _bwd(*xs)
+
+            vbwd = jax.jit(jax.vmap(_lazy_bwd_body, in_axes=in_axes))
             vbwd_jits[stage_key] = vbwd
 
     grid = _build_schedule_grid(schedule, n)
@@ -2461,12 +2593,15 @@ def _get_schedule_fused_fwd_bwd_jit(
         caller can route the forward outputs to the next stage and
         accumulate the backward gradients.
         """
-        fwd_invars = args[:n_invars]
-        bwd_invars = args[n_invars : 2 * n_invars]
-        cotangents = args[2 * n_invars :]
-        fwd_outs = fwd_jit(consts, *fwd_invars)
-        g_consts, g_bwd_invars = bwd_jit(consts, *bwd_invars, *cotangents)
-        return fwd_outs, g_consts, g_bwd_invars
+        with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd"):
+            fwd_invars = args[:n_invars]
+            bwd_invars = args[n_invars : 2 * n_invars]
+            cotangents = args[2 * n_invars :]
+            with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd/forward"):
+                fwd_outs = fwd_jit(consts, *fwd_invars)
+            with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd/backward"):
+                g_consts, g_bwd_invars = bwd_jit(consts, *bwd_invars, *cotangents)
+            return fwd_outs, g_consts, g_bwd_invars
 
     _SCHEDULE_FUSED_FWDBWD_CACHE[key] = fused
     weak_invalidate(fwd_jit, _SCHEDULE_FUSED_FWDBWD_CACHE, key)
@@ -2608,18 +2743,21 @@ def _get_schedule_direct_fused_fwd_bwd_jit(
         function. Profile-driven cache: the result is keyed on
         ``(id(cluster_jaxpr), n_invars)``.
         """
-        fwd_invars = args[:n_invars]
-        bwd_invars = args[n_invars : 2 * n_invars]
-        cotangents = args[2 * n_invars :]
-        fwd_outs = _eval_schedule_cluster_fwd(cluster_jaxpr, consts, *fwd_invars)
-        g_consts, g_bwd_invars = _eval_schedule_cluster_bwd(
-            cluster_jaxpr,
-            n_invars,
-            consts,
-            *bwd_invars,
-            *cotangents,
-        )
-        return fwd_outs, g_consts, g_bwd_invars
+        with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd"):
+            fwd_invars = args[:n_invars]
+            bwd_invars = args[n_invars : 2 * n_invars]
+            cotangents = args[2 * n_invars :]
+            with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd/forward"):
+                fwd_outs = _eval_schedule_cluster_fwd(cluster_jaxpr, consts, *fwd_invars)
+            with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd/backward"):
+                g_consts, g_bwd_invars = _eval_schedule_cluster_bwd(
+                    cluster_jaxpr,
+                    n_invars,
+                    consts,
+                    *bwd_invars,
+                    *cotangents,
+                )
+            return fwd_outs, g_consts, g_bwd_invars
 
     _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE[key] = fused
     return fused
@@ -4228,19 +4366,6 @@ def sxjit(
                     body_jaxpr=closed_jaxpr.jaxpr,
                 )
 
-            cluster_plans = _build_cluster_plans(
-                clusters,
-                consts,
-                stage_shardings,
-                rank_submeshes,
-                original_id_to_idx,
-                n,
-                body_jaxpr=closed_jaxpr.jaxpr,
-                edge_shardings=edge_shardings,
-                donate_argnums_per_stage=donate_per_stage,
-                all_constvars=list(closed_jaxpr.jaxpr.constvars) if not use_legacy_path else None,
-            )
-
             flat_init = jax.tree.leaves(args)
             if use_legacy_path:
                 n_model_leaves = len(jax.tree.leaves(args[:-1]))
@@ -4267,6 +4392,35 @@ def sxjit(
                 static_argnums=static_nums,
             )
 
+            result_sharding_leaves = _flatten_result_shardings(out_shardings, out_shape)
+            stage_out_shardings = _build_stage_output_shardings(
+                clusters,
+                fn_outvar_map,
+                result_sharding_leaves,
+                rank_submeshes=rank_submeshes,
+                stage_shardings=stage_shardings,
+                edge_shardings=edge_shardings,
+            )
+
+            cluster_plans = _build_cluster_plans(
+                clusters,
+                consts,
+                stage_shardings,
+                rank_submeshes,
+                original_id_to_idx,
+                n,
+                body_jaxpr=closed_jaxpr.jaxpr,
+                edge_shardings=edge_shardings,
+                donate_argnums_per_stage=donate_per_stage,
+                all_constvars=list(closed_jaxpr.jaxpr.constvars) if not use_legacy_path else None,
+                flat_init=flat_init,
+                dynamic=dynamic,
+                explicit_in_sh=explicit_in_sh,
+                leaf_shardings=leaf_shardings,
+                dynamic_flat_to_orig_flat=dynamic_flat_to_orig_flat,
+                out_shardings_per_stage=stage_out_shardings,
+            )
+
             placed = _place_static_args(
                 cluster_plans,
                 flat_init,
@@ -4283,6 +4437,8 @@ def sxjit(
             _state["explicit_in_sh"] = explicit_in_sh
             _state["fn_outvar_map"] = fn_outvar_map
             _state["mpmd_mesh"] = mpmd_mesh
+            _state["donate_argnums_per_stage"] = donate_per_stage or [()] * n
+            _state["stage_out_shardings"] = stage_out_shardings
             if not use_legacy_path:
                 _state["dynamic_flat_to_orig_flat"] = dynamic_flat_to_orig_flat
 
@@ -4313,6 +4469,7 @@ def sxjit(
             all_cluster_outputs: list[tuple] = []
             prev_outputs: tuple = ()
             stage_launches = 0
+            stage_times_ms: list[float] = []
 
             for ri, (stage_jit, submesh, my_sh, _, invar_map) in enumerate(compiled):
                 rank_devices = set(rank_submeshes[ri].devices.flat)
@@ -4331,11 +4488,14 @@ def sxjit(
                     mpmd_mesh,
                     dynamic_flat_to_orig_flat=_state.get("dynamic_flat_to_orig_flat"),
                 )
+                stage_t0 = time.perf_counter()
                 with submesh:
                     prev_outputs = stage_jit(*invars)
+                stage_times_ms.append((time.perf_counter() - stage_t0) * 1000.0)
                 stage_launches += 1
                 all_cluster_outputs.append(prev_outputs)
             _state["forward_stage_launches"] = stage_launches
+            _state["forward_stage_times_ms"] = tuple(stage_times_ms)
 
             return _assemble_outputs(
                 _state["fn_outvar_map"],
@@ -4500,6 +4660,139 @@ def _build_outvar_map(
     return fn_outvar_map
 
 
+def _stage_boundary_sharding_from_spec(
+    sharding_or_spec: Any,
+    *,
+    aval: Any,
+    stage_mesh: Any,
+    fallback_sharding: Any | None = None,
+) -> Any | None:
+    """Resolve a stage-boundary sharding against one physical stage mesh.
+
+    ``sxjit`` accepts user ``in_shardings`` / ``out_shardings`` on the
+    outer function, but a forward-only MPMD plan lowers each physical stage as
+    its own ``jax.jit``. Passing the outer sharding object through directly can
+    leave a stage executable with a global mesh or an equivalent-but-different
+    layout. This helper turns either a ``NamedSharding`` or a bare
+    ``PartitionSpec`` into the canonical sharding for the stage-local mesh and
+    the concrete boundary value shape.
+
+    Args:
+        sharding_or_spec: A JAX sharding object, a ``PartitionSpec``, or
+            ``None``.
+        aval: The jaxpr variable aval for the stage input/output.
+        stage_mesh: Physical mesh owned by the compiled stage.
+        fallback_sharding: Value to use when no concrete spec can be derived.
+
+    Returns:
+        A ``NamedSharding`` on ``stage_mesh`` when possible, otherwise
+        ``fallback_sharding``/``None``.
+    """
+    if sharding_or_spec is None:
+        return fallback_sharding
+    shape = tuple(getattr(aval, "shape", ()))
+    if not shape:
+        return fallback_sharding
+    spec = getattr(sharding_or_spec, "spec", sharding_or_spec)
+    try:
+        spec = sanitize_partition_spec_for_mesh_and_shape(spec, mesh=stage_mesh, shape=shape)
+        spec = _trim_trailing_replicated_stage_axes(spec, stage_mesh)
+    except Exception:
+        return fallback_sharding
+    return jax.sharding.NamedSharding(stage_mesh, spec)
+
+
+def _stage_boundary_sharding_for_leaf(
+    leaf: Any,
+    *,
+    target_sharding: Any | None,
+    stage_mesh: Any,
+    fallback_sharding: Any,
+) -> Any:
+    """Resolve the expected sharding for an original leaf entering a stage.
+
+    Explicit caller shardings win. If a live array is already on the destination
+    stage mesh, keep its current partition spec bound to that mesh. Otherwise
+    fall back to the stage default.
+    """
+    if target_sharding is not None:
+        target = _canonical_stage_sharding(leaf, target_sharding, stage_mesh)
+        if target is not None:
+            return target
+        return target_sharding
+    current = getattr(leaf, "sharding", None)
+    if current is not None:
+        target = _canonical_stage_sharding(leaf, current, stage_mesh)
+        if target is not None:
+            return target
+    return fallback_sharding
+
+
+def _flatten_result_shardings(out_shardings: Any | None, out_shape: Any) -> list[Any]:
+    """Flatten user ``out_shardings`` to match the traced result leaves."""
+    out_leaves = jax.tree.leaves(out_shape)
+    if out_shardings is None:
+        return [None] * len(out_leaves)
+    if isinstance(out_shardings, jax.sharding.Sharding):
+        return [out_shardings] * len(out_leaves)
+    leaves = jax.tree_util.tree_leaves(out_shardings, is_leaf=lambda x: x is None)
+    if len(leaves) == len(out_leaves):
+        return list(leaves)
+    if len(leaves) == 1 and len(out_leaves) != 1:
+        return list(leaves) * len(out_leaves)
+    return [None] * len(out_leaves)
+
+
+def _build_stage_output_shardings(
+    clusters: list,
+    fn_outvar_map: list[tuple],
+    result_shardings: list[Any],
+    *,
+    rank_submeshes: list[Any],
+    stage_shardings: list[Any],
+    edge_shardings: list[Any] | tuple[Any, ...],
+) -> list[tuple[Any, ...] | None]:
+    """Build explicit per-stage ``jax.jit(out_shardings=...)`` contracts.
+
+    Final function outputs inherit the user-facing ``out_shardings``. For
+    non-final stage outputs that cross an ``sxstage_iter`` boundary, use the
+    marker edge sharding when one was declared. Entries without an explicit
+    contract stay ``None`` so XLA can keep its local choice.
+    """
+    per_stage: list[list[Any | None]] = [[None] * len(cluster.outvars) for cluster in clusters]
+    for out_idx, mapping in enumerate(fn_outvar_map):
+        if out_idx >= len(result_shardings):
+            continue
+        sharding = result_shardings[out_idx]
+        if sharding is None or not mapping or not isinstance(mapping[0], int):
+            continue
+        rank, out_pos = int(mapping[0]), int(mapping[1])
+        if rank < 0 or rank >= len(clusters) or out_pos < 0 or out_pos >= len(clusters[rank].outvars):
+            continue
+        per_stage[rank][out_pos] = _stage_boundary_sharding_from_spec(
+            sharding,
+            aval=getattr(clusters[rank].outvars[out_pos], "aval", None),
+            stage_mesh=rank_submeshes[rank],
+            fallback_sharding=stage_shardings[rank],
+        )
+
+    for rank, cluster in enumerate(clusters):
+        edge = _edge_sharding_for_logical(edge_shardings, rank)
+        if edge is None:
+            continue
+        for out_pos, outvar in enumerate(cluster.outvars):
+            if per_stage[rank][out_pos] is not None:
+                continue
+            per_stage[rank][out_pos] = _stage_boundary_sharding_from_spec(
+                edge,
+                aval=getattr(outvar, "aval", None),
+                stage_mesh=rank_submeshes[rank],
+                fallback_sharding=stage_shardings[rank],
+            )
+
+    return [tuple(shs) if any(sh is not None for sh in shs) else None for shs in per_stage]
+
+
 def _marker_alias_resolver(body_jaxpr: Any) -> Callable[[Any], Any]:
     """Return a closure that follows ``sxstage_iter`` outvar -> invar identity edges.
 
@@ -4555,6 +4848,12 @@ def _build_cluster_plans(
     edge_shardings: list[Any] | tuple[Any, ...] | None = None,
     donate_argnums_per_stage: list[tuple[int, ...]] | None = None,
     all_constvars: list | None = None,
+    flat_init: list | None = None,
+    dynamic: set[int] | None = None,
+    explicit_in_sh: dict[int, Any] | None = None,
+    leaf_shardings: list[dict[int, Any]] | None = None,
+    dynamic_flat_to_orig_flat: dict[int, int] | None = None,
+    out_shardings_per_stage: list[tuple[Any, ...] | None] | None = None,
 ) -> list[tuple]:
     """Build per-rank ``(stage_jit, submesh, sharding, next_sharding, invar_map)`` tuples.
 
@@ -4569,6 +4868,14 @@ def _build_cluster_plans(
         donate_argnums_per_stage = [()] * n
     if edge_shardings is None:
         edge_shardings = ()
+    if dynamic is None:
+        dynamic = set()
+    if explicit_in_sh is None:
+        explicit_in_sh = {}
+    if leaf_shardings is None:
+        leaf_shardings = [{} for _ in range(n)]
+    if out_shardings_per_stage is None:
+        out_shardings_per_stage = [None] * n
 
     const_idx_by_id: dict[int, int] | None = None
     if all_constvars is not None:
@@ -4623,43 +4930,80 @@ def _build_cluster_plans(
             eval_jaxpr = cluster
 
         donate = donate_argnums_per_stage[rank]
+        stage_scope = f"spectrax/mpmd/forward/stage_{rank}"
+        in_shardings_tuple: tuple[Any, ...] | None = None
+        if flat_init is not None:
+            rank_devices = set(rank_submeshes[rank].devices.flat)
+            stage_in_shardings: list[Any] = []
+            for source, invar in zip(invar_map, cluster.invars, strict=False):
+                kind = source[0]
+                if kind == "orig":
+                    traced_idx = int(source[1])
+                    orig_idx = (
+                        dynamic_flat_to_orig_flat.get(traced_idx, traced_idx)
+                        if dynamic_flat_to_orig_flat is not None
+                        else traced_idx
+                    )
+                    leaf = flat_init[orig_idx] if 0 <= orig_idx < len(flat_init) else None
+                    target = None
+                    if leaf is not None:
+                        if orig_idx in explicit_in_sh:
+                            target = _stage_boundary_sharding_for_leaf(
+                                leaf,
+                                target_sharding=explicit_in_sh[orig_idx],
+                                stage_mesh=rank_submeshes[rank],
+                                fallback_sharding=sub_sharding,
+                            )
+                        elif hasattr(leaf, "devices") and set(leaf.devices()) == rank_devices:
+                            target = _stage_boundary_sharding_for_leaf(
+                                leaf,
+                                target_sharding=getattr(leaf, "sharding", None),
+                                stage_mesh=rank_submeshes[rank],
+                                fallback_sharding=sub_sharding,
+                            )
+                        elif orig_idx in leaf_shardings[rank]:
+                            target = _stage_boundary_sharding_for_leaf(
+                                leaf,
+                                target_sharding=leaf_shardings[rank][orig_idx],
+                                stage_mesh=rank_submeshes[rank],
+                                fallback_sharding=sub_sharding,
+                            )
+                    stage_in_shardings.append(target or sub_sharding)
+                elif kind == "stage":
+                    stage_in_shardings.append(
+                        _stage_boundary_sharding_from_spec(
+                            source[3] if len(source) > 3 else None,
+                            aval=getattr(invar, "aval", None),
+                            stage_mesh=rank_submeshes[rank],
+                            fallback_sharding=sub_sharding,
+                        )
+                        or sub_sharding
+                    )
+                else:
+                    stage_in_shardings.append(sub_sharding)
+            in_shardings_tuple = tuple(stage_in_shardings)
+
+        def stage_body(*invars, _c=pc, _j=eval_jaxpr, _scope=stage_scope):
+            """Run the cluster sub-jaxpr with constants pre-placed on the rank.
+
+            ``_c`` and ``_j`` are bound at definition so each stage's jit closes
+            over its own placed constants and jaxpr (no cross-stage closure
+            leaks). The wrapping ``jax.jit`` below pins the stage ABI sharding
+            contract so large carry leaves, notably KV cache pages, do not
+            silently change layout at the pipeline boundary.
+            """
+            with jax.named_scope(_scope):
+                return tuple(jax.core.eval_jaxpr(_j, list(_c), *invars))
+
+        jit_kwargs: dict[str, Any] = {}
         if donate:
-
-            @functools.partial(jax.jit, donate_argnums=donate)
-            def stage_jit(*invars, _c=pc, _j=eval_jaxpr):
-                """Run the cluster sub-jaxpr with constants pre-placed on the rank.
-
-                ``_c`` and ``_j`` are bound at definition so each stage's
-                jit closes over its own placed constants and jaxpr (no
-                cross-stage closure leaks).
-
-                Args:
-                    *invars: Stage input activations.
-
-                Returns:
-                    Tuple of stage outputs aligned with the cluster's
-                    outvars.
-                """
-                return tuple(jax.core.eval_jaxpr(_j, list(_c), *invars))
-
-        else:
-
-            @jax.jit
-            def stage_jit(*invars, _c=pc, _j=eval_jaxpr):
-                """Run the cluster sub-jaxpr with constants pre-placed on the rank.
-
-                ``_c`` and ``_j`` are bound at definition so each stage's
-                jit closes over its own placed constants and jaxpr (no
-                cross-stage closure leaks).
-
-                Args:
-                    *invars: Stage input activations.
-
-                Returns:
-                    Tuple of stage outputs aligned with the cluster's
-                    outvars.
-                """
-                return tuple(jax.core.eval_jaxpr(_j, list(_c), *invars))
+            jit_kwargs["donate_argnums"] = donate
+        if in_shardings_tuple is not None:
+            jit_kwargs["in_shardings"] = in_shardings_tuple
+        out_shardings_tuple = out_shardings_per_stage[rank]
+        if out_shardings_tuple is not None:
+            jit_kwargs["out_shardings"] = out_shardings_tuple
+        stage_jit = jax.jit(stage_body, **jit_kwargs)
 
         plans.append(
             (
@@ -5347,14 +5691,16 @@ def _transport(
     src_rank: int | None = None,
     dst_rank: int | None = None,
 ) -> Any:
-    """Move ``x`` to ``dest_sharding`` via :func:`jax.device_put`.
+    """Move ``x`` to ``dest_sharding`` for a cross-stage MPMD edge.
 
     All MPMD activation and carry transfers flow through this helper so the
     runtime has one place for placement skip checks, per-edge byte accounting,
-    cache-hit reporting, and optional wall-clock profiling. The only supported
-    transport kind today is ``"device_put"`` because it is portable across CPU,
-    TPU, and single-process GPU backends while still letting XLA choose the
-    actual device-side copy path.
+    cache-hit reporting, and optional wall-clock profiling. ``kind`` remains
+    named ``"device_put"`` for API compatibility, but the hot path first tries a
+    cached jitted identity reshard for JAX array leaves. That gives XLA an
+    explicit source-sharding -> destination-sharding executable for repeated
+    decode handoffs, then falls back to plain :func:`jax.device_put` whenever the
+    transfer is not a single compatible array leaf.
 
     Before issuing a copy, the helper retargets marker-edge shardings to the
     destination stage when possible and asks :func:`_can_skip_device_put` whether
@@ -5363,8 +5709,9 @@ def _transport(
     and destination rank metadata.
 
     Args:
-        kind: Currently only ``"device_put"`` is supported. Portable
-            across CPU / TPU / single-process GPU backends.
+        kind: Currently only ``"device_put"`` is supported. The name describes
+            the fallback transport; compatible JAX array leaves use a cached
+            jitted reshard identity first.
         x: The source value or pytree of values.
         dest_sharding: A :class:`jax.sharding.NamedSharding` whose mesh
             is the destination sub-mesh.
@@ -5396,19 +5743,24 @@ def _transport(
         return x
 
     def put_with_target() -> Any:
-        """``device_put`` to the resharded target, falling back to the bare destination on failure.
+        """Place ``x`` on the resharded target, falling back to the bare destination on failure.
 
         :func:`_retarget_transfer_sharding` may produce a per-leaf
         target that XLA rejects (e.g. shape/spec mismatch); in that
         case we retry with the caller's plain ``dest_sharding`` so
         the transfer at least succeeds on the right device set.
         """
-        try:
-            return jax.device_put(x, target_sharding)
-        except (TypeError, ValueError):
-            if target_sharding is dest_sharding:
-                raise
-            return jax.device_put(x, dest_sharding)
+        edge = f"{src_rank if src_rank is not None else 'unknown'}_to_{dst_rank if dst_rank is not None else 'unknown'}"
+        with jax.named_scope(f"spectrax/mpmd/transport/{edge}"):
+            moved = _reshard_with_jitted_identity(x, target_sharding)
+            if moved is not None:
+                return moved
+            try:
+                return jax.device_put(x, target_sharding)
+            except (TypeError, ValueError):
+                if target_sharding is dest_sharding:
+                    raise
+                return jax.device_put(x, dest_sharding)
 
     if task_name is not None:
         return _time_call(task_name, put_with_target)
@@ -5764,9 +6116,12 @@ def _get_fused_fwd_bwd_jit(
     @jax.jit
     def fused(params, rest, x_fwd, x_bwd, g_y_bwd):
         """Run forward on ``x_fwd`` and backward on ``(x_bwd, g_y_bwd)`` in one HLO."""
-        y_fwd = fwd_jit(params, rest, x_fwd)
-        g_params, g_x = bwd_jit(params, rest, x_bwd, g_y_bwd)
-        return y_fwd, g_params, g_x
+        with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd"):
+            with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd/forward"):
+                y_fwd = fwd_jit(params, rest, x_fwd)
+            with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd/backward"):
+                g_params, g_x = bwd_jit(params, rest, x_bwd, g_y_bwd)
+            return y_fwd, g_params, g_x
 
     _FUSED_FWDBWD_CACHE[key] = fused
     weak_invalidate(fwd_jit, _FUSED_FWDBWD_CACHE, key)
@@ -5819,7 +6174,8 @@ def _get_vmap_loss_and_g_y(
                 """
                 return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
-            return jax.vmap(per_mb)(y_stack, *t_stack)
+            with jax.named_scope("spectrax/mpmd/loss/vmap_loss_and_grad_y"):
+                return jax.vmap(per_mb)(y_stack, *t_stack)
 
     else:
 
@@ -5842,7 +6198,8 @@ def _get_vmap_loss_and_g_y(
                 """
                 return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
-            return jax.vmap(per_mb)(y_stack, *t_stack)
+            with jax.named_scope("spectrax/mpmd/loss/vmap_loss_and_grad_y"):
+                return jax.vmap(per_mb)(y_stack, *t_stack)
 
     _VMAP_LOSS_CACHE[key] = vmap_loss
     weak_invalidate(loss_fn, _VMAP_LOSS_CACHE, key)
@@ -5865,7 +6222,8 @@ def _vmap_sum_grads(g_stack):
     Returns:
         Pytree of arrays with the leading axis summed away.
     """
-    return jax.tree.map(lambda x: x.sum(axis=0), g_stack, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/vmap_sum"):
+        return jax.tree.map(lambda x: x.sum(axis=0), g_stack, is_leaf=_is_leaf)
 
 
 @jax.jit
@@ -5877,7 +6235,8 @@ def _accumulate_state(acc, add):
     shape — eliminates the per-call re-trace cost that previously
     dominated step time at small batch sizes.
     """
-    return jax.tree.map(lambda a, b: a + b, acc, add, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/accumulate_state"):
+        return jax.tree.map(lambda a, b: a + b, acc, add, is_leaf=_is_leaf)
 
 
 @jax.jit
@@ -5896,7 +6255,8 @@ def _accumulate_grad_tree(acc, add):
         ``acc + add`` leaf-wise, with ``float0`` leaves treated as
         additive zero.
     """
-    return jax.tree.map(_add_grad, acc, add, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/accumulate_grad_tree"):
+        return jax.tree.map(_add_grad, acc, add, is_leaf=_is_leaf)
 
 
 @jax.jit
@@ -5913,7 +6273,8 @@ def _scale_grad_tree(state, scalar):
     Returns:
         Grad pytree with each leaf scaled.
     """
-    return jax.tree.map(lambda x: _scale_grad(x, scalar), state, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/scale_grad_tree"):
+        return jax.tree.map(lambda x: _scale_grad(x, scalar), state, is_leaf=_is_leaf)
 
 
 @jax.jit
@@ -5924,7 +6285,8 @@ def _zeros_like_state(state):
     issued one eager dispatch per parameter leaf — ~0.3 ms each on
     TPU, easily 60+ ms per step on medium models.
     """
-    return jax.tree.map(jnp.zeros_like, state, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/zeros_like_state"):
+        return jax.tree.map(jnp.zeros_like, state, is_leaf=_is_leaf)
 
 
 @jax.jit
@@ -5943,7 +6305,8 @@ def _scale_state(state, scalar):
     Returns:
         Same pytree structure with every array leaf scaled.
     """
-    return jax.tree.map(lambda g: g * scalar, state, is_leaf=_is_leaf)
+    with jax.named_scope("spectrax/mpmd/grad/scale_state"):
+        return jax.tree.map(lambda g: g * scalar, state, is_leaf=_is_leaf)
 
 
 def _get_loss_and_g_y(
@@ -5980,8 +6343,9 @@ def _get_loss_and_g_y(
                     """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``."""
                     return loss_fn(y_, *targets)
 
-                (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
-                return loss_val, g_y, aux
+                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y_aux"):
+                    (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
+                    return loss_val, g_y, aux
 
         else:
 
@@ -5998,8 +6362,9 @@ def _get_loss_and_g_y(
                     """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``."""
                     return loss_fn(y_, *targets)
 
-                (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
-                return loss_val, g_y, aux
+                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y_aux"):
+                    (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
+                    return loss_val, g_y, aux
 
     else:
         if donate_argnums:
@@ -6016,7 +6381,8 @@ def _get_loss_and_g_y(
                     """Scalar loss closure passed to :func:`jax.value_and_grad`."""
                     return loss_fn(y_, *targets)
 
-                return jax.value_and_grad(local_loss)(y)
+                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y"):
+                    return jax.value_and_grad(local_loss)(y)
 
         else:
 
@@ -6032,7 +6398,8 @@ def _get_loss_and_g_y(
                     """Scalar loss closure passed to :func:`jax.value_and_grad`."""
                     return loss_fn(y_, *targets)
 
-                return jax.value_and_grad(local_loss)(y)
+                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y"):
+                    return jax.value_and_grad(local_loss)(y)
 
     _LOSS_JIT_CACHE[key] = loss_and_g_y
     weak_invalidate(loss_fn, _LOSS_JIT_CACHE, key)
@@ -6105,8 +6472,9 @@ def _build_stage_callables(
             Returns:
                 The stage's output activation.
             """
-            module = bind(gdef, params.overlay(rest))
-            return module(x)
+            with jax.named_scope("spectrax/mpmd/train/stage_forward"):
+                module = bind(gdef, params.overlay(rest))
+                return module(x)
 
     else:
 
@@ -6123,8 +6491,9 @@ def _build_stage_callables(
             Returns:
                 The stage's output activation.
             """
-            module = bind(gdef, params.overlay(rest))
-            return module(x)
+            with jax.named_scope("spectrax/mpmd/train/stage_forward"):
+                module = bind(gdef, params.overlay(rest))
+                return module(x)
 
     if donate_bwd:
 
@@ -6148,9 +6517,10 @@ def _build_stage_callables(
                 """
                 return bind(gdef, p.overlay(r))(xi)
 
-            _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
-            g_params, _g_rest, g_x = vjp_fn(g_y)
-            return g_params, g_x
+            with jax.named_scope("spectrax/mpmd/train/stage_backward"):
+                _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
+                g_params, _g_rest, g_x = vjp_fn(g_y)
+                return g_params, g_x
 
     else:
 
@@ -6174,9 +6544,10 @@ def _build_stage_callables(
                 """
                 return bind(gdef, p.overlay(r))(xi)
 
-            _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
-            g_params, _g_rest, g_x = vjp_fn(g_y)
-            return g_params, g_x
+            with jax.named_scope("spectrax/mpmd/train/stage_backward"):
+                _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
+                g_params, _g_rest, g_x = vjp_fn(g_y)
+                return g_params, g_x
 
     _STAGE_CALLABLE_CACHE[cache_key] = (fwd_only, bwd_only, n_leaves)
     weak_invalidate(stage, _STAGE_CALLABLE_CACHE, cache_key)
@@ -6213,6 +6584,146 @@ def _normalize_target(
     raise TypeError(f"sxcall target must be a PipelineSequential or a Module, got {type(target).__name__}.")
 
 
+def _split_module_grad_state_by_logical_stage(grad_model: Module | State, n_logical: int) -> StagesArray:
+    """Return per-logical-stage gradient states from an ``sxjit`` module tangent.
+
+    The schedule-faithful ``sxcall`` compatibility path differentiates one
+    marker-instrumented :class:`PipelineSequential`, so JAX returns a tangent
+    shaped like that whole container. Public ``sxcall`` historically returns a
+    :class:`StagesArray` whose shards are ``State`` objects in logical-stage
+    order. This adapter strips the container index prefix (``"3.fc.weight"`` ->
+    ``"fc.weight"``) and preserves the old return contract without changing the
+    underlying true-MPMD execution path.
+
+    Args:
+        grad_model: Module-shaped cotangent returned by ``sxvalue_and_grad`` or
+            an already-normalized :class:`State`.
+        n_logical: Number of logical pipeline stages.
+
+    Returns:
+        A :class:`StagesArray` mapping each logical stage id to a stage-local
+        gradient :class:`State`.
+    """
+    if isinstance(grad_model, State):
+        grad_state = grad_model
+    elif isinstance(grad_model, Module):
+        _, grad_state = export(grad_model)
+    else:
+        raise TypeError(f"Expected Module or State gradient, got {type(grad_model).__name__}.")
+
+    shards: dict[int, State] = {}
+    for logical in range(n_logical):
+        prefix = f"{logical}."
+        stage_data: dict[str, dict[str, Any]] = {}
+        for collection, path, leaf in grad_state.items():
+            if not path.startswith(prefix):
+                continue
+            local_path = path[len(prefix) :]
+            stage_data.setdefault(collection, {})[local_path] = leaf
+        shards[logical] = State(stage_data)
+    return StagesArray(shards=shards)
+
+
+def _sxcall_schedule_signature(schedule: Schedule) -> tuple[Any, ...]:
+    """Return a value-style cache signature for a schedule object.
+
+    ``sxcall`` often receives freshly constructed schedules from
+    ``spx.run(..., schedule=None)``. Keying only by ``id(schedule)`` would
+    rebuild the wrapper every call even when the schedule fields are identical.
+    The signature intentionally records the class and ``repr`` so dataclass-like
+    schedules with the same public configuration reuse the same scheduled
+    wrapper while still separating different scheduler families.
+    """
+    return (
+        type(schedule).__module__,
+        type(schedule).__qualname__,
+        repr(schedule),
+    )
+
+
+def _normalize_sxcall_argnums(argnums: int | tuple[int, ...] | None, batch_len: int) -> tuple[int, ...]:
+    """Normalize public ``sxcall`` batch argnums.
+
+    ``sxcall`` argnums are expressed relative to ``batch`` while the internal
+    scheduled wrapper has an extra leading ``model`` argument. This helper keeps
+    validation/error messages in the public coordinate space before the caller
+    shifts indices by one.
+    """
+    return tuple(sorted(_normalize_argnums(argnums, batch_len)))
+
+
+def _get_sxcall_scheduled_train(
+    *,
+    model: PipelineSequential,
+    mpmd_mesh: MpMdMesh,
+    schedule: Schedule,
+    loss_fn: Callable[..., jax.Array],
+    static_argnums: tuple[int, ...],
+    donate_argnums: tuple[int, ...],
+    batch_argnums: tuple[int, ...],
+) -> Callable[..., Any]:
+    """Build or reuse the true-MPMD scheduled train wrapper for ``sxcall``.
+
+    The wrapper is a normal ``@sxjit(..., schedule=...)`` function over
+    ``(model, *batch)``. It runs every logical stage in order and inserts
+    :func:`sxstage_iter` between adjacent stages, then evaluates ``loss_fn`` on
+    the terminal output. Gradients are later requested with
+    :func:`sxvalue_and_grad`, so forward and backward both use the same
+    schedule-faithful MPMD dispatcher as direct ``sxjit`` users.
+
+    Args:
+        model: Normalized :class:`PipelineSequential` in logical-stage order.
+        mpmd_mesh: Physical MPMD mesh.
+        schedule: Pipeline schedule to honor.
+        loss_fn: Scalar loss called as ``loss_fn(output, *targets)``.
+        static_argnums: Internal argnums for ``(model, *batch)`` treated as
+            static. Always includes ``0`` for the model.
+        donate_argnums: Internal donated argnums for ``(model, *batch)``.
+        batch_argnums: Internal argnums whose leading axis is split into
+            microbatches.
+
+    Returns:
+        A cached scheduled ``sxjit`` callable.
+    """
+    key = (
+        id(model),
+        id(mpmd_mesh),
+        _sxcall_schedule_signature(schedule),
+        id(loss_fn),
+        static_argnums,
+        donate_argnums,
+        batch_argnums,
+    )
+    cached = _SXCALL_SCHEDULED_TRAIN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    @sxjit(
+        mesh=mpmd_mesh,
+        schedule=schedule,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+        batch_argnums=batch_argnums,
+    )
+    def _sxcall_scheduled_loss(model_arg: PipelineSequential, *call_batch: Any) -> jax.Array:
+        """Scalar loss body used by schedule-faithful ``sxcall`` training."""
+        h = call_batch[0]
+        targets = call_batch[1:]
+        stages = model_arg.stages
+        for logical, stage in enumerate(stages):
+            h = stage(h)
+            if logical != len(stages) - 1:
+                h = sxstage_iter(h, stage=logical)
+        return loss_fn(h, *targets)
+
+    _SXCALL_SCHEDULED_TRAIN_CACHE[key] = _sxcall_scheduled_loss
+    weak_invalidate(model, _SXCALL_SCHEDULED_TRAIN_CACHE, key)
+    weak_invalidate(mpmd_mesh, _SXCALL_SCHEDULED_TRAIN_CACHE, key)
+    weak_invalidate(loss_fn, _SXCALL_SCHEDULED_TRAIN_CACHE, key)
+    weak_invalidate(schedule, _SXCALL_SCHEDULED_TRAIN_CACHE, key)
+    return _sxcall_scheduled_loss
+
+
 def sxcall(
     target: "PipelineSequential | Module",
     batch: tuple[Any, ...],
@@ -6232,10 +6743,17 @@ def sxcall(
 ) -> tuple[jax.Array, StagesArray] | tuple[jax.Array, StagesArray, Any] | jax.Array:
     """Execute one pipeline-parallel step with heterogeneous stages.
 
-    Each stage runs on its own sub-mesh of ``mpmd_mesh``; the schedule
-    loop is driven in Python with :func:`jax.device_put` handling
-    cross-stage transfers of activations (forward) and cotangents
-    (backward).
+    Train mode is a compatibility wrapper around the true scheduled
+    MPMD path: ``sxcall`` builds a marker-instrumented loss function
+    and runs it through :func:`sxjit(..., schedule=...)` plus
+    :func:`sxvalue_and_grad`. That means forward, backward, fused
+    schedule cells, virtual stages, and stage-region execution all use
+    the same schedule-faithful dispatcher as direct ``sxjit`` users.
+
+    Forward mode remains a stage-local MPMD forward executor. There is
+    no backward schedule to honor in forward-only inference; stages are
+    run in logical order according to ``schedule.logical_at`` /
+    ``next_logical_loc``.
 
     Args:
         target: :class:`PipelineSequential` whose stages can have
@@ -6364,6 +6882,53 @@ def sxcall(
             "Use mode='forward' or remove 0 from donate_argnums."
         )
 
+    is_forward_only = mode == "forward"
+
+    if not is_forward_only:
+        if has_aux:
+            raise NotImplementedError(
+                "sxcall(has_aux=True) is not supported on the true scheduled MPMD train path yet. "
+                "Return a scalar loss or call a custom sxjit(..., schedule=...) wrapper directly."
+            )
+        if transport != "device_put":
+            raise NotImplementedError(
+                "sxcall transport modes other than 'device_put' belonged to the legacy Python schedule walker "
+                "and are not supported by the true scheduled MPMD train path."
+            )
+        if chunks is not None:
+            raise NotImplementedError(
+                "sxcall(chunks=...) belonged to the legacy GPipe walker and is not supported by "
+                "the true scheduled MPMD train path."
+            )
+        if fuse_1f1b or fuse_zb:
+            raise NotImplementedError(
+                "sxcall(fuse_1f1b=True/fuse_zb=True) belonged to the legacy Python schedule walker. "
+                "Use a schedule that emits fused cells directly for true scheduled MPMD."
+            )
+        if donate_activations:
+            raise NotImplementedError(
+                "sxcall(donate_activations=True) belonged to the legacy Python schedule walker. "
+                "Use donate_argnums for true scheduled MPMD input donation."
+            )
+
+        public_static = _normalize_sxcall_argnums(static_argnums, len(batch))
+        public_donate = _normalize_sxcall_argnums(donate_argnums, len(batch))
+        static_internal = (0, *(idx + 1 for idx in public_static))
+        donate_internal = tuple(idx + 1 for idx in public_donate)
+        batch_internal = tuple(idx + 1 for idx in range(len(batch)) if idx not in set(public_static))
+        scheduled_loss = _get_sxcall_scheduled_train(
+            model=model,
+            mpmd_mesh=mpmd_mesh,
+            schedule=schedule,
+            loss_fn=loss_fn,
+            static_argnums=static_internal,
+            donate_argnums=donate_internal,
+            batch_argnums=batch_internal,
+        )
+        loss, (grad_model,) = sxvalue_and_grad(scheduled_loss, argnums=(0,))(model, *batch)
+        grads_out = _split_module_grad_state_by_logical_stage(grad_model, n_logical)
+        return loss, grads_out
+
     donate_fwd = (2,) if (0 in donate_nums and mode == "forward") else ()
     donate_bwd = ()
     loss_donate = tuple(i for i in donate_nums if i > 0)
@@ -6429,11 +6994,6 @@ def sxcall(
     xs = mb_batch[0]
     target_args = mb_batch[1:]
     static_target_mask = [i in static_nums for i in range(1, len(batch))]
-
-    is_forward_only = mode == "forward"
-
-    if not is_forward_only and loss_fn is None:
-        raise ValueError("sxcall with mode='train' requires loss_fn.")
 
     if is_forward_only:
         return _forward_only_run(
@@ -6799,7 +7359,18 @@ def _forward_only_run(
         cached = _FWD_ONLY_VMAP_CACHE.get(key)
         if cached is not None:
             return cached
-        vfwd = jax.jit(jax.vmap(fwd_jits[loc], in_axes=(None, None, 0)))
+
+        def _vfwd_body(
+            params: Any,
+            rest: Any,
+            x: Any,
+            _fwd=fwd_jits[loc],
+            _scope=f"spectrax/mpmd/forward_only/vmap_rank_{loc[0]}_virt_{loc[1]}",
+        ):
+            with jax.named_scope(_scope):
+                return _fwd(params, rest, x)
+
+        vfwd = jax.jit(jax.vmap(_vfwd_body, in_axes=(None, None, 0)))
         _FWD_ONLY_VMAP_CACHE[key] = vfwd
         weak_invalidate(fwd_jits[loc], _FWD_ONLY_VMAP_CACHE, key)
         return vfwd
@@ -6900,8 +7471,30 @@ def _gpipe_run(
         cached = _GPIPE_VMAP_CACHE.get(key)
         if cached is not None:
             return cached
-        vfwd = jax.jit(jax.vmap(fwd_jits[loc], in_axes=(None, None, 0)))
-        base_vbwd = jax.vmap(bwd_jits[loc], in_axes=(None, None, 0, 0))
+
+        def _vfwd_body(
+            params: Any,
+            rest: Any,
+            x: Any,
+            _fwd=fwd_jits[loc],
+            _scope=f"spectrax/mpmd/gpipe/vmap_forward_rank_{loc[0]}_virt_{loc[1]}",
+        ):
+            with jax.named_scope(_scope):
+                return _fwd(params, rest, x)
+
+        def _vbwd_body(
+            params: Any,
+            rest: Any,
+            x: Any,
+            gy: Any,
+            _bwd=bwd_jits[loc],
+            _scope=f"spectrax/mpmd/gpipe/vmap_backward_rank_{loc[0]}_virt_{loc[1]}",
+        ):
+            with jax.named_scope(_scope):
+                return _bwd(params, rest, x, gy)
+
+        vfwd = jax.jit(jax.vmap(_vfwd_body, in_axes=(None, None, 0)))
+        base_vbwd = jax.vmap(_vbwd_body, in_axes=(None, None, 0, 0))
 
         @functools.partial(jax.jit, static_argnames=("inv_m_const",))
         def vbwd(p, r, x_stack, gy_stack, inv_m_const):
@@ -6914,13 +7507,14 @@ def _gpipe_run(
             microbatch so the next upstream stage can vmap straight on
             them.
             """
-            g_params_stack, g_x_stack = base_vbwd(p, r, x_stack, gy_stack)
-            g_params = jax.tree.map(
-                lambda a: (a.sum(axis=0) * inv_m_const).astype(a.dtype),
-                g_params_stack,
-                is_leaf=_is_leaf,
-            )
-            return g_params, g_x_stack
+            with jax.named_scope("spectrax/mpmd/gpipe/vmap_backward_reduce"):
+                g_params_stack, g_x_stack = base_vbwd(p, r, x_stack, gy_stack)
+                g_params = jax.tree.map(
+                    lambda a: (a.sum(axis=0) * inv_m_const).astype(a.dtype),
+                    g_params_stack,
+                    is_leaf=_is_leaf,
+                )
+                return g_params, g_x_stack
 
         _GPIPE_VMAP_CACHE[key] = (vfwd, vbwd)
         weak_invalidate(fwd_jits[loc], _GPIPE_VMAP_CACHE, key)
@@ -6940,8 +7534,17 @@ def _gpipe_run(
 
         base_fwd = fwd_jits[loc]
         base_bwd = bwd_jits[loc]
-        base_fwd_vmapped = jax.vmap(base_fwd, in_axes=(None, None, 0))
-        base_bwd_vmapped = jax.vmap(base_bwd, in_axes=(None, None, 0, 0))
+
+        def _terminal_fwd_body(params: Any, rest: Any, x: Any) -> Any:
+            with jax.named_scope("spectrax/mpmd/gpipe/terminal_forward"):
+                return base_fwd(params, rest, x)
+
+        def _terminal_bwd_body(params: Any, rest: Any, x: Any, gy: Any) -> Any:
+            with jax.named_scope("spectrax/mpmd/gpipe/terminal_backward"):
+                return base_bwd(params, rest, x, gy)
+
+        base_fwd_vmapped = jax.vmap(_terminal_fwd_body, in_axes=(None, None, 0))
+        base_bwd_vmapped = jax.vmap(_terminal_bwd_body, in_axes=(None, None, 0, 0))
 
         @functools.partial(jax.jit, static_argnames=("inv_m_const",))
         def fwd_loss_bwd(p, r, x_in_stack, *t_stack, inv_m_const):
@@ -6956,21 +7559,23 @@ def _gpipe_run(
             Returns:
                 ``(mean_loss, g_params, g_x_stack)``.
             """
-            y_stack = base_fwd_vmapped(p, r, x_in_stack)
+            with jax.named_scope("spectrax/mpmd/gpipe/terminal_fwd_loss_bwd"):
+                y_stack = base_fwd_vmapped(p, r, x_in_stack)
 
-            def per_mb_loss(y_, *t_):
-                """Compute ``(loss, d_loss/d_y)`` for one microbatch under vmap."""
-                return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
+                def per_mb_loss(y_, *t_):
+                    """Compute ``(loss, d_loss/d_y)`` for one microbatch under vmap."""
+                    with jax.named_scope("spectrax/mpmd/gpipe/terminal_loss"):
+                        return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
 
-            loss_stack, gy_stack = jax.vmap(per_mb_loss)(y_stack, *t_stack)
+                loss_stack, gy_stack = jax.vmap(per_mb_loss)(y_stack, *t_stack)
 
-            g_params_stack, g_x_stack = base_bwd_vmapped(p, r, x_in_stack, gy_stack)
-            g_params = jax.tree.map(
-                lambda a: (a.sum(axis=0) * inv_m_const).astype(a.dtype),
-                g_params_stack,
-                is_leaf=_is_leaf,
-            )
-            return loss_stack.mean(), g_params, g_x_stack
+                g_params_stack, g_x_stack = base_bwd_vmapped(p, r, x_in_stack, gy_stack)
+                g_params = jax.tree.map(
+                    lambda a: (a.sum(axis=0) * inv_m_const).astype(a.dtype),
+                    g_params_stack,
+                    is_leaf=_is_leaf,
+                )
+                return loss_stack.mean(), g_params, g_x_stack
 
         _GPIPE_TERM_CACHE[key] = fwd_loss_bwd
         weak_invalidate(fwd_jits[loc], _GPIPE_TERM_CACHE, key)

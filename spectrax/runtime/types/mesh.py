@@ -111,29 +111,36 @@ class MpMdMesh:
         return tuple(n for n in self.jax_mesh.axis_names if n != self.mpmd_axis_name)
 
     def submesh(self, mpmd_idx: int) -> Mesh:
-        """Return the sub-mesh for pipeline stage ``mpmd_idx``.
+        """Return the SPMD sub-mesh for pipeline stage ``mpmd_idx``.
 
-        The returned mesh keeps every axis of ``jax_mesh`` (including
-        the MPMD axis, now size 1); only the devices laid out on the
-        other axes remain. Specs meant to shard intra-stage should not
-        mention :attr:`mpmd_axis_name`.
+        The MPMD axis is dropped — pipeline stages are independent
+        programs, so within one stage there is no MPMD axis to shard
+        over. The returned mesh has rank ``len(spmd_axis_names)``
+        (i.e. one less than ``jax_mesh``) and only the devices that
+        belong to stage ``mpmd_idx``.
+
+        Specs intended to shard intra-stage should not mention the MPMD
+        axis: it is no longer present in the sub-mesh.
 
         Args:
             mpmd_idx: Which pipeline stage. Must satisfy
                 ``0 <= mpmd_idx < mpmd_dim``.
 
         Returns:
-            A :class:`~jax.sharding.Mesh` of the same rank as
-            ``jax_mesh`` but with size 1 on the MPMD axis.
+            A :class:`~jax.sharding.Mesh` over the SPMD axes of
+            ``jax_mesh``, holding only stage ``mpmd_idx``'s devices.
         """
         if not 0 <= mpmd_idx < self.mpmd_dim:
             raise IndexError(f"mpmd_idx {mpmd_idx} out of range [0, {self.mpmd_dim}).")
         devices = np.take(
             self.jax_mesh.devices,
-            indices=[mpmd_idx],
+            indices=mpmd_idx,
             axis=self.mpmd_axis,
         )
-        return Mesh(devices, self.jax_mesh.axis_names)
+        spmd_axis_types = tuple(
+            t for n, t in zip(self.jax_mesh.axis_names, self.jax_mesh.axis_types, strict=False) if n != self.mpmd_axis_name
+        )
+        return Mesh(devices, self.spmd_axis_names, axis_types=spmd_axis_types)
 
     def unstack(self) -> list[Mesh]:
         """Return one :class:`~jax.sharding.Mesh` per pipeline stage."""

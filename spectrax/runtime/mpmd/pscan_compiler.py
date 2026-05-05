@@ -35,13 +35,18 @@ the final model-shaped gradient pytree from the captured module consts.
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.extend.core import Jaxpr, JaxprEqn, Var
+from jax._src import compilation_cache as _jax_compilation_cache
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Var
+from jax.sharding import Mesh, NamedSharding
 
 from ...core.graph import export, live_variables
 from ...core.module import Module
@@ -93,6 +98,198 @@ def _eqn_params(eqn: JaxprEqn) -> dict[str, Any]:
         exists, which should not happen with supported JAX versions).
     """
     return getattr(eqn, "params", getattr(eqn, "parameters", {}))
+
+
+_persistent_cache_scope_lock = threading.RLock()
+
+
+def _reset_jax_persistent_cache_state() -> None:
+    """Reset JAX's in-process persistent-cache handle without touching files.
+
+    ``jax._src.compilation_cache.reset_cache`` logs at INFO every time it
+    runs. The stage guard may enter many times while building a schedule, so
+    we reset the same private state quietly instead.
+    """
+    _jax_compilation_cache._cache = None  # pyright: ignore[reportPrivateUsage]
+    with _jax_compilation_cache._cache_initialized_mutex:  # pyright: ignore[reportPrivateUsage]
+        _jax_compilation_cache._cache_initialized = False  # pyright: ignore[reportPrivateUsage]
+        _jax_compilation_cache._cache_checked = False  # pyright: ignore[reportPrivateUsage]
+        _jax_compilation_cache._cache_used = False  # pyright: ignore[reportPrivateUsage]
+
+
+class _ScopedPersistentCacheJit:
+    """Callable wrapper that bypasses JAX's persistent disk cache on first compile.
+
+    JAX's persistent compilation cache is process-global. There is no public
+    ``jax.jit`` option that says "do not persist this one executable", so the
+    first call temporarily disables the persistent cache and lets JAX compile
+    normally. Schedule-stage wrappers are built per traced plan/shape, so once
+    that first call succeeds the wrapped ``jax.jit`` object's in-process
+    executable cache is hot and later calls run at normal dispatch speed.
+    """
+
+    def __init__(self, jitted: Callable[..., Any]) -> None:
+        self._jitted = jitted
+        self._compiled_once = False
+        functools.update_wrapper(self, jitted)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self._compiled_once:
+            return self._jitted(*args, **kwargs)
+
+        with _persistent_cache_scope_lock:
+            if self._compiled_once:
+                return self._jitted(*args, **kwargs)
+            was_enabled = bool(jax.config.jax_enable_compilation_cache)
+            if not was_enabled:
+                result = self._jitted(*args, **kwargs)
+                self._compiled_once = True
+                return result
+            jax.config.update("jax_enable_compilation_cache", False)
+            _reset_jax_persistent_cache_state()
+            try:
+                result = self._jitted(*args, **kwargs)
+                self._compiled_once = True
+                return result
+            finally:
+                jax.config.update("jax_enable_compilation_cache", was_enabled)
+                _reset_jax_persistent_cache_state()
+
+    def lower(self, *args: Any, **kwargs: Any) -> Any:
+        with _persistent_cache_scope_lock:
+            was_enabled = bool(jax.config.jax_enable_compilation_cache)
+            if not was_enabled:
+                return self._jitted.lower(*args, **kwargs)
+            jax.config.update("jax_enable_compilation_cache", False)
+            _reset_jax_persistent_cache_state()
+            try:
+                return self._jitted.lower(*args, **kwargs)
+            finally:
+                jax.config.update("jax_enable_compilation_cache", was_enabled)
+                _reset_jax_persistent_cache_state()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._jitted, name)
+
+
+def _rebase_concrete_mesh(orig_mesh: Any, target_stage_mesh: Mesh) -> Any:
+    """Place ``orig_mesh``'s axis layout onto ``target_stage_mesh``'s devices.
+
+    Cluster jaxprs are traced once on rank 0's stage submesh. When another
+    rank compiles the same cluster, every closed-over concrete ``Mesh`` still
+    references rank-0 devices, which trips XLA's enhanced-barrier check
+    (E0200) because the per-rank executable then refers to devices it does
+    not own. We rebuild each concrete mesh in place: same axis names, same
+    axis types, same per-axis sizes, but reshaped from the current rank's
+    devices.
+
+    Abstract structure must be preserved: the inner ``shard_map`` body was
+    typed at trace time against ``orig_mesh.abstract_mesh``. Changing the
+    abstract structure here would invalidate every aval inside that body and
+    break the JAX 0.10 context/aval mesh check.
+
+    If ``orig_mesh`` lists axes not present in ``target_stage_mesh`` (or the
+    sizes do not multiply out to the target's device count), we leave the
+    mesh untouched — a wrong rebase is worse than the conservative no-op.
+    """
+    if not isinstance(orig_mesh, Mesh):
+        return orig_mesh
+    target_axis_names = tuple(target_stage_mesh.axis_names)
+    target_shape = dict(target_stage_mesh.shape)
+    target_devices = target_stage_mesh.devices
+    orig_axis_names = tuple(orig_mesh.axis_names)
+    orig_shape = dict(orig_mesh.shape)
+
+    expected_total = 1
+    for n in orig_axis_names:
+        expected_total *= int(orig_shape.get(n, 1))
+    if expected_total != int(target_devices.size):
+        return orig_mesh
+
+    if orig_axis_names == target_axis_names and orig_shape == target_shape:
+        new_devices = target_devices
+    else:
+        # Validate: every orig axis either appears in target with the same size,
+        # or target has an extra axis that we drop (only safe if it's size 1).
+        for n in orig_axis_names:
+            if n in target_shape and target_shape[n] != orig_shape[n]:
+                return orig_mesh
+        for n in target_axis_names:
+            if n not in orig_shape and target_shape[n] != 1:
+                return orig_mesh
+        flat = target_devices.reshape(-1)
+        new_shape = tuple[int, ...](int(orig_shape[n]) for n in orig_axis_names)
+        new_devices = flat.reshape(new_shape) if new_shape else flat
+
+    return Mesh(new_devices, orig_axis_names, axis_types=orig_mesh.axis_types)
+
+
+def _rebase_named_sharding(sharding: NamedSharding, target_stage_mesh: Mesh) -> NamedSharding:
+    """Swap the concrete devices of a ``NamedSharding``'s mesh.
+
+    Abstract-mesh shardings are returned unchanged: they carry no devices
+    and JAX 0.10 forbids replacing them with concrete meshes inside avals.
+    """
+    if not isinstance(sharding, NamedSharding):
+        return sharding
+    if not isinstance(sharding.mesh, Mesh):
+        return sharding
+    new_mesh = _rebase_concrete_mesh(sharding.mesh, target_stage_mesh)
+    if new_mesh is sharding.mesh:
+        return sharding
+    rebased = NamedSharding(new_mesh, sharding.spec)
+    memory_kind = getattr(sharding, "memory_kind", None)
+    if memory_kind is not None:
+        try:
+            rebased = rebased.with_memory_kind(memory_kind)
+        except Exception:
+            pass
+    return rebased
+
+
+def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: Any) -> Jaxpr:
+    """Rebind concrete devices in nested mesh params to the current rank.
+
+    Cluster jaxprs are traced once and then evaluated inside per-rank
+    ``jax.jit`` programs. Concrete ``Mesh`` objects closed over during the
+    trace (in ``shard_map`` ``mesh`` params, ``NamedSharding`` shardings on
+    pjit primitives, etc.) still reference the trace-time rank's devices,
+    which can trip XLA's enhanced-barrier validation when another rank runs
+    the same executable.
+
+    We walk the jaxpr and swap only the device assignment of every concrete
+    ``Mesh`` we see — axis names, axis types, and per-axis sizes are
+    preserved. That keeps the jaxpr's nested abstract-mesh structure intact,
+    which JAX 0.10 requires for context-vs-aval mesh checks inside
+    ``shard_map`` bodies. ``AbstractMesh``-backed shardings (the form JAX 0.10
+    uses for aval shardings) are left alone — they describe structure, not
+    placement.
+    """
+    if not isinstance(stage_mesh, Mesh):
+        return jaxpr
+
+    def rebase_value(value: Any) -> Any:
+        if isinstance(value, ClosedJaxpr):
+            return ClosedJaxpr(_rebase_jaxpr_mesh_params(value.jaxpr, stage_mesh), value.consts)
+        if isinstance(value, Jaxpr):
+            return _rebase_jaxpr_mesh_params(value, stage_mesh)
+        if isinstance(value, Mesh):
+            return _rebase_concrete_mesh(value, stage_mesh)
+        if isinstance(value, NamedSharding):
+            return _rebase_named_sharding(value, stage_mesh)
+        if type(value) is tuple:
+            return tuple[Any, ...](rebase_value(item) for item in value)
+        if type(value) is list:
+            return [rebase_value(item) for item in value]
+        if type(value) is dict:
+            return {key: rebase_value(item) for key, item in value.items()}
+        return value
+
+    new_eqns: list[JaxprEqn] = []
+    for eqn in jaxpr.eqns:
+        params = {key: rebase_value(value) for key, value in _eqn_params(eqn).items()}
+        new_eqns.append(eqn.replace(params=params))
+    return jaxpr.replace(eqns=new_eqns)
 
 
 @dataclass
@@ -212,13 +409,116 @@ def _place_cluster_consts(
     return tuple(placed)
 
 
-def _make_fwd_jit(cluster_jaxpr: Jaxpr, donate_argnums: tuple[int, ...] = ()) -> Callable[..., tuple[Any, ...]]:
+def _stage_compile_tag(stage_mesh: Any) -> int:
+    """Return a per-rank tag that distinguishes stage compiles in the XLA cache.
+
+    Two stages on different ranks produce structurally identical cluster
+    jaxprs after rebase — the only thing that differs is the concrete
+    device set in the ``shard_map`` mesh. JAX's pjit cache hashes input
+    avals (abstract structure) but not concrete devices, so without a
+    rank-specific marker the same compiled XLA executable is reused
+    across ranks. That is unsafe when the executable carries a
+    cross-rank collective with a hardcoded device assignment — TPU's
+    enhanced-barrier validation halts on the second invocation
+    (E0200 ``enhanced-barrier-parent-phase-1 no HLO mapping``).
+
+    We derive the tag from the smallest device id in the stage mesh,
+    which is unique per pipeline rank and stable across re-builds.
+    """
+    if not isinstance(stage_mesh, Mesh):
+        return 0
+    return int(min(d.id for d in stage_mesh.devices.flatten()))
+
+
+def _mesh_fingerprint(mesh: Mesh) -> tuple[Any, ...]:
+    """Return a stable fingerprint for a concrete mesh embedded in a stage jaxpr.
+
+    The persistent XLA cache key normally sees StableHLO plus compile options,
+    but MPMD stage jaxprs can contain nested ``shard_map`` meshes whose device
+    placement is semantically important while their abstract structure is
+    identical. Folding the concrete device placement into the generated Python
+    function name gives the persistent cache a distinct module prefix for each
+    real stage/expert layout.
+    """
+    devices = tuple(
+        (
+            int(getattr(device, "id", -1)),
+            int(getattr(device, "process_index", -1)),
+            tuple(getattr(device, "coords", ())),
+            int(getattr(device, "core_on_chip", -1)),
+        )
+        for device in mesh.devices.flatten()
+    )
+    shape = tuple((str(axis), int(mesh.shape[axis])) for axis in mesh.axis_names)
+    axis_types = tuple(str(axis_type) for axis_type in mesh.axis_types)
+    return (tuple(map(str, mesh.axis_names)), shape, axis_types, devices)
+
+
+def _collect_mesh_fingerprints(value: Any, out: list[tuple[Any, ...]]) -> None:
+    """Append fingerprints for every concrete mesh reachable from ``value``."""
+    if isinstance(value, ClosedJaxpr):
+        _collect_mesh_fingerprints(value.jaxpr, out)
+        return
+    if isinstance(value, Jaxpr):
+        for eqn in value.eqns:
+            _collect_mesh_fingerprints(_eqn_params(eqn), out)
+        return
+    if isinstance(value, Mesh):
+        out.append(_mesh_fingerprint(value))
+        return
+    if isinstance(value, NamedSharding):
+        _collect_mesh_fingerprints(value.mesh, out)
+        out.append(("named-sharding-spec", repr(value.spec)))
+        return
+    if isinstance(value, tuple | list):
+        for item in value:
+            _collect_mesh_fingerprints(item, out)
+        return
+    if isinstance(value, dict):
+        for key in sorted(value, key=str):
+            _collect_mesh_fingerprints(value[key], out)
+
+
+def _stage_jit_name_suffix(cluster_jaxpr: Jaxpr, stage_mesh: Any) -> str:
+    """Build a cache-visible suffix for one concrete MPMD stage executable."""
+    parts: list[tuple[Any, ...]] = []
+    if isinstance(stage_mesh, Mesh):
+        parts.append(("stage", _mesh_fingerprint(stage_mesh)))
+    _collect_mesh_fingerprints(cluster_jaxpr, parts)
+    digest = hashlib.sha256(repr(tuple(parts)).encode("utf-8")).hexdigest()[:16]
+    return f"rank{_stage_compile_tag(stage_mesh)}_{digest}"
+
+
+def _scope_stage_persistent_cache(jitted: Callable[..., Any]) -> Callable[..., Any]:
+    """Disable persistent disk caching for Spectrax schedule-stage executables only.
+
+    The MPMD scheduler creates per-stage programs by evaluating split jaxprs
+    that can close over rebased ``shard_map`` / mesh metadata. These programs
+    are valid to compile and to keep in JAX's in-process executable cache, but
+    TPU persistent-cache deserialization can revive them with stale collective
+    barrier metadata on a later process run. Scope the persistent-cache guard
+    to these stage executables instead of changing global EasyDeL/eJKernel
+    caching behavior.
+    """
+    return _ScopedPersistentCacheJit(jitted)
+
+
+def _make_fwd_jit(
+    cluster_jaxpr: Jaxpr,
+    donate_argnums: tuple[int, ...] = (),
+    stage_mesh: Any | None = None,
+) -> Callable[..., tuple[Any, ...]]:
     """Return ``@jax.jit`` callable ``(consts, *invars) -> outvars`` for a non-terminal cluster.
 
     Consts are passed as an explicit first argument (not closure-captured)
     so the dispatcher can route placed constants uniformly and so the
     backward VJP can differentiate w.r.t. them.
     """
+
+    if stage_mesh is not None:
+        cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
+
+    cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
 
     def fwd(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, ...]:
         """Evaluate the cluster sub-jaxpr with an explicit const tuple.
@@ -235,9 +535,11 @@ def _make_fwd_jit(cluster_jaxpr: Jaxpr, donate_argnums: tuple[int, ...] = ()) ->
         with jax.named_scope("spectrax/mpmd/schedule/stage_forward"):
             return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
 
+    fwd.__qualname__ = f"{fwd.__qualname__}_{cache_tag}"
+    fwd.__name__ = f"{fwd.__name__}_{cache_tag}"
     if donate_argnums:
-        return jax.jit(fwd, donate_argnums=donate_argnums)
-    return jax.jit(fwd)
+        return _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums))
+    return _scope_stage_persistent_cache(jax.jit(fwd))
 
 
 def _make_bwd_jit(
@@ -245,6 +547,7 @@ def _make_bwd_jit(
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
     out_shardings: Any | None = None,
+    stage_mesh: Any | None = None,
 ) -> Callable[..., tuple[Any, tuple[Any, ...]]]:
     """Return ``@jax.jit`` VJP callable for a non-terminal cluster.
 
@@ -253,6 +556,9 @@ def _make_bwd_jit(
     outputs so BWD_I (discards ``g_consts``) and BWD_W (discards
     ``g_invars``) each take ~half the cost of a full BWD.
     """
+
+    if stage_mesh is not None:
+        cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
     def bwd(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, tuple[Any, ...]]:
         """Run ``jax.vjp`` on the cluster and return ``(g_consts, g_invars)``.
@@ -292,7 +598,10 @@ def _make_bwd_jit(
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
         jit_kwargs["out_shardings"] = out_shardings
-    return jax.jit(bwd, **jit_kwargs)
+    cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
+    bwd.__qualname__ = f"{bwd.__qualname__}_{cache_tag}"
+    bwd.__name__ = f"{bwd.__name__}_{cache_tag}"
+    return _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs))
 
 
 def _make_bwd_i_jit(
@@ -300,6 +609,7 @@ def _make_bwd_i_jit(
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
     out_shardings: Any | None = None,
+    stage_mesh: Any | None = None,
 ) -> Callable[..., tuple[Any, ...]]:
     """Return a ``@jax.jit`` VJP callable that yields only input cotangents.
 
@@ -308,6 +618,9 @@ def _make_bwd_i_jit(
     soon as input grads are ready while deferring the costlier
     weight-grad computation into pipeline bubble slots.
     """
+
+    if stage_mesh is not None:
+        cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
     def bwd_i(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, ...]:
         """Compute ``grad(invars)`` only, dropping the const grads.
@@ -342,7 +655,10 @@ def _make_bwd_i_jit(
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
         jit_kwargs["out_shardings"] = out_shardings
-    return jax.jit(bwd_i, **jit_kwargs)
+    cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
+    bwd_i.__qualname__ = f"{bwd_i.__qualname__}_{cache_tag}"
+    bwd_i.__name__ = f"{bwd_i.__name__}_{cache_tag}"
+    return _scope_stage_persistent_cache(jax.jit(bwd_i, **jit_kwargs))
 
 
 def _make_bwd_w_jit(
@@ -350,8 +666,12 @@ def _make_bwd_w_jit(
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
     out_shardings: Any | None = None,
+    stage_mesh: Any | None = None,
 ) -> Callable[..., Any]:
     """Return ``@jax.jit`` VJP callable for weight/const gradients only."""
+
+    if stage_mesh is not None:
+        cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
     def bwd_w(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> Any:
         """Compute ``grad(consts)`` only, dropping invar cotangents.
@@ -387,7 +707,10 @@ def _make_bwd_w_jit(
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
         jit_kwargs["out_shardings"] = out_shardings
-    return jax.jit(bwd_w, **jit_kwargs)
+    cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
+    bwd_w.__qualname__ = f"{bwd_w.__qualname__}_{cache_tag}"
+    bwd_w.__name__ = f"{bwd_w.__name__}_{cache_tag}"
+    return _scope_stage_persistent_cache(jax.jit(bwd_w, **jit_kwargs))
 
 
 def _make_terminal_jit(
@@ -395,6 +718,7 @@ def _make_terminal_jit(
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
     out_shardings: Any | None = None,
+    stage_mesh: Any | None = None,
 ) -> Callable[..., Any]:
     """Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
 
@@ -404,6 +728,9 @@ def _make_terminal_jit(
     :func:`jax.value_and_grad` supplies the initial cotangent of
     ``1.0`` automatically so we don't have to thread it from outside.
     """
+
+    if stage_mesh is not None:
+        cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
     def term(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, tuple[Any, tuple[Any, ...]]]:
         """Compute the loss and its gradients w.r.t. ``(consts, *invars)`` in one jit.
@@ -448,7 +775,10 @@ def _make_terminal_jit(
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
         jit_kwargs["out_shardings"] = out_shardings
-    return jax.jit(term, **jit_kwargs)
+    cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
+    term.__qualname__ = f"{term.__qualname__}_{cache_tag}"
+    term.__name__ = f"{term.__name__}_{cache_tag}"
+    return _scope_stage_persistent_cache(jax.jit(term, **jit_kwargs))
 
 
 def _build_logical_locs(
@@ -1141,13 +1471,14 @@ def build_pscan_plan(
         )
         const_indices_per_loc[loc] = const_indices
         n_invars_per_loc[loc] = n_invars
-        fwd_jits[loc] = _make_fwd_jit(filtered_cluster)
+        stage_mesh = rank_submeshes[rank]
+        fwd_jits[loc] = _make_fwd_jit(filtered_cluster, stage_mesh=stage_mesh)
 
         if loc != terminal_loc:
-            bwd_jits[loc] = _make_bwd_jit(filtered_cluster, n_invars)
+            bwd_jits[loc] = _make_bwd_jit(filtered_cluster, n_invars, stage_mesh=stage_mesh)
         else:
             bwd_jits[loc] = None
-            terminal_jit = _make_terminal_jit(filtered_cluster, n_invars)
+            terminal_jit = _make_terminal_jit(filtered_cluster, n_invars, stage_mesh=stage_mesh)
 
     assert terminal_jit is not None
 

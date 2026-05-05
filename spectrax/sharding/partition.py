@@ -556,15 +556,18 @@ def _stage_mesh_from_existing_sharding(
 ) -> "Mesh | None":
     """Recover the stage-local mesh from ``arr.sharding`` when possible.
 
-    If the array is already living on a sub-mesh of the MPMD mesh
-    (same axis names, MPMD axis size 1), return that sub-mesh so a
-    follow-up constraint can target the same stage. Otherwise return
-    ``None``.
+    If the array is already living on a sub-mesh of the MPMD mesh, return
+    that sub-mesh so a follow-up constraint can target the same stage.
+    Modern stage meshes drop the MPMD axis; legacy traces may still carry
+    the full axis list with the MPMD axis at size one, so both forms are
+    accepted.
     """
     existing = getattr(arr, "sharding", None)
     if not isinstance(existing, NamedSharding):
         return None
     mesh = existing.mesh
+    if mesh.axis_names == mpmd_mesh.spmd_axis_names:
+        return mesh
     if mesh.axis_names != mpmd_mesh.jax_mesh.axis_names:
         return None
     try:
@@ -579,12 +582,16 @@ def _stage_mesh_from_current_context(mpmd_mesh: "MpMdMesh") -> "Mesh | None":
     """Recover the stage-local mesh from the active JAX mesh context.
 
     Mirrors :func:`_stage_mesh_from_existing_sharding` but reads from
-    ``jax.interpreters.pxla.thread_resources`` instead of the array's
-    own sharding. Used as a secondary fallback in
-    :func:`_resolve_constraint_target`.
+    ``jax.interpreters.pxla.thread_resources`` instead of the array's own
+    sharding. Both MPMD-axis-free stage meshes and legacy size-one MPMD-axis
+    meshes are accepted.
     """
     mesh = _physical_mesh_or_none()
-    if mesh is None or mesh.axis_names != mpmd_mesh.jax_mesh.axis_names:
+    if mesh is None:
+        return None
+    if mesh.axis_names == mpmd_mesh.spmd_axis_names:
+        return mesh
+    if mesh.axis_names != mpmd_mesh.jax_mesh.axis_names:
         return None
     try:
         if int(mesh.shape[mpmd_mesh.mpmd_axis_name]) == 1:

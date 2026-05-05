@@ -1609,7 +1609,12 @@ def _build_schedule_plan(
         n_invars_per_loc[stage_key] = n_invars
         cluster_jaxprs_per_loc[stage_key] = filtered_cluster
         donate_positions = tuple(1 + pos for pos in sorted(donate_invars_per_logical[logical]))
-        fwd_jits[stage_key] = _make_fwd_jit(filtered_cluster, donate_argnums=donate_positions)
+        stage_mesh = rank_submeshes[_rank]
+        fwd_jits[stage_key] = _make_fwd_jit(
+            filtered_cluster,
+            donate_argnums=donate_positions,
+            stage_mesh=stage_mesh,
+        )
         bwd_out_shardings = _bwd_out_shardings_for(logical, loc, placed_consts)
 
         if logical != terminal_logical:
@@ -1618,18 +1623,21 @@ def _build_schedule_plan(
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings,
+                stage_mesh=stage_mesh,
             )
             bwd_i_jits[stage_key] = _make_bwd_i_jit(
                 filtered_cluster,
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings[1],
+                stage_mesh=stage_mesh,
             )
             bwd_w_jits[stage_key] = _make_bwd_w_jit(
                 filtered_cluster,
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings[0],
+                stage_mesh=stage_mesh,
             )
         else:
             bwd_jits[stage_key] = None
@@ -1640,6 +1648,7 @@ def _build_schedule_plan(
                 n_invars,
                 donate_argnums=donate_positions,
                 out_shardings=_terminal_out_shardings_for(logical, loc, placed_consts),
+                stage_mesh=stage_mesh,
             )
 
     assert terminal_jit is not None
@@ -1862,7 +1871,6 @@ def _dispatch_gpipe_fwd(
     loc_for_logical = plan["loc_for_logical"]
     invar_sources = plan["invar_sources"]
     fwd_jits = plan["fwd_jits"]
-    terminal_jit = plan["terminal_jit"]
     terminal_logical = plan.get("terminal_logical", n_logical - 1)
     rank_submeshes = plan["rank_submeshes"]
     stage_shardings = plan["stage_shardings"]
@@ -1893,7 +1901,7 @@ def _dispatch_gpipe_fwd(
 
     saved_inputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
     saved_outputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    loss_acc = jnp.asarray(0.0)
+    loss_acc: jax.Array | None = None
 
     for mb in range(m):
         for logical in range(n_logical):
@@ -1940,8 +1948,14 @@ def _dispatch_gpipe_fwd(
 
             with submesh:
                 if logical == terminal_logical:
-                    loss, _ = terminal_jit(consts, *invars)
-                    loss_acc = loss_acc + loss
+                    terminal_out = fwd_jits[stage_key](consts, *invars)
+                    if len(terminal_out) != 1:
+                        raise ValueError(
+                            f"Terminal forward cluster must produce exactly one scalar loss; "
+                            f"got {len(terminal_out)} outputs."
+                        )
+                    loss = terminal_out[0]
+                    loss_acc = loss if loss_acc is None else loss_acc + loss
                 else:
                     out = fwd_jits[stage_key](consts, *invars)
 
@@ -1950,6 +1964,8 @@ def _dispatch_gpipe_fwd(
             if logical != terminal_logical:
                 saved_outputs[key] = out
 
+    if loss_acc is None:
+        raise ValueError("sxjit schedule forward did not execute a terminal loss stage.")
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     return mean_loss, {
         "saved_inputs": saved_inputs,
@@ -4571,6 +4587,16 @@ def sxjit(
             _state["out_shardings"] = out_shardings
             return _state
 
+        # The schedule dispatcher reuses one ``jax.jit``-compiled per-stage
+        # XLA executable per call. Successive in-process invocations share
+        # those executables, and on TPU some collective barriers are tied to
+        # an executable's invocation phase. Letting two calls overlap
+        # in-flight trips enhanced-barrier validation
+        # (E0200 ``enhanced-barrier-parent-phase-1``). We serialize at the
+        # call boundary by blocking on the previous result before launching
+        # the next call. This is correctness, not just diagnostics.
+        _previous_schedule_result: dict[str, Any] = {"value": None}
+
         def wrapped(*args, **kwargs):
             """The user-visible callable returned by :func:`sxjit`.
 
@@ -4585,8 +4611,20 @@ def sxjit(
             _prepare_mpmd_state(*args, **kwargs)
 
             if "schedule_plan" in _state:
+                previous = _previous_schedule_result.get("value")
+                if previous is not None:
+                    try:
+                        jax.block_until_ready(previous)
+                    except Exception:
+                        # The earlier dispatch may have raised before its
+                        # result was materialized; clearing the slot keeps
+                        # the next call from re-raising the stale error.
+                        pass
+                    _previous_schedule_result["value"] = None
                 plan = _state["schedule_plan"]
-                return _schedule_forward(plan, *args)
+                result = _schedule_forward(plan, *args)
+                _previous_schedule_result["value"] = result
+                return result
 
             if "pscan_plan" in _state:
                 results = dispatch_pscan(_state["pscan_plan"])

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -38,11 +37,11 @@ from ..schedules import Schedule
 
 __all__ = ["spmd_run"]
 
-_COMPILE_CACHE: dict[Any, Callable[..., Any]] = {}
+_COMPILE_CACHE: dict[object, Callable[..., object]] = {}
 _StageSignature = tuple[tuple[str, str, int, tuple[int, ...], str], ...]
 
-_STAGE_EXTRACT_CACHE: dict[int, tuple[_StageSignature, Any, State, State]] = {}
-_PLACED_CACHE: dict[Any, tuple[State, State]] = {}
+_STAGE_EXTRACT_CACHE: dict[int, tuple[_StageSignature, object, State, State]] = {}
+_PLACED_CACHE: dict[object, tuple[State, State]] = {}
 
 
 def _microbatch(x: jax.Array, m: int) -> jax.Array:
@@ -64,7 +63,7 @@ def _microbatch(x: jax.Array, m: int) -> jax.Array:
     return x.reshape(m, b // m, *x.shape[1:])
 
 
-def _is_leaf(x: Any) -> bool:
+def _is_leaf(x: object) -> bool:
     """Pytree leaf predicate: stop traversal at JAX arrays and :class:`Variable` s.
 
     Used to keep :func:`jax.tree.map` from descending into a
@@ -72,7 +71,7 @@ def _is_leaf(x: Any) -> bool:
     its raw array) when the runtime needs to slice the array directly.
 
     Args:
-        x: Any pytree node.
+        x: object pytree node.
 
     Returns:
         ``True`` if ``x`` should be treated as a leaf.
@@ -80,7 +79,7 @@ def _is_leaf(x: Any) -> bool:
     return isinstance(x, jax.Array | Variable)
 
 
-def _extract_stages(container: PipelineSequential) -> tuple[Any, tuple[State, ...]]:
+def _extract_stages(container: PipelineSequential) -> tuple[object, tuple[State, ...]]:
     """Export every stage in ``container`` and assert :class:`GraphDef` homogeneity.
 
     The SPMD pipeline runtime requires all stages to share the same
@@ -133,7 +132,7 @@ def _stack_states(states: tuple[State, ...]) -> State:
         A single :class:`State` whose leaves are stacked across the
         stage axis.
     """
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, dict[str, object]] = {}
     first_items = tuple(states[0].items())
     for c, p, _ in first_items:
         out.setdefault(c, {})[p] = jnp.stack([s.get(c, p) for s in states], axis=0)
@@ -161,7 +160,7 @@ def _unstack_state(stacked: State, n: int) -> tuple[State, ...]:
     """
     raw = stacked.raw()
     paths: list[tuple[str, str]] = []
-    leaves: list[Any] = []
+    leaves: list[object] = []
     for c, d in raw.items():
         for p, v in d.items():
             paths.append((c, p))
@@ -169,7 +168,7 @@ def _unstack_state(stacked: State, n: int) -> tuple[State, ...]:
     if not leaves:
         return tuple(State({c: {} for c in raw}) for _ in range(n))
     sliced = _unstack_leaves_jit(tuple(leaves), n)
-    out: list[dict[str, dict[str, Any]]] = [{c: {} for c in raw} for _ in range(n)]
+    out: list[dict[str, dict[str, object]]] = [{c: {} for c in raw} for _ in range(n)]
     for i in range(n):
         for (c, p), v in zip(paths, sliced[i], strict=True):
             out[i][c][p] = v
@@ -196,8 +195,8 @@ def _split_params_rest(state: State) -> tuple[State, State]:
         else.
     """
     raw = state.raw()
-    params_raw: dict[str, dict[str, Any]] = {}
-    rest_raw: dict[str, dict[str, Any]] = {}
+    params_raw: dict[str, dict[str, object]] = {}
+    rest_raw: dict[str, dict[str, object]] = {}
     for c, d in raw.items():
         (params_raw if c == "parameters" else rest_raw)[c] = dict(d)
     return State(params_raw), State(rest_raw)
@@ -205,7 +204,7 @@ def _split_params_rest(state: State) -> tuple[State, State]:
 
 def spmd_run(
     model: PipelineSequential,
-    batch: tuple[Any, ...],
+    batch: tuple[object, ...],
     *,
     mesh: Mesh,
     axis: str,
@@ -280,7 +279,7 @@ def spmd_run(
 
 def _extract_and_stack(
     container: PipelineSequential,
-) -> tuple[Any, _StageSignature, State, State]:
+) -> tuple[object, _StageSignature, State, State]:
     """Return the cached ``(gdef, stacked_params, stacked_rest)`` for ``container``.
 
     The first call walks every stage, exports their state, and stacks
@@ -338,11 +337,11 @@ def _stage_state_signature(states: tuple[State, ...]) -> _StageSignature:
 
 def _get_cached_spmd_step(
     *,
-    gdef: Any,
+    gdef: object,
     n_stages: int,
     microbatches: int,
     loss_fn: Callable[..., jax.Array],
-) -> Callable[..., Any]:
+) -> Callable[..., object]:
     """Return the jitted step fn for this config, building + caching if needed.
 
     The cache is keyed on ``(gdef, n_stages, microbatches, id(loss_fn))``.
@@ -366,11 +365,11 @@ def _get_cached_spmd_step(
 
 def _build_spmd_step(
     *,
-    gdef: Any,
+    gdef: object,
     n_stages: int,
     microbatches: int,
     loss_fn: Callable[..., jax.Array],
-) -> Callable[..., Any]:
+) -> Callable[..., object]:
     """Build a jitted step function: ``(stacked_params, stacked_rest, *mb_batch) -> (loss, stacked_grads)``.
 
     The step traces a straight-line computation:

@@ -42,7 +42,7 @@ def test_mpmd_mesh_2d_pp_first():
     subs = mm.unstack()
     assert len(subs) == 2
     for sub in subs:
-        assert dict(sub.shape) == {"pp": 1, "dp": 2}
+        assert dict(sub.shape) == {"dp": 2}
 
 
 def test_mpmd_mesh_2d_pp_second():
@@ -77,7 +77,7 @@ def test_sub_sharding_replicated():
     mm = MpMdMesh(Mesh(np.array(d).reshape(2, 2), ("pp", "dp")), "pp")
     sh = mm.sub_sharding(0)
     assert isinstance(sh, NamedSharding)
-    assert dict(sh.mesh.shape) == {"pp": 1, "dp": 2}
+    assert dict(sh.mesh.shape) == {"dp": 2}
     assert sh.spec == PartitionSpec()
 
 

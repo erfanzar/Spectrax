@@ -19,12 +19,11 @@ anchor dies — before any new object can claim the freed id.
 from __future__ import annotations
 
 import weakref
-from typing import Any
 
 __all__ = ["weak_invalidate"]
 
 
-def weak_invalidate(anchor: Any, cache: dict[Any, Any], key: Any) -> None:
+def weak_invalidate(anchor: object, cache: dict[object, object], key: object) -> None:
     """Register a GC callback that pops ``cache[key]`` when ``anchor`` is collected.
 
     No-op for anchors that cannot be weak-referenced (e.g. tuples of

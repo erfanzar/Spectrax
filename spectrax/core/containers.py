@@ -16,7 +16,7 @@ from __future__ import annotations
 import types
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, is_dataclass
-from typing import Any, ClassVar, TypeVar, overload
+from typing import ClassVar, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
@@ -124,14 +124,14 @@ def _scan_graph_signature(gdef: GraphDef) -> GraphDef:
     )
 
 
-def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[Any, ...]:
+def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[object, ...]:
     """Return the state/child topology used to decide scan compatibility.
 
     Static values and opaque object identities are intentionally excluded.
     ``ModuleList.scan`` preserves those values by binding each layer with its
     own graph definition inside a ``lax.switch`` branch.
     """
-    nodes: list[Any] = []
+    nodes: list[object] = []
     for node in gdef.nodes:
         if isinstance(node, ModuleNode):
             nodes.append(
@@ -158,7 +158,7 @@ def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[Any, ...]:
     )
 
 
-def _scan_normalize_value(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> Any:
+def _scan_normalize_value(value: object, *, _depth: int = 0, _seen: set[int] | None = None) -> object:
     """Normalize static/opaque values for scan template compatibility checks."""
     if _seen is None:
         _seen = set()
@@ -305,7 +305,7 @@ def _scan_class_field_names(class_name: str, attr_name: str) -> frozenset[str]:
     return frozenset(names or ())
 
 
-def _scan_static_field_key(node: ModuleNode, name: str, value: Any) -> Any:
+def _scan_static_field_key(node: ModuleNode, name: str, value: object) -> object:
     """Return the graph-family key payload for a static field."""
     safe_fields = _scan_class_field_names(node.class_name, "_spx_scan_safe_static_fields")
     if name in safe_fields:
@@ -313,7 +313,7 @@ def _scan_static_field_key(node: ModuleNode, name: str, value: Any) -> Any:
     return repr(_scan_normalize_value(value))
 
 
-def _scan_opaque_field_key(node: ModuleNode, name: str, value: Any) -> Any:
+def _scan_opaque_field_key(node: ModuleNode, name: str, value: object) -> object:
     """Return the graph-family key payload for an opaque field."""
     safe_fields = _scan_class_field_names(node.class_name, "_spx_scan_safe_opaque_fields")
     if name in safe_fields:
@@ -321,14 +321,14 @@ def _scan_opaque_field_key(node: ModuleNode, name: str, value: Any) -> Any:
     return repr(_scan_normalize_value(value))
 
 
-def _scan_graph_family_key(gdef: GraphDef) -> tuple[Any, ...]:
+def _scan_graph_family_key(gdef: GraphDef) -> tuple[object, ...]:
     """Return a scan graph-family key.
 
     Equal keys mean the graph definitions can share one scan body template.
     Differing behavior-changing statics intentionally produce different keys;
     statics explicitly marked safe by the module class are ignored.
     """
-    nodes: list[Any] = []
+    nodes: list[object] = []
     for node in gdef.nodes:
         if isinstance(node, ModuleNode):
             nodes.append(
@@ -366,7 +366,7 @@ def _stack_states(states: list[State], *, context: str) -> State:
         ) from exc
 
 
-def _stage_place_trace_carry(layer: Module, carry: Any) -> Any:
+def _stage_place_trace_carry(layer: Module, carry: object) -> object:
     """Move the leading activation carry onto a layer's stage-local mesh."""
     if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(carry)):
         return carry
@@ -417,7 +417,7 @@ def _trace_layer_static_index(layer: Module) -> int | None:
     return None
 
 
-def _is_scalar_integer_like(value: Any) -> bool:
+def _is_scalar_integer_like(value: object) -> bool:
     """Return whether ``value`` looks like the carried layer-index scalar."""
     if isinstance(value, int):
         return True
@@ -427,7 +427,7 @@ def _is_scalar_integer_like(value: Any) -> bool:
     return shape == () and dtype is not None and jnp.issubdtype(dtype, jnp.integer)
 
 
-def _inject_trace_layer_index(layer: Module, carry: Any) -> Any:
+def _inject_trace_layer_index(layer: Module, carry: object) -> object:
     """Keep trace-mode scan layer indices concrete for Python-side users.
 
     EasyDeL layer loops conventionally carry ``idx`` as the final carry item
@@ -446,10 +446,10 @@ def _inject_trace_layer_index(layer: Module, carry: Any) -> Any:
     return carry
 
 
-def _device_put_first_carry_leaf(carry: Any, stage_mesh: Any) -> Any:
+def _device_put_first_carry_leaf(carry: object, stage_mesh: object) -> object:
     """Place the leading array carry on ``stage_mesh`` while preserving carry shape."""
 
-    def place(value: Any) -> Any:
+    def place(value: object) -> object:
         """``device_put`` ``value`` onto ``stage_mesh`` (replicated) if it's a JAX array; else passthrough."""
         if isinstance(value, jax.Array):
             return jax.device_put(value, jax.sharding.NamedSharding(stage_mesh, jax.sharding.PartitionSpec()))
@@ -469,7 +469,7 @@ def _slice_stacked_state(stacked: State, start: int, stop: int) -> State:
 
 def _scan_static_template_signature(
     graph_defs: tuple[GraphDef, ...],
-    family_keys: tuple[Any, ...] | None = None,
+    family_keys: tuple[object, ...] | None = None,
 ) -> GraphDef | None:
     """Return a reusable graph template when per-layer differences are safe.
 
@@ -495,7 +495,7 @@ def _build_scan_plan_from_exports(exports: list[tuple[GraphDef, State]], *, cont
     if not exports:
         raise ValueError(f"{context} requires at least one module")
 
-    family_key_to_id: dict[tuple[Any, ...], int] = {}
+    family_key_to_id: dict[tuple[object, ...], int] = {}
     graph_family_ids: list[int] = []
     graph_defs = [gdef for gdef, _state in exports]
     for gdef in graph_defs:
@@ -524,15 +524,15 @@ def _build_scan_plan_from_exports(exports: list[tuple[GraphDef, State]], *, cont
 
 def _scan_plan_cache_key(
     graph_defs: tuple[GraphDef, ...],
-    family_keys: tuple[Any, ...] | None = None,
-) -> tuple[Any, ...]:
+    family_keys: tuple[object, ...] | None = None,
+) -> tuple[object, ...]:
     """Return a stable key for cached scan segmentation metadata."""
     if family_keys is not None:
         return (_graph_epoch(), len(graph_defs), tuple(hash(key) for key in family_keys))
     return (_graph_epoch(), len(graph_defs), tuple(hash(gdef) for gdef in graph_defs))
 
 
-def _cache_plan(owner: Module, key: tuple[Any, ...], plan: _ScanPlan) -> None:
+def _cache_plan(owner: Module, key: tuple[object, ...], plan: _ScanPlan) -> None:
     """Store state-free scan segmentation metadata on a container."""
     segment_specs = tuple((segment.start, segment.stop, segment.gdef, segment.family_id) for segment in plan.segments)
     object.__setattr__(
@@ -542,7 +542,7 @@ def _cache_plan(owner: Module, key: tuple[Any, ...], plan: _ScanPlan) -> None:
     )
 
 
-def _cached_plan_metadata(owner: Module, key: tuple[Any, ...]) -> tuple[Any, ...] | None:
+def _cached_plan_metadata(owner: Module, key: tuple[object, ...]) -> tuple[object, ...] | None:
     """Return cached scan segmentation metadata when it matches ``key``."""
     cache = getattr(owner, "_spx_scan_plan_cache", None)
     if cache is None or cache[0] != key:
@@ -598,7 +598,7 @@ def _build_scan_plan_from_stacked(
     stacked: State,
     *,
     context: str,
-    family_keys: tuple[Any, ...] | None = None,
+    family_keys: tuple[object, ...] | None = None,
 ) -> _ScanPlan:
     """Build a segmented scan plan for pre-stacked leaves."""
     if not graph_defs:
@@ -607,7 +607,7 @@ def _build_scan_plan_from_stacked(
         family_keys = tuple(_scan_graph_family_key(gdef) for gdef in graph_defs)
     if len(family_keys) != len(graph_defs):
         raise ValueError(f"{context} received mismatched graph/family key counts")
-    family_key_to_id: dict[tuple[Any, ...], int] = {}
+    family_key_to_id: dict[tuple[object, ...], int] = {}
     graph_family_ids: list[int] = []
     for key in family_keys:
         family_id = family_key_to_id.setdefault(key, len(family_key_to_id))
@@ -692,7 +692,7 @@ def _scan_default_unroll(_length: int) -> int:
     return 1
 
 
-def _scan_constraint_for_metadata(metadata: dict[str, Any]) -> Any:
+def _scan_constraint_for_metadata(metadata: dict[str, object]) -> object:
     """Resolve per-layer variable metadata to a scan-body sharding constraint."""
     from ..sharding.mesh import current_mesh
     from ..sharding.partition import named_sharding_for_metadata
@@ -705,7 +705,7 @@ def _scan_constraint_for_metadata(metadata: dict[str, Any]) -> Any:
 
 def _scan_state_constraint_specs(gdef: GraphDef) -> State | None:
     """Return a State-shaped tree of per-layer sharding constraints."""
-    data: dict[str, dict[str, Any]] = {}
+    data: dict[str, dict[str, object]] = {}
     canonical: dict[int, str] = dict(gdef.var_canonical)
     seen_refs: set[int] = set()
     for node_idx, local_ref_id in gdef.var_refs:
@@ -724,9 +724,9 @@ def _scan_state_constraint_specs(gdef: GraphDef) -> State | None:
     return State._from_raw(data)
 
 
-def _apply_nested_constraints(values: dict[str, Any], specs: dict[str, Any]) -> dict[str, Any]:
+def _apply_nested_constraints(values: dict[str, object], specs: dict[str, object]) -> dict[str, object]:
     """Apply sharding constraints to a nested state collection."""
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for key, value in values.items():
         spec = specs.get(key) if isinstance(specs, dict) else None
         if isinstance(value, dict):
@@ -742,7 +742,7 @@ def _apply_scan_state_constraints(state: State, specs: State | None) -> State:
     """Apply State-shaped scan-body sharding constraints."""
     if specs is None:
         return state
-    constrained: dict[str, dict[str, Any]] = {}
+    constrained: dict[str, dict[str, object]] = {}
     spec_raw = specs.raw()
     for collection, values in state.raw().items():
         constrained[collection] = _apply_nested_constraints(values, spec_raw.get(collection, {}))
@@ -779,9 +779,9 @@ class _ListContainer(Module):
     children.
     """
 
-    _spx_items: list[Any]
+    _spx_items: list[object]
 
-    def __init__(self, items: Iterable[Any] = ()) -> None:
+    def __init__(self, items: Iterable[object] = ()) -> None:
         """Construct the container from an iterable of items.
 
         Items are validated one by one via :meth:`_validate_item` before
@@ -807,7 +807,7 @@ class _ListContainer(Module):
         return len(self._spx_items)
 
     @overload
-    def __getitem__(self, idx: int) -> Any:
+    def __getitem__(self, idx: int) -> object:
         """Overload: integer index returns one stored element."""
         ...
 
@@ -816,7 +816,7 @@ class _ListContainer(Module):
         """Overload: slice returns a new container of the same concrete type."""
         ...
 
-    def __getitem__(self, idx: int | slice) -> Any:
+    def __getitem__(self, idx: int | slice) -> object:
         """Index or slice into the container.
 
         Integer indices return the single element. Slices return a new
@@ -826,11 +826,11 @@ class _ListContainer(Module):
             return type(self)(self._spx_items[idx])
         return self._spx_items[idx]
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self) -> Iterator[object]:
         """Iterate over stored elements."""
         return iter(self._spx_items)
 
-    def append(self, value: Any) -> None:
+    def append(self, value: object) -> None:
         """Append ``value``, validating its type first.
 
         Args:
@@ -846,7 +846,7 @@ class _ListContainer(Module):
         object.__setattr__(self, "_spx_export_cache", None)
         _bump_graph_epoch()
 
-    def extend(self, values: Iterable[Any]) -> None:
+    def extend(self, values: Iterable[object]) -> None:
         """Append every item from ``values``.
 
         Args:
@@ -859,7 +859,7 @@ class _ListContainer(Module):
         for v in values:
             self.append(v)
 
-    def _validate_item(self, value: Any) -> None:
+    def _validate_item(self, value: object) -> None:
         """Raise :class:`TypeError` if ``value`` is of an unacceptable type."""
         raise NotImplementedError
 
@@ -869,7 +869,7 @@ class _ListContainer(Module):
             if isinstance(it, Module | Variable):
                 yield i, it
 
-    def _spx_static_fields(self) -> dict[str, Any]:
+    def _spx_static_fields(self) -> dict[str, object]:
         """Containers have no static fields."""
         return {}
 
@@ -897,12 +897,12 @@ class ModuleList(_ListContainer):
         """Construct from an iterable of modules."""
         super().__init__(items)
 
-    def _validate_item(self, value: Any) -> None:
+    def _validate_item(self, value: object) -> None:
         """Require every item to be a :class:`~spectrax.Module`."""
         if not isinstance(value, Module):
             raise TypeError(f"ModuleList accepts Modules only, got {type(value).__name__}")
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`ModuleList` is not a callable layer.
 
         Returns:
@@ -914,7 +914,7 @@ class ModuleList(_ListContainer):
         """
         raise RuntimeError("ModuleList is not callable; iterate or index it.")
 
-    def __getitem__(self, idx: int | slice) -> Any:
+    def __getitem__(self, idx: int | slice) -> object:
         """Index/slice with extra support for tracer indices (used inside ``jit``/``scan``).
 
         Concrete integers and slices behave like a normal Python list.
@@ -938,7 +938,7 @@ class ModuleList(_ListContainer):
             return self._get_traced(idx)
         return self._spx_items[idx]
 
-    def _get_traced(self, idx: Any) -> Module:
+    def _get_traced(self, idx: object) -> Module:
         """Return the module at tracer index ``idx`` via export/stack/bind."""
         from .graph import bind
 
@@ -1067,7 +1067,7 @@ class ModuleList(_ListContainer):
         return jax.lax.fori_loop(0, len(self), body, init_carry)
 
 
-def _prepend_stacked_axis_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+def _prepend_stacked_axis_metadata(metadata: dict[str, object]) -> dict[str, object]:
     """Adjust variable metadata after adding a leading layer axis."""
     out = dict(metadata)
     if "axis_names" in out:
@@ -1081,7 +1081,7 @@ def _prepend_stacked_axis_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _stacked_variable_like(template: Variable, value: Any) -> Variable:
+def _stacked_variable_like(template: Variable, value: object) -> Variable:
     """Create a variable of ``template``'s class for a stacked leaf value."""
     cls = type(template)
     var = cls.__new__(cls)
@@ -1188,16 +1188,16 @@ class StackedModuleList(Module):
     def __iter__(self) -> Iterator[Module]:
         """Iterate by materializing read-only layer views."""
         for i in range(len(self)):
-            yield self[i]
+            yield cast(Module, self[i])
 
-    def __getitem__(self, idx: int | slice) -> Any:
+    def __getitem__(self, idx: int | slice) -> object:
         """Return one layer view or a sliced stacked container."""
         if isinstance(idx, slice):
             indices = range(*idx.indices(len(self)))
             return ModuleList([self[i] for i in indices]).stack()
         return self._bind_index(idx)
 
-    def _spx_static_fields(self) -> dict[str, Any]:
+    def _spx_static_fields(self) -> dict[str, object]:
         """Persist the item graph and original leaf paths through bind."""
         return {
             "_spx_item_gdef": self._spx_item_gdef,
@@ -1253,13 +1253,13 @@ class StackedModuleList(Module):
 
     def _stacked_state(self) -> State:
         """Rebuild the per-item stacked state expected by ``bind``."""
-        data: dict[str, dict[str, Any]] = {}
+        data: dict[str, dict[str, object]] = {}
         for i, (collection, path) in enumerate(self._spx_leaf_specs):
             var = getattr(self, f"v{i}")
             _nested_set(data.setdefault(collection, {}), str_to_path(path), var.value)
         return State._from_raw(data)
 
-    def _bind_index(self, idx: Any) -> Module:
+    def _bind_index(self, idx: object) -> Module:
         """Bind the module at ``idx`` from the stacked state."""
         from .graph import bind
 
@@ -1278,7 +1278,7 @@ class StackedModuleList(Module):
         state = jax.tree.map(lambda leaf: leaf[idx], self._stacked_state())
         return bind(gdef, state)
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`StackedModuleList` is not callable.
 
         Returns:
@@ -1384,12 +1384,12 @@ class Sequential(_ListContainer):
         """Construct from positional modules."""
         super().__init__(modules)
 
-    def _validate_item(self, value: Any) -> None:
+    def _validate_item(self, value: object) -> None:
         """Require every item to be a :class:`~spectrax.Module`."""
         if not isinstance(value, Module):
             raise TypeError(f"Sequential accepts Modules only, got {type(value).__name__}")
 
-    def forward(self, x: Any, **kwargs: Any) -> Any:
+    def forward(self, x: object, **kwargs: object) -> object:
         """Thread ``x`` through the chain, passing ``**kwargs`` where accepted.
 
         Each child is called with ``(x, **kwargs)``. A :class:`TypeError`
@@ -1422,12 +1422,12 @@ class ParameterList(_ListContainer):
         """Construct from an iterable of parameters."""
         super().__init__(items)
 
-    def _validate_item(self, value: Any) -> None:
+    def _validate_item(self, value: object) -> None:
         """Require every item to be a :class:`~spectrax.Parameter`."""
         if not isinstance(value, Parameter):
             raise TypeError(f"ParameterList accepts Parameters only, got {type(value).__name__}")
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`ParameterList` is not a callable layer.
 
         Returns:
@@ -1526,11 +1526,11 @@ class ModuleDict(Module):
         """Yield ``(key, child)`` for every entry in insertion order."""
         yield from self._spx_items.items()
 
-    def _spx_static_fields(self) -> dict[str, Any]:
+    def _spx_static_fields(self) -> dict[str, object]:
         """Containers have no static fields."""
         return {}
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`ModuleDict` is not a callable layer.
 
         Returns:

@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-import typing as tp
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 
 import jax
 import numpy as np
@@ -17,7 +17,8 @@ from spectrax._internal.logging import get_logger
 _logger = get_logger(__name__)
 
 Scalar = float | int
-ArrayLike = tp.Union[np.ndarray, "jax.Array"]  # type: ignore[name-defined]
+ArrayLike = np.ndarray | jax.Array
+LogValue = Scalar | str | bool | None | ArrayLike | Mapping[str, "LogValue"] | Sequence["LogValue"]
 
 
 class BaseBackend(ABC):
@@ -68,14 +69,14 @@ class BaseBackend(ABC):
         """
 
     @abstractmethod
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Log hyper-parameters.
 
         Args:
             hparams: Flat or nested dict of hyper-parameters.
         """
 
-    def log_summary(self, metrics: dict[str, tp.Any]) -> None:
+    def log_summary(self, metrics: dict[str, LogValue]) -> None:
         """Log summary-level metrics (optional; default no-op).
 
         Args:
@@ -87,7 +88,7 @@ class BaseBackend(ABC):
         self,
         tag: str,
         columns: list[str],
-        rows: list[list[tp.Any]],
+        rows: list[list[LogValue]],
         step: int,
     ) -> None:
         """Log a table (optional; default no-op).
@@ -128,11 +129,11 @@ class _NullBackend(BaseBackend):
         """No-op."""
         pass
 
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """No-op."""
         pass
 
-    def log_summary(self, metrics: dict[str, tp.Any]) -> None:
+    def log_summary(self, metrics: dict[str, LogValue]) -> None:
         """No-op."""
         pass
 
@@ -140,7 +141,7 @@ class _NullBackend(BaseBackend):
         self,
         tag: str,
         columns: list[str],
-        rows: list[list[tp.Any]],
+        rows: list[list[LogValue]],
         step: int,
     ) -> None:
         """No-op."""
@@ -220,7 +221,7 @@ class Logger:
         except RuntimeError:
             return True
 
-    def _dispatch(self, method: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def _dispatch(self, method: str, *args: object, **kwargs: object) -> None:
         """Call *method* on every backend, swallowing individual failures.
 
         If :attr:`_auto_flush` is enabled, :meth:`flush` is called on all
@@ -281,7 +282,7 @@ class Logger:
         """
         self._dispatch("log_text", tag, text, step)
 
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Log hyper-parameters to all backends.
 
         Args:
@@ -289,7 +290,7 @@ class Logger:
         """
         self._dispatch("log_hparams", hparams)
 
-    def log_summary(self, metrics: dict[str, tp.Any]) -> None:
+    def log_summary(self, metrics: dict[str, LogValue]) -> None:
         """Log summary-level metrics (e.g. WandB ``run.summary``).
 
         Not all backends support this; those that don't silently ignore it.
@@ -303,7 +304,7 @@ class Logger:
         self,
         tag: str,
         columns: list[str],
-        rows: list[list[tp.Any]],
+        rows: list[list[LogValue]],
         step: int,
     ) -> None:
         """Log a table to all backends.
@@ -335,7 +336,7 @@ class Logger:
         """Alias for :meth:`log_text`."""
         self.log_text(tag, text, step)
 
-    def add_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def add_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Alias for :meth:`log_hparams`."""
         self.log_hparams(hparams)
 
@@ -355,7 +356,7 @@ class Logger:
         """Flax-style alias for :meth:`log_text`."""
         self.log_text(tag, textdata, step)
 
-    def hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def hparams(self, hparams: dict[str, LogValue]) -> None:
         """Flax-style alias for :meth:`log_hparams`."""
         self.log_hparams(hparams)
 
@@ -386,6 +387,6 @@ class Logger:
         """Context-manager entry — returns ``self``."""
         return self
 
-    def __exit__(self, *exc: tp.Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         """Context-manager exit — closes all backends."""
         self.close()

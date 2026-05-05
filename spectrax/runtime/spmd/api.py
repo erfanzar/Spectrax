@@ -18,7 +18,6 @@ scheduler when it was not.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 from jax.sharding import Mesh
 
@@ -69,13 +68,13 @@ def _unwrap_spmd_mesh(mesh: SpxMesh | MpMdMesh | Mesh, *, axis: str, api_name: s
 
 def pipeline_step(
     model: PipelineSequential,
-    batch: tuple[Any, ...],
+    batch: tuple[object, ...],
     *,
     mesh: SpxMesh | MpMdMesh | Mesh,
     axis: str = "pp",
-    schedule: Any,
-    loss_fn: Callable[..., Any],
-) -> tuple[Any, tuple[State, ...]]:
+    schedule: object,
+    loss_fn: Callable[..., object],
+) -> tuple[object, tuple[State, ...]]:
     """Execute one SPMD pipeline-parallel forward + backward step.
 
     Thin wrapper over :func:`~spectrax.runtime.spmd.spmd_run`.  The

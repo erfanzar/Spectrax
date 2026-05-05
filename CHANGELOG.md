@@ -4,6 +4,43 @@ All notable changes to spectrax are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.0] — 2026-05-05
+
+### Added
+
+- `sxstage_region` for multimodal and branched MPMD pipelines, allowing
+  independent logical stage sequences inside one scheduled function.
+- Region-aware MPMD schedule planning for GPipe, 1F1B, ZeroBubble,
+  interleaved, KimiK2, and DualPipeV schedules.
+- Runnable examples for `sxstage_region`, stage-local MPMD mesh
+  layout, and `MultiOptimizer` LoRA training.
+- Optimizer guide covering `Optimizer`, `MultiOptimizer`, selector
+  scoped optimizer state, and mutable collection rules.
+
+### Changed
+
+- `sxcall`, `sxjit`, `sxgrad`, `sxvalue_and_grad`, and MPMD `spx.run`
+  now route through the true scheduled MPMD path instead of legacy
+  pipeline shortcuts.
+- Stage-local mesh and sharding handling now drops the pipeline axis
+  at stage boundaries and preserves only the local SPMD sub-mesh.
+- MPMD stage JITs now use cache-visible stage/rank names and guarded
+  first-compile behavior so persistent executable caches cannot be
+  reused across incompatible stage meshes.
+
+### Fixed
+
+- Rebased nested `shard_map` / `pjit` mesh metadata inside split stage
+  JAXPRs so per-stage executables do not close over full-pipeline meshes.
+- Fixed stale persistent-cache reuse for MPMD MoE / expert-parallel
+  stage executables.
+- Fixed scalar zero-axis mesh rebasing during scheduled training plan
+  construction.
+- Fixed boundary sharding/layout handling that could trigger large
+  unintended KV-cache copies in pipeline inference.
+- Fixed `MultiOptimizer` slicing for nested dotted paths such as LoRA
+  adapters under child modules.
+
 ## [0.0.1] — 2026-04-20
 
 ### Added

@@ -33,7 +33,7 @@ from .async_manager import AsyncCheckpointManager
 
 logger = get_logger(__name__)
 
-MetadataDict = dict[str, tp.Any]
+MetadataDict = dict[str, object]
 Sequence = tp.Sequence
 Callable = tp.Callable
 
@@ -135,7 +135,7 @@ class Checkpointer:
     def on_step(
         self,
         mesh: Mesh,
-        pytree: tp.Any | None = None,
+        pytree: PyTree | None = None,
         force: bool = False,
         *,
         step: int,
@@ -250,6 +250,7 @@ class Checkpointer:
         *,
         step: int | None = None,
         destination: str | None = None,
+        mesh: Mesh | None = None,
         dtype: jnp.dtype | None = None,
         extras: dict | None = None,
         temporary: bool = False,
@@ -262,6 +263,9 @@ class Checkpointer:
             prefix: Namespace/prefix (e.g., ``"model"``, ``"tx"``).
             step: Training step number for metadata.
             destination: Optional subdirectory under ``base_path``.
+            mesh: Optional compatibility argument accepted by older call sites.
+                Save preserves each array's existing sharding, so the mesh is
+                only needed on load and is intentionally ignored here.
             dtype: Optional dtype to cast floating point arrays to.
             extras: Optional extra metadata.
             temporary: If ``True``, mark as temporary in metadata.
@@ -292,6 +296,7 @@ class Checkpointer:
             pytree=tree,
             path=path,
             prefix=prefix,
+            mesh=mesh,
             dtype=dtype,
             extras=merged_extras,
             write_index=write_index,

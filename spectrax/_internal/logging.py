@@ -19,7 +19,7 @@ import os
 import sys
 import threading
 import time
-import typing as tp
+from collections.abc import Callable
 from functools import wraps
 
 import jax
@@ -67,7 +67,7 @@ _LOGGING_LEVELS: dict[str, int] = {
     "notset": 0,
 }
 
-_logged_once: set[tuple[str, ...]] = set()
+_logged_once: set[tuple[object, ...]] = set()
 
 
 class ColorFormatter(logging.Formatter):
@@ -162,7 +162,7 @@ class LazyLogger:
         self._logger = logger
 
     @staticmethod
-    def _make_hashable(value: tp.Any) -> tp.Any:
+    def _make_hashable(value: object) -> object:
         """Return a hashable stand-in for *value*, falling back to ``repr``.
 
         Used by :meth:`_log_once` so non-hashable args (e.g. lists, dicts)
@@ -185,7 +185,7 @@ class LazyLogger:
                 return (type(value), id(value))
         return value
 
-    def _log_once(self, level: int, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def _log_once(self, level: int, message: str, *args: object, **kwargs: object) -> None:
         """Log *message* at *level* only if the exact call has not been seen before.
 
         The deduplication key covers the level name, message template, and
@@ -205,23 +205,23 @@ class LazyLogger:
                 self._ensure_initialized()
                 self._logger.log(level, message, *args, **kwargs)
 
-    def debug_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def debug_once(self, message: str, *args: object, **kwargs: object) -> None:
         """Log a ``DEBUG`` message once (deduplicated)."""
         self._log_once(logging.DEBUG, message, *args, **kwargs)
 
-    def info_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def info_once(self, message: str, *args: object, **kwargs: object) -> None:
         """Log an ``INFO`` message once (deduplicated)."""
         self._log_once(logging.INFO, message, *args, **kwargs)
 
-    def warn_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def warn_once(self, message: str, *args: object, **kwargs: object) -> None:
         """Log a ``WARNING`` message once (deduplicated)."""
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
-    def warning_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def warning_once(self, message: str, *args: object, **kwargs: object) -> None:
         """Alias for :meth:`warn_once`."""
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
-    def error_once(self, message: str, *args: tp.Any, **kwargs: tp.Any) -> None:
+    def error_once(self, message: str, *args: object, **kwargs: object) -> None:
         """Log an ``ERROR`` message once (deduplicated)."""
         self._log_once(logging.ERROR, message, *args, **kwargs)
 
@@ -234,7 +234,7 @@ class LazyLogger:
         with self._logged_once_lock:
             _logged_once.clear()
 
-    def __getattr__(self, name: str) -> tp.Callable:
+    def __getattr__(self, name: str) -> Callable[..., object]:
         """Dynamically resolve logging methods on first access.
 
         Args:
@@ -250,7 +250,7 @@ class LazyLogger:
             method_name = name
 
             @wraps(getattr(logging.Logger, method_name))
-            def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+            def wrapped_log_method(*args: object, **kwargs: object) -> object:
                 """Delegate to the underlying logger method."""
                 self._ensure_initialized()
                 return getattr(self._logger, method_name)(*args, **kwargs)
@@ -263,7 +263,7 @@ class LazyLogger:
             if hasattr(logging.Logger, method_name):
 
                 @wraps(getattr(logging.Logger, method_name))
-                def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+                def wrapped_log_method(*args: object, **kwargs: object) -> object:
                     """Delegate to the named level method of the underlying logger."""
                     self._ensure_initialized()
                     return getattr(self._logger, method_name)(*args, **kwargs)
@@ -271,7 +271,7 @@ class LazyLogger:
                 return wrapped_log_method
 
             @wraps(logging.Logger.log)
-            def wrapped_log_method(*args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+            def wrapped_log_method(*args: object, **kwargs: object) -> object:
                 """Log at the dynamically-resolved level."""
                 self._ensure_initialized()
                 return self._logger.log(level, *args, **kwargs)

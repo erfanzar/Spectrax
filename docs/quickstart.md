@@ -20,8 +20,8 @@ development):
 ```bash
 git clone https://github.com/erfanzar/spectrax
 cd spectrax
-uv sync --extra dev --extra test --extra contrib
-uv run pytest -q                        # 770+ tests, ~80 s on CPU
+uv sync --extra dev --extra test
+uv run pytest -q                        # 1700+ tests, about 3 min on CPU
 ```
 
 ### Requirements
@@ -29,13 +29,13 @@ uv run pytest -q                        # 770+ tests, ~80 s on CPU
 | Item     | Version             |
 |----------|---------------------|
 | Python   | ≥ 3.11, ≤ 3.13      |
-| JAX      | ≥ 0.9.2             |
-| jaxlib   | ≥ 0.9.2             |
+| JAX      | ≥ 0.10.0            |
+| jaxlib   | ≥ 0.10.0            |
 | numpy    | ≥ 1.26              |
 | treescope| ≥ 0.1.7             |
 | optax    | ≥ 0.2.8 (optional)  |
 
-AGPL-3.0-or-later. Project is `v0.0.3` (alpha) — pin the version if you
+AGPL-3.0-or-later. Project is `v0.1.0` (alpha) — pin the version if you
 depend on behavioral stability.
 
 ## A first model

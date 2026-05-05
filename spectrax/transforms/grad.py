@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
-from typing import Any, TypeVar
+from typing import TypeVar, cast
 
 import jax
 
@@ -52,9 +52,9 @@ from .split_merge import (
 
 __all__ = ["grad", "jvp", "value_and_grad", "vjp"]
 
-F = TypeVar("F", bound=Callable[..., Any])
+F = TypeVar("F", bound=Callable[..., object])
 
-AxisName = Any
+AxisName = object
 """Type alias for a JAX axis-name sentinel (no canonical type exists)."""
 
 _MISSING = object()
@@ -118,21 +118,24 @@ def value_and_grad(
             :class:`~spectrax.Module`.
     """
     if fn is None:
-        return lambda f: value_and_grad(
-            f,
-            wrt=wrt,
-            argnum=argnum,
-            has_aux=has_aux,
-            holomorphic=holomorphic,
-            allow_int=allow_int,
-            reduce_axes=reduce_axes,
+        return cast(
+            F,
+            lambda f: value_and_grad(
+                f,
+                wrt=wrt,
+                argnum=argnum,
+                has_aux=has_aux,
+                holomorphic=holomorphic,
+                allow_int=allow_int,
+                reduce_axes=reduce_axes,
+            ),
         )
 
     wrt_sel = as_selector(wrt)
     direct_guarded = make_direct_readonly(fn)
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Partition the module's state, differentiate against the target subset, and re-merge.
 
         Looks up the target module at position ``argnum`` (or the first
@@ -149,7 +152,7 @@ def value_and_grad(
         gdef, state = export(model)
         target, rest = wrt_sel.partition_state(model, state)
         if _state_is_empty(rest):
-            vg_kwargs: dict[str, Any] = {
+            vg_kwargs: dict[str, object] = {
                 "argnums": idx,
                 "has_aux": has_aux,
                 "holomorphic": holomorphic,
@@ -165,9 +168,9 @@ def value_and_grad(
         def pure(
             target_state: State,
             rest_state: State,
-            other: tuple[Any, ...],
-            kw: dict[str, Any],
-        ) -> tuple[Any, Any]:
+            other: tuple[object, ...],
+            kw: dict[str, object],
+        ) -> tuple[object, object | None]:
             """Pure closure fed to :func:`jax.value_and_grad`.
 
             Overlays the differentiation target on top of the captured
@@ -193,7 +196,7 @@ def value_and_grad(
                 return val, aux
             return out, None
 
-        vg_kwargs: dict[str, Any] = {
+        vg_kwargs: dict[str, object] = {
             "has_aux": True,
             "holomorphic": holomorphic,
             "allow_int": allow_int,
@@ -206,7 +209,7 @@ def value_and_grad(
             return (value, aux), grads_target
         return value, grads_target
 
-    return wrapped
+    return cast(F, wrapped)
 
 
 def grad(
@@ -247,14 +250,17 @@ def grad(
             :class:`~spectrax.Module`.
     """
     if fn is None:
-        return lambda f: grad(
-            f,
-            wrt=wrt,
-            argnum=argnum,
-            has_aux=has_aux,
-            holomorphic=holomorphic,
-            allow_int=allow_int,
-            reduce_axes=reduce_axes,
+        return cast(
+            F,
+            lambda f: grad(
+                f,
+                wrt=wrt,
+                argnum=argnum,
+                has_aux=has_aux,
+                holomorphic=holomorphic,
+                allow_int=allow_int,
+                reduce_axes=reduce_axes,
+            ),
         )
 
     vg = value_and_grad(
@@ -268,7 +274,7 @@ def grad(
     )
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Return only the gradient half of the :func:`value_and_grad` output.
 
         Strips the value (and aux when ``has_aux`` is unset) from the
@@ -282,16 +288,16 @@ def grad(
         _, grads = out
         return grads
 
-    return wrapped
+    return cast(F, wrapped)
 
 
 def vjp(
     fn: F | None = None,
-    *primals: Any,
+    *primals: object,
     has_aux: bool = False,
     reduce_axes: Sequence[AxisName] = (),
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.vjp`.
 
     Two call shapes are supported:
@@ -345,7 +351,7 @@ def vjp(
         return _vjp_call(fn, primals, has_aux=has_aux, reduce_axes=reduce_axes, mutable=mutable)
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Decorator-mode wrapper: defer ``_vjp_call`` until primals arrive.
 
         Rejects keyword primals (since :func:`jax.vjp` does not support
@@ -360,12 +366,12 @@ def vjp(
 
 def jvp(
     fn: F | None = None,
-    primals: Sequence[Any] | None | object = _MISSING,
-    tangents: Sequence[Any] | None | object = _MISSING,
+    primals: Sequence[object] | None | object = _MISSING,
+    tangents: Sequence[object] | None | object = _MISSING,
     *,
     has_aux: bool = False,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.jvp`.
 
     Two call shapes:
@@ -413,9 +419,9 @@ def jvp(
 
     @functools.wraps(fn)
     def wrapped(
-        primals_: Sequence[Any],
-        tangents_: Sequence[Any],
-    ) -> Any:
+        primals_: Sequence[object],
+        tangents_: Sequence[object],
+    ) -> object:
         """Decorator-mode wrapper: defer ``_jvp_call`` until ``(primals, tangents)`` arrive.
 
         Forwards the eventual ``(primals, tangents)`` invocation through
@@ -427,7 +433,7 @@ def jvp(
     return wrapped
 
 
-def _find_first_module(args: tuple[Any, ...]) -> int:
+def _find_first_module(args: tuple[object, ...]) -> int:
     """Return the positional index of the first :class:`~spectrax.Module` in ``args``.
 
     Used by :func:`value_and_grad` (and transitively :func:`grad`) to
@@ -449,7 +455,7 @@ def _find_first_module(args: tuple[Any, ...]) -> int:
     raise TypeError("spectrax.grad requires at least one Module argument")
 
 
-def _ensure_no_kwargs(name: str, kwargs: dict[str, Any]) -> None:
+def _ensure_no_kwargs(name: str, kwargs: dict[str, object]) -> None:
     """Reject keyword arguments for transforms whose public API mirrors raw JAX.
 
     :func:`jax.vjp` and :func:`jax.jvp` do not accept keyword arguments
@@ -471,7 +477,9 @@ def _ensure_no_kwargs(name: str, kwargs: dict[str, Any]) -> None:
         )
 
 
-def _split_module_tangents(refs: list[Any], tangents: tuple[Any, ...]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+def _split_module_tangents(
+    refs: list[object], tangents: tuple[object, ...]
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
     """Separate the module-state tangents from the rest of the positional tangents.
 
     For every located module in ``refs``, looks up the tangent at the
@@ -491,7 +499,7 @@ def _split_module_tangents(refs: list[Any], tangents: tuple[Any, ...]) -> tuple[
         ``refs`` and ``tangents`` respectively.
     """
     stripped_tangents = list(tangents)
-    state_tangents: list[Any] = []
+    state_tangents: list[object] = []
     for ref in refs:
         tangent = tangents[ref.locator]
         if isinstance(tangent, Module):
@@ -502,8 +510,8 @@ def _split_module_tangents(refs: list[Any], tangents: tuple[Any, ...]) -> tuple[
 
 
 def _splice_module_cotangents(
-    refs: list[Any], stripped_cotangents: tuple[Any, ...], state_cotangents: tuple[Any, ...]
-) -> tuple[Any, ...]:
+    refs: list[object], stripped_cotangents: tuple[object, ...], state_cotangents: tuple[object, ...]
+) -> tuple[object, ...]:
     """Rebuild a cotangent tuple matching the original primal positions.
 
     Inverse of :func:`_split_module_tangents`: takes the cotangents JAX
@@ -529,7 +537,9 @@ def _splice_module_cotangents(
     return tuple(out)
 
 
-def _splice_one_cotangent(locator: int, other_cotangents: tuple[Any, ...], state_cotangent: Any) -> tuple[Any, ...]:
+def _splice_one_cotangent(
+    locator: int, other_cotangents: tuple[object, ...], state_cotangent: object
+) -> tuple[object, ...]:
     """Rebuild a cotangent tuple for the single-positional-Module fast path.
 
     Args:
@@ -548,7 +558,7 @@ def _splice_one_cotangent(locator: int, other_cotangents: tuple[Any, ...], state
     return tuple(out)
 
 
-def _zeros_like_tree(tree: Any) -> Any:
+def _zeros_like_tree(tree: object) -> object:
     """Build a zero-filled cotangent pytree with the same structure as ``tree``.
 
     Used to seed the cotangent for the ``new_states`` half of a
@@ -563,7 +573,7 @@ def _state_is_empty(state: State) -> bool:
     return not state.collections()
 
 
-def _module_like_to_state(value: Any) -> State:
+def _module_like_to_state(value: object) -> State:
     """Coerce a Module-shaped cotangent into the public :class:`~spectrax.State` form.
 
     JAX returns cotangents whose pytree structure matches the primal's
@@ -591,7 +601,7 @@ def _module_like_to_state(value: Any) -> State:
     raise TypeError(f"Expected Module or State value, got {type(value).__name__}")
 
 
-def _convert_direct_tangents(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[Any, ...] | None:
+def _convert_direct_tangents(primals: tuple[object, ...], tangents: tuple[object, ...]) -> tuple[object, ...] | None:
     """Convert :class:`~spectrax.State` tangents into Module-pytree tangents.
 
     When ``mutable=()`` :func:`vjp` / :func:`jvp` use the direct-JAX
@@ -628,7 +638,7 @@ def _convert_direct_tangents(primals: tuple[Any, ...], tangents: tuple[Any, ...]
     return tuple(converted)
 
 
-def _convert_direct_cotangents(primals: tuple[Any, ...], cotangents: tuple[Any, ...]) -> tuple[Any, ...]:
+def _convert_direct_cotangents(primals: tuple[object, ...], cotangents: tuple[object, ...]) -> tuple[object, ...]:
     """Translate raw JAX cotangents into the user-facing types.
 
     Walks ``primals`` / ``cotangents`` in parallel and converts every
@@ -645,20 +655,20 @@ def _convert_direct_cotangents(primals: tuple[Any, ...], cotangents: tuple[Any, 
         A tuple parallel to ``cotangents`` where every module-associated
         entry has been converted to :class:`~spectrax.State`.
     """
-    out: list[Any] = []
+    out: list[object] = []
     for primal, cotangent in zip(primals, cotangents, strict=False):
         out.append(_module_like_to_state(cotangent) if isinstance(primal, Module) else cotangent)
     return tuple(out)
 
 
 def _vjp_call(
-    fn: Callable[..., Any],
-    primals: Sequence[Any],
+    fn: Callable[..., object],
+    primals: Sequence[object],
     *,
     has_aux: bool,
     reduce_axes: Sequence[AxisName],
     mutable: SelectorSugar,
-) -> Any:
+) -> object:
     """Shared backend for direct and wrapped :func:`vjp` invocations.
 
     Branches on ``mutable_sel`` and on whether the call is the
@@ -675,13 +685,13 @@ def _vjp_call(
     mutable_sel = resolve_mutable(mutable)
     direct_guarded = make_direct_readonly(fn)
     if mutable_sel is None:
-        vjp_kwargs: dict[str, Any] = {"has_aux": has_aux} if has_aux else {}
+        vjp_kwargs: dict[str, object] = {"has_aux": has_aux} if has_aux else {}
         if reduce_axes:
             vjp_kwargs["reduce_axes"] = reduce_axes
         if has_aux:
             out, pullback, aux = jax.vjp(direct_guarded, *args, **vjp_kwargs)
 
-            def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+            def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
                 """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
                 Translates the cotangent into the right shape for the wrapped
@@ -696,7 +706,7 @@ def _vjp_call(
 
         out, pullback = jax.vjp(direct_guarded, *args, **vjp_kwargs)
 
-        def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+        def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
             """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
             Translates the cotangent into the right shape for the wrapped
@@ -722,13 +732,13 @@ def _vjp_call(
         )
 
         if has_aux:
-            vjp_kwargs: dict[str, Any] = {"has_aux": True}
+            vjp_kwargs: dict[str, object] = {"has_aux": True}
             if reduce_axes:
                 vjp_kwargs["reduce_axes"] = reduce_axes
             if mutable_sel is None:
                 out, pullback, aux = jax.vjp(pure_one, state_in, *other_args, **vjp_kwargs)
 
-                def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+                def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
                     """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
                     Translates the cotangent into the right shape for the wrapped
@@ -741,7 +751,7 @@ def _vjp_call(
 
                 return out, wrapped_pullback, aux
 
-            def pure_with_updates(state: State, *other: Any) -> tuple[tuple[Any, State], Any]:
+            def pure_with_updates(state: State, *other: object) -> tuple[tuple[object, State], object]:
                 """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
                 Used by ``jax.vjp`` / ``jax.grad`` so the autodiff transform sees a
@@ -756,7 +766,7 @@ def _vjp_call(
             apply_mutations([ref], [new_state], mutable_sel)
             zero_state = _zeros_like_tree(new_state)
 
-            def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+            def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
                 """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
                 Translates the cotangent into the right shape for the wrapped
@@ -775,7 +785,7 @@ def _vjp_call(
         if mutable_sel is None:
             out, pullback = jax.vjp(pure_one, state_in, *other_args, **vjp_kwargs)
 
-            def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+            def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
                 """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
                 Translates the cotangent into the right shape for the wrapped
@@ -788,7 +798,7 @@ def _vjp_call(
 
             return out, wrapped_pullback
 
-        def pure_with_updates(state: State, *other: Any) -> tuple[Any, State]:
+        def pure_with_updates(state: State, *other: object) -> tuple[object, State]:
             """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
             Used by ``jax.vjp`` / ``jax.grad`` so the autodiff transform sees a
@@ -796,13 +806,13 @@ def _vjp_call(
             the user wrote a stateful module-method. The caller separately
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
             """
-            return pure_one(state, *other)
+            return cast(tuple[object, State], pure_one(state, *other))
 
         (out, new_state), pullback = jax.vjp(pure_with_updates, state_in, *other_args, **vjp_kwargs)
         apply_mutations([ref], [new_state], mutable_sel)
         zero_state = _zeros_like_tree(new_state)
 
-        def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+        def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
             """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
             Translates the cotangent into the right shape for the wrapped
@@ -817,16 +827,16 @@ def _vjp_call(
 
     states_in = tuple(r.state for r in refs)
     pure = make_pure_readonly(fn, refs) if mutable_sel is None else make_pure(fn, refs)
-    empty_kwargs: dict[str, Any] = {}
+    empty_kwargs: dict[str, object] = {}
 
     if has_aux:
-        vjp_kwargs: dict[str, Any] = {"has_aux": True}
+        vjp_kwargs: dict[str, object] = {"has_aux": True}
         if reduce_axes:
             vjp_kwargs["reduce_axes"] = reduce_axes
         if mutable_sel is None:
             out, pullback, aux = jax.vjp(pure, states_in, stripped_args, empty_kwargs, **vjp_kwargs)
 
-            def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+            def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
                 """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
                 Translates the cotangent into the right shape for the wrapped
@@ -840,8 +850,8 @@ def _vjp_call(
             return out, wrapped_pullback, aux
 
         def pure_with_updates(
-            states: tuple[State, ...], stripped: tuple[Any, ...], kwargs: dict[str, Any]
-        ) -> tuple[Any, Any]:
+            states: tuple[State, ...], stripped: tuple[object, ...], kwargs: dict[str, object]
+        ) -> tuple[tuple[object, tuple[State, ...]], object]:
             """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
             Used by ``jax.vjp`` / ``jax.grad`` so the autodiff transform sees a
@@ -850,7 +860,7 @@ def _vjp_call(
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
             """
             (out, aux), new_states = pure(states, stripped, kwargs)
-            return (out, new_states), aux
+            return (out, cast(tuple[State, ...], new_states)), aux
 
         (out, new_states), pullback, aux = jax.vjp(
             pure_with_updates, states_in, stripped_args, empty_kwargs, **vjp_kwargs
@@ -858,7 +868,7 @@ def _vjp_call(
         apply_mutations(refs, list(new_states), mutable_sel)
         zero_states = _zeros_like_tree(new_states)
 
-        def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+        def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
             """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
             Translates the cotangent into the right shape for the wrapped
@@ -877,7 +887,7 @@ def _vjp_call(
     if mutable_sel is None:
         out, pullback = jax.vjp(pure, states_in, stripped_args, empty_kwargs, **vjp_kwargs)
 
-        def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+        def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
             """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
             Translates the cotangent into the right shape for the wrapped
@@ -891,8 +901,8 @@ def _vjp_call(
         return out, wrapped_pullback
 
     def pure_with_updates(
-        states: tuple[State, ...], stripped: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[Any, tuple[State, ...]]:
+        states: tuple[State, ...], stripped: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[object, tuple[State, ...]]:
         """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
         Used by ``jax.vjp`` / ``jax.grad`` so the autodiff transform sees a
@@ -907,7 +917,7 @@ def _vjp_call(
     apply_mutations(refs, list(new_states), mutable_sel)
     zero_states = _zeros_like_tree(new_states)
 
-    def wrapped_pullback(cotangent: Any) -> tuple[Any, ...]:
+    def wrapped_pullback(cotangent: object) -> tuple[object, ...]:
         """User-facing pullback: lifts a JAX VJP into module/state-aware tangents.
 
         Translates the cotangent into the right shape for the wrapped
@@ -922,13 +932,13 @@ def _vjp_call(
 
 
 def _jvp_call(
-    fn: Callable[..., Any],
-    primals: Sequence[Any] | None | object,
-    tangents: Sequence[Any] | None | object,
+    fn: Callable[..., object],
+    primals: Sequence[object] | None | object,
+    tangents: Sequence[object] | None | object,
     *,
     has_aux: bool,
     mutable: SelectorSugar,
-) -> Any:
+) -> object:
     """Shared backend for direct and wrapped :func:`jvp` invocations.
 
     Validates arity, exports module primals to states, splits tangents
@@ -972,7 +982,7 @@ def _jvp_call(
                 (out, aux), new_state = pure_one(ref.state, *other_args)
                 apply_mutations([ref], [new_state], mutable_sel)
 
-            def fn_noaux(*a: Any) -> Any:
+            def fn_noaux(*a: object) -> object:
                 """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar."""
                 value, _aux = fn(*a)
                 return value
@@ -990,7 +1000,7 @@ def _jvp_call(
                 )
             else:
 
-                def out_only(state: State, *other: Any) -> Any:
+                def out_only(state: State, *other: object) -> object:
                     """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``."""
                     out_only_val, _ignored_state = pure_noaux(state, *other)
                     return out_only_val
@@ -1010,7 +1020,7 @@ def _jvp_call(
             )
             return out, tangent_out
 
-        def pure_with_updates(state: State, *other: Any) -> tuple[Any, State]:
+        def pure_with_updates(state: State, *other: object) -> tuple[object, State]:
             """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
             Used by ``jax.jvp`` so the autodiff transform sees a
@@ -1018,7 +1028,7 @@ def _jvp_call(
             the user wrote a stateful module-method. The caller separately
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
             """
-            return pure_one(state, *other)
+            return cast(tuple[object, State], pure_one(state, *other))
 
         (out, new_state), (tangent_out, _tangent_state) = jax.jvp(
             pure_with_updates,
@@ -1030,7 +1040,7 @@ def _jvp_call(
 
     states_in = tuple(r.state for r in refs)
     state_tangents, stripped_tangents = _split_module_tangents(refs, tangent_args)
-    empty_kwargs: dict[str, Any] = {}
+    empty_kwargs: dict[str, object] = {}
     pure = make_pure_readonly(fn, refs) if mutable_sel is None else make_pure(fn, refs)
 
     if has_aux:
@@ -1040,7 +1050,7 @@ def _jvp_call(
             (out, aux), new_states = pure(states_in, stripped_args, empty_kwargs)
             apply_mutations(refs, list(new_states), mutable_sel)
 
-        def fn_noaux(*a: Any) -> Any:
+        def fn_noaux(*a: object) -> object:
             """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar."""
             value, _aux = fn(*a)
             return value
@@ -1054,7 +1064,7 @@ def _jvp_call(
             )
         else:
 
-            def out_only(states: tuple[State, ...], stripped: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            def out_only(states: tuple[State, ...], stripped: tuple[object, ...], kwargs: dict[str, object]) -> object:
                 """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``."""
                 out_only_val, _ignored_states = pure_noaux(states, stripped, kwargs)
                 return out_only_val
@@ -1075,8 +1085,8 @@ def _jvp_call(
         return out, tangent_out
 
     def pure_with_updates(
-        states: tuple[State, ...], stripped: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[Any, tuple[State, ...]]:
+        states: tuple[State, ...], stripped: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[object, tuple[State, ...]]:
         """Closure that runs the (re-bound) function and returns ``(out, new_state)``.
 
         Used by ``jax.jvp`` so the autodiff transform sees a

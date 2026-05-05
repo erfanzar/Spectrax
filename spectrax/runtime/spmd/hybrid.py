@@ -12,12 +12,10 @@ longer exported or executable.
 
 from __future__ import annotations
 
-from typing import Any
-
 __all__: list[str] = []
 
 
-def hybrid_linear_run(*args: Any, **kwargs: Any) -> Any:
+def hybrid_linear_run(*args: object, **kwargs: object) -> object:
     """Reject calls to the removed hybrid helper.
 
     Raises:

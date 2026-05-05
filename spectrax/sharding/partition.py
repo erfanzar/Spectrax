@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, cast
 
 import jax
 import numpy as np
@@ -130,7 +130,7 @@ def with_partitioning(
     """
     sharding = normalize_sharding(axis_names)
 
-    def wrapped(key: Any, shape: tuple[int, ...], dtype: Any) -> Array:
+    def wrapped(key: object, shape: tuple[int, ...], dtype: object) -> Array:
         """Run the wrapped initializer and stamp its output with sharding metadata."""
         arr = init(key, shape, dtype)
         try:
@@ -273,7 +273,7 @@ def _mpmd_axis_name(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> str | None:
     return None
 
 
-def _drop_axis_name(axis: Any, name: str) -> Any:
+def _drop_axis_name(axis: object, name: str) -> object:
     """Drop ``name`` from a single axis spec, collapsing trivial tuples.
 
     Used to strip the pipeline axis out of a per-dimension spec so the
@@ -325,7 +325,7 @@ def _mesh_axis_size(mesh: "Mesh | SpxMesh | MpMdMesh | None", axis: str) -> int:
         return 1
 
 
-def _query_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None, *, raise_error: bool = True) -> Any:
+def _query_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None, *, raise_error: bool = True) -> object:
     """Return ``mesh`` if given, else fall back to the active mesh context.
 
     The fallback chain is: explicit ``mesh`` argument → SpectraX
@@ -342,7 +342,7 @@ def _query_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None, *, raise_error:
     return get_incontext_mesh(raise_error=raise_error)
 
 
-def _same_mesh_devices(a: Any, b: Any) -> bool:
+def _same_mesh_devices(a: object, b: object) -> bool:
     """Return whether two raw JAX meshes cover the same physical devices."""
     try:
         if tuple(a.axis_names) != tuple(b.axis_names):
@@ -436,7 +436,7 @@ def get_axes_size_in_mesh(
     return product
 
 
-def _sanitize_axis_for_mesh(axis: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> Any:
+def _sanitize_axis_for_mesh(axis: object, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> object:
     """Drop axis-name parts that are not present on ``mesh``.
 
     Symmetric to :func:`_drop_axis_name` but instead of removing one
@@ -459,7 +459,7 @@ def _sanitize_axis_for_mesh(axis: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None")
     return axis if axis in names else None
 
 
-def _axis_partition_product(axis: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> int:
+def _axis_partition_product(axis: object, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> int:
     """Return the total device count implied by an axis spec.
 
     A bare name returns its mesh size; a tuple of names returns the
@@ -533,7 +533,7 @@ def sanitize_partition_spec_for_mesh_and_shape(
     return spec
 
 
-def _sharding_spec(sharding: Any) -> PartitionSpec:
+def _sharding_spec(sharding: object) -> PartitionSpec:
     """Coerce any sharding-like input to a plain :class:`PartitionSpec`.
 
     Accepts a :class:`NamedSharding` (extracts ``.spec``), a
@@ -567,12 +567,12 @@ def _stage_mesh_from_existing_sharding(
         return None
     mesh = existing.mesh
     if mesh.axis_names == mpmd_mesh.spmd_axis_names:
-        return mesh
+        return cast("Mesh", mesh)
     if mesh.axis_names != mpmd_mesh.jax_mesh.axis_names:
         return None
     try:
         if int(mesh.shape[mpmd_mesh.mpmd_axis_name]) == 1:
-            return mesh
+            return cast("Mesh", mesh)
     except Exception:
         return None
     return None
@@ -607,7 +607,7 @@ def _resolve_constraint_target(
     mesh: "Mesh | SpxMesh | MpMdMesh | None",
     stage: int | tuple[int, int] | None,
     stage_mesh: "Mesh | None",
-    metadata: dict[str, Any] | None,
+    metadata: dict[str, object] | None,
 ) -> tuple["Mesh | None", "MpMdMesh | None", bool]:
     """Return ``(target_mesh, mpmd_mesh, unresolved_mpmd)`` for a constraint.
 
@@ -650,7 +650,7 @@ def _resolve_constraint_target(
             existing = getattr(arr, "sharding", None)
             if isinstance(existing, NamedSharding):
                 target = existing.mesh
-        return target, None, False
+        return cast("Mesh | None", target), None, False
 
     if stage_mesh is not None:
         return stage_mesh, mpmd_mesh, False
@@ -693,7 +693,7 @@ def get_current_stage_mesh(
     arr: ArrayLike | None = None,
     stage: int | tuple[int, int] | None = None,
     stage_mesh: "Mesh | None" = None,
-    metadata: dict[str, Any] | None = None,
+    metadata: dict[str, object] | None = None,
     raise_error: bool = False,
 ) -> "Mesh | None":
     """Return the stage-local JAX mesh for the current MPMD context.
@@ -724,12 +724,12 @@ def get_current_stage_mesh(
 
 def with_sharding_constraint(
     arr: ArrayLike,
-    sharding: PartitionSpec | NamedSharding | Any,
+    sharding: PartitionSpec | NamedSharding | object,
     *,
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
     stage: int | tuple[int, int] | None = None,
     stage_mesh: "Mesh | None" = None,
-    metadata: dict[str, Any] | None = None,
+    metadata: dict[str, object] | None = None,
     ignore_mpmd: bool = False,
 ) -> ArrayLike:
     """MPMD-aware variant of :func:`jax.lax.with_sharding_constraint`.
@@ -777,14 +777,17 @@ def with_sharding_constraint(
     if not hasattr(arr, "shape"):
         leaves = jax.tree_util.tree_leaves(arr)
         if any(hasattr(leaf, "shape") for leaf in leaves):
-            return lax_reshard(
-                arr,
-                sharding,
-                mesh=resolved_mesh,
-                stage=stage,
-                stage_mesh=stage_mesh,
-                metadata=metadata,
-                ignore_mpmd=ignore_mpmd,
+            return cast(
+                ArrayLike,
+                lax_reshard(
+                    arr,
+                    sharding,
+                    mesh=resolved_mesh,
+                    stage=stage,
+                    stage_mesh=stage_mesh,
+                    metadata=metadata,
+                    ignore_mpmd=ignore_mpmd,
+                ),
             )
         return arr
     target_mesh, mpmd_mesh, unresolved_mpmd = _resolve_constraint_target(
@@ -821,7 +824,7 @@ def with_sharding_constraint(
         raise
 
 
-def _is_axis_name_like(value: Any) -> bool:
+def _is_axis_name_like(value: object) -> bool:
     """Return ``True`` iff ``value`` is a valid axis-spec component.
 
     Axis names are strings or ``None``; nested tuples are also valid
@@ -835,7 +838,7 @@ def _is_axis_name_like(value: Any) -> bool:
     return False
 
 
-def _is_single_sharding_spec(value: Any) -> bool:
+def _is_single_sharding_spec(value: object) -> bool:
     """Return ``True`` iff ``value`` is a *single* sharding spec, not a pytree of specs.
 
     Used as the ``is_leaf`` predicate in :func:`lax_reshard` so the
@@ -854,15 +857,15 @@ def _is_single_sharding_spec(value: Any) -> bool:
 
 
 def lax_reshard(
-    arr: Any,
-    sharding: PartitionSpec | NamedSharding | Any,
+    arr: object,
+    sharding: PartitionSpec | NamedSharding | object,
     *,
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
     stage: int | tuple[int, int] | None = None,
     stage_mesh: "Mesh | None" = None,
-    metadata: dict[str, Any] | None = None,
+    metadata: dict[str, object] | None = None,
     ignore_mpmd: bool = False,
-) -> Any:
+) -> object:
     """Apply an MPMD-aware sharding constraint to an array or pytree.
 
     Two calling conventions:
@@ -919,7 +922,7 @@ def lax_reshard(
     )
 
 
-def _named_sharding_for_leaf(leaf: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> Any:
+def _named_sharding_for_leaf(leaf: object, mesh: "Mesh | SpxMesh | MpMdMesh | None") -> object:
     """Return a ``NamedSharding`` for ``leaf`` aligned to ``mesh``.
 
     If the leaf already has a :class:`NamedSharding`, its spec is
@@ -947,7 +950,7 @@ def _named_sharding_for_leaf(leaf: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None"
     return NamedSharding(target_mesh, spec)
 
 
-def extract_shardings(tree: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None" = None) -> Any:
+def extract_shardings(tree: object, mesh: "Mesh | SpxMesh | MpMdMesh | None" = None) -> object:
     """Extract a pytree of mesh-aligned :class:`NamedSharding` objects from ``tree``.
 
     For every array leaf, reads the leaf's existing
@@ -971,12 +974,12 @@ def extract_shardings(tree: Any, mesh: "Mesh | SpxMesh | MpMdMesh | None" = None
 
 
 def _extracted_sharding_for_leaf(
-    leaf: Any,
+    leaf: object,
     *,
     mesh: "Mesh | SpxMesh | MpMdMesh | None",
     stage: int | tuple[int, int] | None,
     stage_mesh: "Mesh | None",
-    metadata: dict[str, Any] | None,
+    metadata: dict[str, object] | None,
 ) -> NamedSharding | None:
     """Return a sanitized, MPMD-aware ``NamedSharding`` from a leaf's existing sharding.
 
@@ -1017,13 +1020,13 @@ def _extracted_sharding_for_leaf(
 
 
 def extract_sharding_structure(
-    pytree: Any,
+    pytree: object,
     *,
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
     stage: int | tuple[int, int] | None = None,
     stage_mesh: "Mesh | None" = None,
-    metadata: dict[str, Any] | None = None,
-) -> Any:
+    metadata: dict[str, object] | None = None,
+) -> object:
     """Mirror ``pytree`` with extracted ``NamedSharding`` leaves.
 
     If an MPMD mesh is active or explicitly provided, returned
@@ -1046,10 +1049,10 @@ def extract_sharding_structure(
 
 def match_partition_rules(
     rules: list[tuple[str, PartitionSpec]] | tuple[tuple[str, PartitionSpec], ...],
-    tree: Any,
+    tree: object,
     min_size: int | None = None,
     strict: bool = True,
-) -> Any:
+) -> object:
     """Match regex partition rules against tree paths and preserve tree structure.
 
     Each entry in ``rules`` is a ``(regex, spec)`` pair. For every leaf
@@ -1087,7 +1090,7 @@ def match_partition_rules(
             unmatched leaves silently, prepend a catch-all ``(".", PartitionSpec())``.)
     """
 
-    def _path_to_string(path: tuple[Any, ...], sep: str = "/") -> str:
+    def _path_to_string(path: tuple[object, ...], sep: str = "/") -> str:
         """Render a JAX tree-key path as a forward-slash-separated string."""
         parts: list[str] = []
         for key in path:
@@ -1103,7 +1106,7 @@ def match_partition_rules(
                 parts.append(str(key))
         return sep.join(parts)
 
-    def _spec_for(path: str, leaf: Any) -> PartitionSpec:
+    def _spec_for(path: str, leaf: object) -> PartitionSpec:
         """Pick the first matching rule's ``PartitionSpec`` for one leaf.
 
         Honors the ``strict`` and ``min_size`` outer arguments:
@@ -1130,9 +1133,9 @@ def match_partition_rules(
 
 
 def make_shard_and_gather_fns(
-    partition_specs: Any,
+    partition_specs: object,
     mesh: "Mesh | SpxMesh | MpMdMesh | None" = None,
-) -> tuple[Any, Any]:
+) -> tuple[object, object]:
     """Build shard / gather helper pytrees matching ``partition_specs``.
 
     Returns a pair of pytrees with the same structure as
@@ -1166,7 +1169,7 @@ def make_shard_and_gather_fns(
     if target_mesh is None:
         raise ValueError("mesh must be provided to make_shard_and_gather_fns")
 
-    def _named(raw_spec: Any) -> NamedSharding:
+    def _named(raw_spec: object) -> NamedSharding:
         """Wrap a raw spec in a ``NamedSharding`` bound to the closure's mesh."""
         if not isinstance(raw_spec, PartitionSpec):
             raw_spec = PartitionSpec()
@@ -1246,10 +1249,10 @@ def get_corrected_named_sharding(
 
 def apply_logical_sharding(
     x: ArrayLike,
-    partition_manager: Any | None = NOT_GIVEN,
-    axes: tuple[Any, ...] | list[Any] | None = NOT_GIVEN,
-    mode: Any = NOT_GIVEN,
-    dynamic_axes: Any | None = NOT_GIVEN,
+    partition_manager: object | None = NOT_GIVEN,
+    axes: tuple[object, ...] | list[object] | None = NOT_GIVEN,
+    mode: object = NOT_GIVEN,
+    dynamic_axes: object | None = NOT_GIVEN,
     auto_correct: bool = True,
 ) -> ArrayLike:
     """Apply a logical sharding constraint without depending on eformer.
@@ -1301,7 +1304,7 @@ def _identity_mesh_axis_rules(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -
     return {name: name for name in axis_names}
 
 
-def named_sharding_for_metadata(metadata: dict[str, Any], mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding | None:
+def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding | None:
     """Resolve raw variable-style ``metadata`` to a :class:`NamedSharding`.
 
     Reads a ``Variable``-style metadata dict (the kind returned from

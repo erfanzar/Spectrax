@@ -92,7 +92,7 @@ Shape = tp.Sequence[int]
 Mesh = jax.sharding.Mesh
 AxisNames = tuple[str, ...]
 AxisIdxes = tuple[int, ...]
-AxisType = tuple[str, ...] | str | tp.Any | None
+AxisType = tuple[str, ...] | str | _Empty | None
 
 EMPTY: tp.Final = "_"
 BATCH: tp.Final = "__BATCH__"

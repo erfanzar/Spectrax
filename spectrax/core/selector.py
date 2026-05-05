@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
-from typing import Any, TypeAlias
+from typing import TypeAlias
 
 from ._typing import Path
 from .errors import SelectorError
@@ -55,7 +55,7 @@ ModulePred: TypeAlias = Callable[[Module, str], bool]
 VariablePred: TypeAlias = Callable[[Variable, str], bool]
 """``(variable, path) -> bool`` predicate type applied per variable."""
 
-AnyPred: TypeAlias = Callable[[Any, str], bool]
+AnyPred: TypeAlias = Callable[[object, str], bool]
 """Predicate tolerant of both modules and variables as the first argument."""
 
 SelectorSugar: TypeAlias = "Selector | str | type | Iterable[str | type] | VariablePred | None"
@@ -446,10 +446,10 @@ class Selector:
         matched_paths: set[tuple[str, str]] = set()
         for p, v in self.apply(module):
             matched_paths.add((v.kind, p))
-        matched_nested: dict[str, dict[str, Any]] = {}
-        rest_nested: dict[str, dict[str, Any]] = {}
-        matched_writers: dict[tuple[str, str], Any] | None = {} if state._writers is not None else None
-        rest_writers: dict[tuple[str, str], Any] | None = {} if state._writers is not None else None
+        matched_nested: dict[str, dict[str, object]] = {}
+        rest_nested: dict[str, dict[str, object]] = {}
+        matched_writers: dict[tuple[str, str], object] | None = {} if state._writers is not None else None
+        rest_writers: dict[tuple[str, str], object] | None = {} if state._writers is not None else None
         for c, path, val in state.items():
             is_match = (c, path) in matched_paths
             tgt = matched_nested if is_match else rest_nested
@@ -465,7 +465,7 @@ class Selector:
             rest_nested, writers=rest_writers
         )
 
-    def set(self, module: Module, fn: Callable[[Variable], Any]) -> None:
+    def set(self, module: Module, fn: Callable[[Variable]]) -> None:
         """In-place update: write ``fn(var)`` to ``var.value`` for every match.
 
         Walks ``module`` via :meth:`apply` and assigns ``var.value =
@@ -509,7 +509,7 @@ def as_selector(x: SelectorSugar) -> Selector:
     * ``None`` — returns a selector that matches nothing.
 
     Args:
-        x: Any :data:`SelectorSugar` value.
+        x: object :data:`SelectorSugar` value.
 
     Returns:
         A :class:`Selector` representing the input.

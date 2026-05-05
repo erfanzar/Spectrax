@@ -7,14 +7,13 @@
 from __future__ import annotations
 
 import sys
-import typing as tp
 from datetime import datetime
 
 import numpy as np
 
 from spectrax._internal.logging import COLORS
 
-from .base import ArrayLike, BaseBackend, Scalar
+from .base import ArrayLike, BaseBackend, LogValue, Scalar
 
 _KIND_COLORS: dict[str, str] = {
     "scalar": COLORS["GREEN"],
@@ -120,7 +119,7 @@ class ConsoleBackend(BaseBackend):
         clipped = text[:120] + ("…" if len(text) > 120 else "")
         self._print("text", tag, repr(clipped), step)
 
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Print hyper-parameters as a key-value list.
 
         Args:
@@ -136,7 +135,7 @@ class ConsoleBackend(BaseBackend):
         for k, v in hparams.items():
             print(f"  {bold}{k}{reset} = {v}", file=sys.stdout, flush=True)
 
-    def log_table(self, tag: str, columns: list[str], rows: list[list[tp.Any]], step: int) -> None:
+    def log_table(self, tag: str, columns: list[str], rows: list[list[LogValue]], step: int) -> None:
         """Tables are intentionally skipped in console output."""
         pass
 

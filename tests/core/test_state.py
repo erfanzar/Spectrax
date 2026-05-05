@@ -111,11 +111,12 @@ def test_filter_copy_returns_detached_state():
 
 
 def test_merge_other_wins_on_collision():
-    """``merge`` mutates in place by default and prefers ``other`` on collision."""
+    """``merge`` returns a fresh state and prefers ``other`` on collision."""
     a = State({"parameters": {"w": 1}})
     b = State({"parameters": {"w": 2, "b": 3}})
     out = a.merge(b)
-    assert out is a
+    assert out is not a
+    assert a["parameters"]["w"] == 1
     assert out["parameters"]["w"] == 2
     assert out["parameters"]["b"] == 3
 

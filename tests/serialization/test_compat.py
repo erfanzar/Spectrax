@@ -12,13 +12,11 @@ from spectrax.serialization._compat import PyTree, flatten_dict
 
 
 class TestPyTree:
-    """PyTree is simply a type alias for Any."""
+    """PyTree uses object as the dynamic top type."""
 
-    def test_is_any(self):
-        """Is any."""
-        import typing
-
-        assert PyTree is typing.Any
+    def test_is_object(self):
+        """Is object."""
+        assert PyTree is object
 
 
 class TestFlattenDict:

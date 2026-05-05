@@ -33,7 +33,6 @@ import functools
 import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import jax
 import numpy as np
@@ -87,7 +86,7 @@ class StageRegionSpec:
     donate_argnums: tuple[int, ...] | None
 
 
-def _normalize_optional_argnums(argnums: Any) -> tuple[int, ...] | None:
+def _normalize_optional_argnums(argnums: object) -> tuple[int, ...] | None:
     """Coerce optional argnum spec to a tuple of ints (or ``None``).
 
     Accepts ``None``, a single ``int``, or any iterable of ints. Each
@@ -110,10 +109,10 @@ def _normalize_optional_argnums(argnums: Any) -> tuple[int, ...] | None:
 def _make_stage_region_spec(
     name: str | None,
     *,
-    schedule: Any = None,
-    batch_argnums: Any = None,
-    static_argnums: Any = None,
-    donate_argnums: Any = None,
+    schedule: object = None,
+    batch_argnums: object = None,
+    static_argnums: object = None,
+    donate_argnums: object = None,
 ) -> StageRegionSpec:
     """Build a :class:`StageRegionSpec` from user-facing :func:`sxstage_region` kwargs.
 
@@ -145,7 +144,7 @@ def _make_stage_region_spec(
     )
 
 
-def _is_marker_leaf(x: Any) -> bool:
+def _is_marker_leaf(x: object) -> bool:
     """Return whether ``x`` can safely be used as a JAX primitive operand."""
     dtype = getattr(getattr(x, "aval", None), "dtype", getattr(x, "dtype", None))
     if dtype is not None and not np.issubdtype(np.dtype(dtype), np.inexact):
@@ -153,10 +152,10 @@ def _is_marker_leaf(x: Any) -> bool:
     return hasattr(x, "aval") or isinstance(x, jax.Array)
 
 
-def _bind_stage_region_marker(x: Any, primitive: Primitive, *, spec: StageRegionSpec) -> Any:
+def _bind_stage_region_marker(x: object, primitive: Primitive, *, spec: StageRegionSpec) -> object:
     """Mark every JAX value leaf in ``x`` while leaving static leaves unchanged."""
 
-    def mark_leaf(leaf: Any) -> Any:
+    def mark_leaf(leaf: object) -> object:
         """Bind one leaf to the region primitive if it is a JAX traceable value."""
         if not _is_marker_leaf(leaf):
             return leaf
@@ -166,14 +165,14 @@ def _bind_stage_region_marker(x: Any, primitive: Primitive, *, spec: StageRegion
     return jax.tree_util.tree_map(mark_leaf, x)
 
 
-def _normalize_sharding_axis(axis: Any) -> Any:
+def _normalize_sharding_axis(axis: object) -> object:
     """Return a hashable axis-spec component for primitive metadata."""
     if isinstance(axis, list | tuple):
         return tuple(_normalize_sharding_axis(part) for part in axis)
     return axis
 
 
-def _normalize_edge_sharding(sharding: Any) -> PartitionSpec | None:
+def _normalize_edge_sharding(sharding: object) -> PartitionSpec | None:
     """Normalize user-facing edge sharding metadata to a ``PartitionSpec``."""
     if sharding is None:
         return None
@@ -194,7 +193,7 @@ def _normalize_edge_sharding(sharding: Any) -> PartitionSpec | None:
     return PartitionSpec(*(_normalize_sharding_axis(part) for part in parts))
 
 
-def sxstage_iter(x: Any, *, stage: int | None = None, sharding: Any = None) -> Any:
+def sxstage_iter(x: object, *, stage: int | None = None, sharding: object = None) -> object:
     """Declare a pipeline-stage boundary in the traced function.
 
     Functionally the identity — the marker survives in the jaxpr but
@@ -299,11 +298,11 @@ batching.primitive_batchers[sxstage_iter_p] = _mpmd_stage_iter_batch
 def sxstage_region(
     name: str | Callable | None = None,
     *,
-    schedule: Any = None,
-    batch_argnums: Any = None,
-    static_argnums: Any = None,
-    donate_argnums: Any = None,
-) -> Any:
+    schedule: object = None,
+    batch_argnums: object = None,
+    static_argnums: object = None,
+    donate_argnums: object = None,
+) -> object:
     """Declare an independently schedulable pipeline stage region.
 
     ``sxstage_region`` is a lightweight wrapper/decorator that records
@@ -395,7 +394,7 @@ class _StageRegion:
             raise TypeError("sxstage_region(...) expects a callable to wrap.")
 
         @functools.wraps(fn)
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
+        def wrapped(*args: object, **kwargs: object) -> object:
             """Run the original function with region markers on args/kwargs and output."""
             marked_args, marked_kwargs = self.enter((args, kwargs))
             out = fn(*marked_args, **marked_kwargs)
@@ -407,16 +406,16 @@ class _StageRegion:
         """Enter the context-manager protocol; returns ``self``."""
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
         """Exit the context-manager protocol; does not suppress exceptions."""
         del exc_type, exc, tb
         return False
 
-    def enter(self, x: Any) -> Any:
+    def enter(self, x: object) -> object:
         """Insert a region-enter marker around ``x``."""
         return _bind_stage_region_marker(x, sxstage_region_enter_p, spec=self.spec)
 
-    def exit(self, x: Any) -> Any:
+    def exit(self, x: object) -> object:
         """Insert a region-exit marker around ``x``."""
         return _bind_stage_region_marker(x, sxstage_region_exit_p, spec=self.spec)
 
@@ -479,7 +478,7 @@ batching.primitive_batchers[sxstage_region_enter_p] = _mpmd_stage_region_batch
 batching.primitive_batchers[sxstage_region_exit_p] = _mpmd_stage_region_batch
 
 
-def sxenter_loop(x: Any, *, name: str | None = None) -> Any:
+def sxenter_loop(x: object, *, name: str | None = None) -> object:
     """Mark the start of a repeated computation block.
 
     Functionally the identity.  When the enclosing function is traced by
@@ -501,7 +500,7 @@ def sxenter_loop(x: Any, *, name: str | None = None) -> Any:
     return jax.tree_util.tree_unflatten(treedef, out_flat)
 
 
-def sxexit_loop(x: Any, *, name: str | None = None) -> Any:
+def sxexit_loop(x: object, *, name: str | None = None) -> object:
     """Mark the end of a repeated computation block.
 
     See :func:`sxenter_loop` for details.
@@ -597,14 +596,14 @@ mlir.register_lowering(sxexit_loop_p, _mpmd_exit_loop_lowering)
 
 
 def sxloop(
-    body_fn: Any,
-    init: Any,
-    xs: Any = None,
+    body_fn: object,
+    init: object,
+    xs: object = None,
     *,
     length: int | None = None,
     reverse: bool = False,
     unroll: int = 1,
-) -> Any:
+) -> object:
     """Repeatedly apply ``body_fn`` using :func:`jax.lax.scan`.
 
     This is a thin wrapper with a friendlier name.  The main benefit over
@@ -778,7 +777,7 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
     specs: list[StageRegionSpec] = []
     seen: set[int] = set()
 
-    def visit_obj(obj: Any) -> None:
+    def visit_obj(obj: object) -> None:
         """Recursively inspect ``obj`` for nested jaxprs and region primitives.
 
         Guards against cycles via the ``seen`` id-set. Dictionaries,
@@ -1080,10 +1079,10 @@ def cluster_jaxpr_by_markers(
 
 
 def split_by_markers(
-    fn: Any,
-    *abstract_args: Any,
+    fn: object,
+    *abstract_args: object,
     return_clusters: bool = False,
-) -> Any:
+) -> object:
     """Trace ``fn`` and split it at every :func:`sxstage_iter`.
 
     Returns a list of per-stage Python callables. Each callable takes

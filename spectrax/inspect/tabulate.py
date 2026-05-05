@@ -20,8 +20,6 @@ Provides four entry points:
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 
@@ -110,9 +108,9 @@ def count_bytes(module: Module, *, collection: str = "parameters") -> int:
 
 def tabulate(
     module: Module,
-    *example_args: Any,
+    *example_args: object,
     depth: int | None = None,
-    **example_kwargs: Any,
+    **example_kwargs: object,
 ) -> str:
     """Build a per-submodule ``(path, class, parameters, bytes)`` table.
 
@@ -182,7 +180,7 @@ def tabulate(
     return "\n".join(lines)
 
 
-def hlo_cost(module: Module, *example_args: Any, **example_kwargs: Any) -> dict[str, float]:
+def hlo_cost(module: Module, *example_args: object, **example_kwargs: object) -> dict[str, float]:
     """Probe XLA's cost model for ``module(*example_args, **example_kwargs)``.
 
     Wraps the call in a fresh closure, lowers it via :func:`jax.jit`
@@ -205,7 +203,7 @@ def hlo_cost(module: Module, *example_args: Any, **example_kwargs: Any) -> dict[
     """
     try:
 
-        def run(*args: Any, **kwargs: Any) -> Any:
+        def run(*args: object, **kwargs: object) -> object:
             """Trivial closure that calls ``module`` with the given args.
 
             Exists purely so :func:`jax.jit` has a concrete callable

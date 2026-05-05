@@ -14,7 +14,7 @@ the live input modules are never disturbed by an abstract trace.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
 
 import jax
 
@@ -23,7 +23,7 @@ from .split_merge import locate_and_strip, make_pure
 __all__ = ["eval_shape"]
 
 
-def eval_shape(fn: Any, *args: Any, **kwargs: Any) -> Any:
+def eval_shape(fn: Callable[..., object], *args: object, **kwargs: object) -> object:
     """Compute the abstract output shape of ``fn`` without running it.
 
     Module-aware analogue of :func:`jax.eval_shape`. Module inputs are

@@ -43,18 +43,26 @@ import dataclasses
 import hashlib
 import threading
 import typing as tp
+from types import TracebackType
 
 import jax
 from jax.sharding import PartitionSpec
 
 from .. import common_types as ct
+from ..core._typing import Array
 from .partition import get_corrected_named_sharding, with_sharding_constraint
 
-_CURRENT_PARTITION_MANAGER = contextvars.ContextVar("_CURRENT_PARTITION_MANAGER", default=None)
-_LAST_PARTITION_MANAGER: tp.Any = None
+AxisRule: tp.TypeAlias = ct.AxisType | list[ct.AxisType] | tuple[ct.AxisType, ...]
+RegisteredAxes: tp.TypeAlias = dict[str, dict[str, AxisRule]]
+
+_CURRENT_PARTITION_MANAGER: contextvars.ContextVar[PartitionManager | None] = contextvars.ContextVar(
+    "_CURRENT_PARTITION_MANAGER",
+    default=None,
+)
+_LAST_PARTITION_MANAGER: PartitionManager | None = None
 
 
-def _to_hashable(value: tp.Any) -> tp.Any:
+def _to_hashable(value: object) -> object:
     """Convert an arbitrary value into a stable, hashable representation.
 
     Used by :func:`hash_fn` to give SpectraX dataclasses a deterministic
@@ -90,7 +98,7 @@ def _to_hashable(value: tp.Any) -> tp.Any:
     return value
 
 
-def hash_fn(self) -> int:
+def hash_fn(self: object) -> int:
     """Generic ``__hash__`` implementation for SpectraX dataclasses.
 
     Builds the hash from ``self.__class__.__qualname__`` plus a stable,
@@ -120,7 +128,7 @@ def hash_fn(self) -> int:
     return hash((self.__class__.__qualname__, _to_hashable(vars(self))))
 
 
-def get_safe_hash_int(text: tp.Any, algorithm: str = "md5") -> int:
+def get_safe_hash_int(text: object, algorithm: str = "md5") -> int:
     """Hash any object to a deterministic, large positive integer.
 
     Useful for deriving stable seeds, cache keys, or shard indexes from
@@ -263,16 +271,16 @@ class PartitionAxis:
         "attention_kv_dim_axis": "decode_attention_kv_dim_axis",
     }
     _REGISTRY_LOCK: tp.ClassVar[threading.RLock] = threading.RLock()
-    _REGISTERED_SEMANTIC_MAP: tp.ClassVar[dict[str, tp.Any]] = {}
-    _REGISTERED_GENERATION_MAP: tp.ClassVar[dict[str, tp.Any]] = {}
+    _REGISTERED_SEMANTIC_MAP: tp.ClassVar[dict[str, AxisRule]] = {}
+    _REGISTERED_GENERATION_MAP: tp.ClassVar[dict[str, AxisRule]] = {}
 
     @classmethod
     def register(
         cls,
         semantic_axis: str,
-        axis_rule: tp.Any,
+        axis_rule: AxisRule,
         *,
-        generation_axis_rule: tp.Any = ct.NOT_GIVEN,
+        generation_axis_rule: AxisRule = ct.NOT_GIVEN,
         override: bool = False,
     ) -> None:
         """Register a new symbolic-axis name for all ``PartitionAxis`` instances.
@@ -370,7 +378,7 @@ class PartitionAxis:
             cls._REGISTERED_GENERATION_MAP.clear()
 
     @classmethod
-    def get_registered_axes(cls) -> dict[str, dict[str, tp.Any]]:
+    def get_registered_axes(cls) -> RegisteredAxes:
         """Return a snapshot of all runtime-registered symbolic axes.
 
         Returns:
@@ -396,7 +404,7 @@ class PartitionAxis:
             }
 
     @classmethod
-    def _lookup_semantic_mapping(cls, semantic_axis: str) -> tp.Any:
+    def _lookup_semantic_mapping(cls, semantic_axis: str) -> AxisRule | None:
         """Look up a symbolic axis name in the registry, then in the built-ins.
 
         Runtime-registered axes shadow built-in ones with the same
@@ -408,7 +416,7 @@ class PartitionAxis:
         return cls._SEMANTIC_MAP.get(semantic_axis)
 
     @classmethod
-    def _lookup_generation_mapping(cls, semantic_axis: str) -> tp.Any:
+    def _lookup_generation_mapping(cls, semantic_axis: str) -> AxisRule:
         """Look up the generation-mode override for a registered axis.
 
         Returns :data:`~spectrax.common_types.NOT_GIVEN` if the axis
@@ -418,7 +426,7 @@ class PartitionAxis:
         """
         return cls._REGISTERED_GENERATION_MAP.get(semantic_axis, ct.NOT_GIVEN)
 
-    def _resolve_axis_rule(self, axis_rule: tp.Any, _visited: set[str] | None = None) -> tp.Any:
+    def _resolve_axis_rule(self, axis_rule: AxisRule, _visited: set[str] | None = None) -> AxisRule:
         """Recursively resolve an axis rule down to a concrete mesh-axis name.
 
         Handles the four shapes a rule can take:
@@ -446,10 +454,16 @@ class PartitionAxis:
                 semantic-axis graph.
         """
         if isinstance(axis_rule, list):
-            return [self._resolve_axis_rule(item, set(_visited) if _visited is not None else None) for item in axis_rule]
+            return tp.cast(
+                AxisRule,
+                [self._resolve_axis_rule(item, set(_visited) if _visited is not None else None) for item in axis_rule],
+            )
         if isinstance(axis_rule, tuple):
-            return tuple(
-                self._resolve_axis_rule(item, set(_visited) if _visited is not None else None) for item in axis_rule
+            return tp.cast(
+                AxisRule,
+                tuple(
+                    self._resolve_axis_rule(item, set(_visited) if _visited is not None else None) for item in axis_rule
+                ),
             )
         if isinstance(axis_rule, str):
             if hasattr(self, axis_rule):
@@ -478,9 +492,9 @@ class PartitionAxis:
         weights on ``tp``, and experts on ``ep``. ``decode_*`` fields
         mirror their non-decode counterparts unless explicitly set.
         """
-        resolved_values: dict[str, tp.Any] = {}
+        resolved_values: dict[str, ct.AxisType] = {}
 
-        def resolve_field(name: str, default_logic: tp.Callable[[], tp.Any]) -> None:
+        def resolve_field(name: str, default_logic: tp.Callable[[], ct.AxisType]) -> None:
             """Helper: store ``default_logic()`` for ``name`` if currently ``NOT_GIVEN``.
 
             Otherwise keep the user-provided value. Idempotent within
@@ -492,7 +506,7 @@ class PartitionAxis:
             elif name not in resolved_values:
                 resolved_values[name] = current_value
 
-        def get_resolved(name: str) -> tp.Any:
+        def get_resolved(name: str) -> ct.AxisType:
             """Return the just-resolved value for ``name`` (or the live attr)."""
             return resolved_values.get(name, getattr(self, name))
 
@@ -583,7 +597,7 @@ class PartitionAxis:
                 continue
 
             if isinstance(axis_name, list | tuple):
-                standard_rule: list[tp.Any] = []
+                standard_rule: list[ct.AxisType] = []
                 for sub_axis in axis_name:
                     if sub_axis is None or sub_axis == ct.EMPTY:
                         standard_rule.append(None)
@@ -600,7 +614,7 @@ class PartitionAxis:
             target_rule = standard_rule
             if mode in ct.GENERATION_MODES:
                 if isinstance(axis_name, list | tuple):
-                    gen_composite: list[tp.Any] = []
+                    gen_composite: list[ct.AxisType] = []
                     any_changed = False
                     for idx, sub_axis in enumerate(axis_name):
                         sub_standard = standard_rule[idx]
@@ -658,7 +672,7 @@ class PartitionAxis:
         """
         return PartitionSpec(*self.resolve_axis(axes=axes, mode=mode))
 
-    def to_dict(self) -> dict[str, tp.Any]:
+    def to_dict(self) -> dict[str, ct.AxisType]:
         """Return a plain ``dict`` of every dataclass field.
 
         Useful for serialization (config dump, JSON export) and for
@@ -699,7 +713,12 @@ class PartitionManager:
     """
 
     paxis: PartitionAxis
-    _context_token: tp.Any = dataclasses.field(default=None, init=False, repr=False, compare=False)
+    _context_token: contextvars.Token[PartitionManager | None] | None = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         """Validate ``paxis`` and record this instance as the most-recent manager."""
@@ -716,7 +735,12 @@ class PartitionManager:
         _LAST_PARTITION_MANAGER = self
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
         """Restore the previous active manager. Always re-raises (returns ``False``)."""
         token = getattr(self, "_context_token", None)
         if token is not None:
@@ -827,7 +851,7 @@ class PartitionManager:
         spec = self.resolve(axes=axes, mode=mode, dynamic_axes=dynamic_axes, shape=x.shape)
         if auto_correct:
             spec = get_corrected_named_sharding(x.shape, spec, raise_mesh_error=False).spec
-        return with_sharding_constraint(x, spec)
+        return tp.cast(Array, with_sharding_constraint(x, spec))
 
     def __str__(self) -> str:
         """Return a short, hash-stable string repr (the manager is opaque)."""

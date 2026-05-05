@@ -29,7 +29,7 @@ fly without recording a new stream.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -463,7 +463,7 @@ def _to_typed_key(x: ArrayLike) -> Array:
     view of the input.
     """
     if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jax.dtypes.prng_key):
-        return x
+        return cast(Array, x)
     return jax.random.wrap_key_data(jnp.asarray(x, dtype=jnp.uint32))
 
 

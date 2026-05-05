@@ -40,7 +40,7 @@ import hashlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -83,7 +83,7 @@ def has_pscan(jaxpr: Jaxpr) -> list[JaxprEqn]:
     return [e for e in jaxpr.eqns if e.primitive is pscan_p]
 
 
-def _eqn_params(eqn: JaxprEqn) -> dict[str, Any]:
+def _eqn_params(eqn: JaxprEqn) -> dict[str, object]:
     """Return a JAX equation's primitive parameter dict.
 
     Older JAX exposed the parameters dict as ``eqn.params``; some newer
@@ -91,7 +91,7 @@ def _eqn_params(eqn: JaxprEqn) -> dict[str, Any]:
     so the rest of the compiler does not have to branch.
 
     Args:
-        eqn: Any :class:`JaxprEqn`.
+        eqn: object :class:`JaxprEqn`.
 
     Returns:
         The equation's parameter mapping (empty if neither attribute
@@ -128,12 +128,12 @@ class _ScopedPersistentCacheJit:
     executable cache is hot and later calls run at normal dispatch speed.
     """
 
-    def __init__(self, jitted: Callable[..., Any]) -> None:
+    def __init__(self, jitted: Callable[..., object]) -> None:
         self._jitted = jitted
         self._compiled_once = False
         functools.update_wrapper(self, jitted)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         if self._compiled_once:
             return self._jitted(*args, **kwargs)
 
@@ -155,7 +155,7 @@ class _ScopedPersistentCacheJit:
                 jax.config.update("jax_enable_compilation_cache", was_enabled)
                 _reset_jax_persistent_cache_state()
 
-    def lower(self, *args: Any, **kwargs: Any) -> Any:
+    def lower(self, *args: object, **kwargs: object) -> object:
         with _persistent_cache_scope_lock:
             was_enabled = bool(jax.config.jax_enable_compilation_cache)
             if not was_enabled:
@@ -168,11 +168,11 @@ class _ScopedPersistentCacheJit:
                 jax.config.update("jax_enable_compilation_cache", was_enabled)
                 _reset_jax_persistent_cache_state()
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         return getattr(self._jitted, name)
 
 
-def _rebase_concrete_mesh(orig_mesh: Any, target_stage_mesh: Mesh) -> Any:
+def _rebase_concrete_mesh(orig_mesh: object, target_stage_mesh: Mesh) -> object:
     """Place ``orig_mesh``'s axis layout onto ``target_stage_mesh``'s devices.
 
     Cluster jaxprs are traced once on rank 0's stage submesh. When another
@@ -247,7 +247,7 @@ def _rebase_named_sharding(sharding: NamedSharding, target_stage_mesh: Mesh) -> 
     return rebased
 
 
-def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: Any) -> Jaxpr:
+def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: object) -> Jaxpr:
     """Rebind concrete devices in nested mesh params to the current rank.
 
     Cluster jaxprs are traced once and then evaluated inside per-rank
@@ -268,7 +268,7 @@ def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: Any) -> Jaxpr:
     if not isinstance(stage_mesh, Mesh):
         return jaxpr
 
-    def rebase_value(value: Any) -> Any:
+    def rebase_value(value: object) -> object:
         if isinstance(value, ClosedJaxpr):
             return ClosedJaxpr(_rebase_jaxpr_mesh_params(value.jaxpr, stage_mesh), value.consts)
         if isinstance(value, Jaxpr):
@@ -278,7 +278,7 @@ def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: Any) -> Jaxpr:
         if isinstance(value, NamedSharding):
             return _rebase_named_sharding(value, stage_mesh)
         if type(value) is tuple:
-            return tuple[Any, ...](rebase_value(item) for item in value)
+            return tuple[object, ...](rebase_value(item) for item in value)
         if type(value) is list:
             return [rebase_value(item) for item in value]
         if type(value) is dict:
@@ -306,39 +306,39 @@ class PscanPlan:
     v: int
     n_logical: int
     m: int
-    schedule: Any
+    schedule: object
     ops: tuple[Op, ...]
     n_outs: int
     n_outer_consts: int
     body_mode: str
 
-    stage_shardings: list[Any]
-    rank_submeshes: list[Any]
+    stage_shardings: list[object]
+    rank_submeshes: list[object]
     mpmd_mesh: MpMdMesh
 
     loc_for_logical: tuple[tuple[int, int], ...]
     logical_for_loc: dict[tuple[int, int], int]
     terminal_loc: tuple[int, int]
 
-    per_loc_consts: dict[tuple[int, int], tuple[Any, ...]]
+    per_loc_consts: dict[tuple[int, int], tuple[object, ...]]
     const_indices_per_loc: dict[tuple[int, int], tuple[int, ...]]
     n_invars_per_loc: dict[tuple[int, int], int]
 
-    fwd_jits: dict[tuple[int, int], Callable[..., Any]]
-    bwd_jits: dict[tuple[int, int], Callable[..., Any] | None]
-    terminal_jit: Callable[..., Any]
+    fwd_jits: dict[tuple[int, int], Callable[..., object]]
+    bwd_jits: dict[tuple[int, int], Callable[..., object] | None]
+    terminal_jit: Callable[..., object]
 
-    init_state_template: list[Any]
+    init_state_template: list[object]
 
-    grad_tree: Any | None = None
+    grad_tree: object | None = None
     grad_const_indices: tuple[int, ...] = ()
-    grad_template_leaves: tuple[Any, ...] = ()
-    grad_output_sharding: Any | None = None
+    grad_template_leaves: tuple[object, ...] = ()
+    grad_output_sharding: object | None = None
 
     invar_sources: list[list[tuple[str, int, int]]] = field(default_factory=list)
-    edge_shardings: list[Any] = field(default_factory=list)
+    edge_shardings: list[object] = field(default_factory=list)
 
-    grid: list[list[Any]] = field(default_factory=list)
+    grid: list[list[object]] = field(default_factory=list)
 
 
 def _collect_used_constvars(cluster: Jaxpr) -> list[Var]:
@@ -372,13 +372,13 @@ def _filtered_cluster(cluster: Jaxpr, used_constvars: list[Var]) -> Jaxpr:
 def _place_cluster_consts(
     used_vars: list[Var],
     all_constvars: list[Var],
-    concrete_consts: tuple[Any, ...],
+    concrete_consts: tuple[object, ...],
     const_flat_arg_indices: tuple[int | None, ...],
-    leaf_shardings: dict[int, Any],
+    leaf_shardings: dict[int, object],
     leaf_stage_owners: dict[int, int],
-    fallback_sharding: Any,
+    fallback_sharding: object,
     expected_rank: int,
-) -> tuple[Any, ...]:
+) -> tuple[object, ...]:
     """Pick concrete values for ``used_vars`` and place them on the owning stage mesh.
 
     ``concrete_consts`` is aligned with ``all_constvars``: entry ``i``
@@ -390,7 +390,7 @@ def _place_cluster_consts(
     sub-mesh.
     """
     const_idx_by_id = {id(v): i for i, v in enumerate(all_constvars)}
-    placed: list[Any] = []
+    placed: list[object] = []
     for var in used_vars:
         const_idx = const_idx_by_id[id(var)]
         flat_arg_idx = const_flat_arg_indices[const_idx]
@@ -409,7 +409,7 @@ def _place_cluster_consts(
     return tuple(placed)
 
 
-def _stage_compile_tag(stage_mesh: Any) -> int:
+def _stage_compile_tag(stage_mesh: object) -> int:
     """Return a per-rank tag that distinguishes stage compiles in the XLA cache.
 
     Two stages on different ranks produce structurally identical cluster
@@ -430,7 +430,7 @@ def _stage_compile_tag(stage_mesh: Any) -> int:
     return int(min(d.id for d in stage_mesh.devices.flatten()))
 
 
-def _mesh_fingerprint(mesh: Mesh) -> tuple[Any, ...]:
+def _mesh_fingerprint(mesh: Mesh) -> tuple[object, ...]:
     """Return a stable fingerprint for a concrete mesh embedded in a stage jaxpr.
 
     The persistent XLA cache key normally sees StableHLO plus compile options,
@@ -454,7 +454,7 @@ def _mesh_fingerprint(mesh: Mesh) -> tuple[Any, ...]:
     return (tuple(map(str, mesh.axis_names)), shape, axis_types, devices)
 
 
-def _collect_mesh_fingerprints(value: Any, out: list[tuple[Any, ...]]) -> None:
+def _collect_mesh_fingerprints(value: object, out: list[tuple[object, ...]]) -> None:
     """Append fingerprints for every concrete mesh reachable from ``value``."""
     if isinstance(value, ClosedJaxpr):
         _collect_mesh_fingerprints(value.jaxpr, out)
@@ -479,9 +479,9 @@ def _collect_mesh_fingerprints(value: Any, out: list[tuple[Any, ...]]) -> None:
             _collect_mesh_fingerprints(value[key], out)
 
 
-def _stage_jit_name_suffix(cluster_jaxpr: Jaxpr, stage_mesh: Any) -> str:
+def _stage_jit_name_suffix(cluster_jaxpr: Jaxpr, stage_mesh: object) -> str:
     """Build a cache-visible suffix for one concrete MPMD stage executable."""
-    parts: list[tuple[Any, ...]] = []
+    parts: list[tuple[object, ...]] = []
     if isinstance(stage_mesh, Mesh):
         parts.append(("stage", _mesh_fingerprint(stage_mesh)))
     _collect_mesh_fingerprints(cluster_jaxpr, parts)
@@ -489,7 +489,7 @@ def _stage_jit_name_suffix(cluster_jaxpr: Jaxpr, stage_mesh: Any) -> str:
     return f"rank{_stage_compile_tag(stage_mesh)}_{digest}"
 
 
-def _scope_stage_persistent_cache(jitted: Callable[..., Any]) -> Callable[..., Any]:
+def _scope_stage_persistent_cache(jitted: Callable[..., object]) -> Callable[..., object]:
     """Disable persistent disk caching for Spectrax schedule-stage executables only.
 
     The MPMD scheduler creates per-stage programs by evaluating split jaxprs
@@ -506,8 +506,8 @@ def _scope_stage_persistent_cache(jitted: Callable[..., Any]) -> Callable[..., A
 def _make_fwd_jit(
     cluster_jaxpr: Jaxpr,
     donate_argnums: tuple[int, ...] = (),
-    stage_mesh: Any | None = None,
-) -> Callable[..., tuple[Any, ...]]:
+    stage_mesh: object | None = None,
+) -> Callable[..., tuple[object, ...]]:
     """Return ``@jax.jit`` callable ``(consts, *invars) -> outvars`` for a non-terminal cluster.
 
     Consts are passed as an explicit first argument (not closure-captured)
@@ -520,7 +520,7 @@ def _make_fwd_jit(
 
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
 
-    def fwd(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, ...]:
+    def fwd(consts: tuple[object, ...], *invars: object) -> tuple[object, ...]:
         """Evaluate the cluster sub-jaxpr with an explicit const tuple.
 
         Args:
@@ -538,17 +538,17 @@ def _make_fwd_jit(
     fwd.__qualname__ = f"{fwd.__qualname__}_{cache_tag}"
     fwd.__name__ = f"{fwd.__name__}_{cache_tag}"
     if donate_argnums:
-        return _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums))
-    return _scope_stage_persistent_cache(jax.jit(fwd))
+        return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums)))
+    return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd)))
 
 
 def _make_bwd_jit(
     cluster_jaxpr: Jaxpr,
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
-    out_shardings: Any | None = None,
-    stage_mesh: Any | None = None,
-) -> Callable[..., tuple[Any, tuple[Any, ...]]]:
+    out_shardings: object | None = None,
+    stage_mesh: object | None = None,
+) -> Callable[..., tuple[object, tuple[object, ...]]]:
     """Return ``@jax.jit`` VJP callable for a non-terminal cluster.
 
     Signature: ``(consts, *invars, *cotangents) -> (g_consts, g_invars)``.
@@ -560,7 +560,7 @@ def _make_bwd_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
-    def bwd(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, tuple[Any, ...]]:
+    def bwd(consts: tuple[object, ...], *invars_and_cotangents: object) -> tuple[object, tuple[object, ...]]:
         """Run ``jax.vjp`` on the cluster and return ``(g_consts, g_invars)``.
 
         ``invars_and_cotangents`` is the concatenation of the cluster's
@@ -582,7 +582,7 @@ def _make_bwd_jit(
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
 
-            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
                 """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument."""
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
@@ -593,7 +593,7 @@ def _make_bwd_jit(
             g_invars = tuple(grads[1:])
             return g_consts, g_invars
 
-    jit_kwargs: dict[str, Any] = {}
+    jit_kwargs: dict[str, object] = {}
     if donate_argnums:
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
@@ -601,16 +601,16 @@ def _make_bwd_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd.__qualname__ = f"{bwd.__qualname__}_{cache_tag}"
     bwd.__name__ = f"{bwd.__name__}_{cache_tag}"
-    return _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs))
+    return cast(Callable[..., tuple[object, tuple[object, ...]]], _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs)))
 
 
 def _make_bwd_i_jit(
     cluster_jaxpr: Jaxpr,
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
-    out_shardings: Any | None = None,
-    stage_mesh: Any | None = None,
-) -> Callable[..., tuple[Any, ...]]:
+    out_shardings: object | None = None,
+    stage_mesh: object | None = None,
+) -> Callable[..., tuple[object, ...]]:
     """Return a ``@jax.jit`` VJP callable that yields only input cotangents.
 
     Companion of :func:`_make_bwd_w_jit`. Together the pair lets
@@ -622,7 +622,7 @@ def _make_bwd_i_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
-    def bwd_i(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> tuple[Any, ...]:
+    def bwd_i(consts: tuple[object, ...], *invars_and_cotangents: object) -> tuple[object, ...]:
         """Compute ``grad(invars)`` only, dropping the const grads.
 
         ``invars_and_cotangents`` packs ``(*invars, *cotangents)`` as a
@@ -641,7 +641,7 @@ def _make_bwd_i_jit(
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
 
-            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
                 """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
@@ -650,7 +650,7 @@ def _make_bwd_i_jit(
             grads = vjp_fn(tuple(cotangents))
             return tuple(grads[1:])
 
-    jit_kwargs: dict[str, Any] = {}
+    jit_kwargs: dict[str, object] = {}
     if donate_argnums:
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
@@ -658,22 +658,22 @@ def _make_bwd_i_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd_i.__qualname__ = f"{bwd_i.__qualname__}_{cache_tag}"
     bwd_i.__name__ = f"{bwd_i.__name__}_{cache_tag}"
-    return _scope_stage_persistent_cache(jax.jit(bwd_i, **jit_kwargs))
+    return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(bwd_i, **jit_kwargs)))
 
 
 def _make_bwd_w_jit(
     cluster_jaxpr: Jaxpr,
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
-    out_shardings: Any | None = None,
-    stage_mesh: Any | None = None,
-) -> Callable[..., Any]:
+    out_shardings: object | None = None,
+    stage_mesh: object | None = None,
+) -> Callable[..., object]:
     """Return ``@jax.jit`` VJP callable for weight/const gradients only."""
 
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
-    def bwd_w(consts: tuple[Any, ...], *invars_and_cotangents: Any) -> Any:
+    def bwd_w(consts: tuple[object, ...], *invars_and_cotangents: object) -> object:
         """Compute ``grad(consts)`` only, dropping invar cotangents.
 
         Companion to :func:`_make_bwd_i_jit`. Splitting the backward
@@ -693,7 +693,7 @@ def _make_bwd_w_jit(
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
 
-            def pure(c: tuple[Any, ...], *xs: Any) -> tuple[Any, ...]:
+            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
                 """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_weight/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
@@ -702,7 +702,7 @@ def _make_bwd_w_jit(
             grads = vjp_fn(tuple(cotangents))
             return grads[0]
 
-    jit_kwargs: dict[str, Any] = {}
+    jit_kwargs: dict[str, object] = {}
     if donate_argnums:
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
@@ -717,9 +717,9 @@ def _make_terminal_jit(
     cluster_jaxpr: Jaxpr,
     n_invars: int,
     donate_argnums: tuple[int, ...] = (),
-    out_shardings: Any | None = None,
-    stage_mesh: Any | None = None,
-) -> Callable[..., Any]:
+    out_shardings: object | None = None,
+    stage_mesh: object | None = None,
+) -> Callable[..., object]:
     """Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
 
     Signature: ``(consts, *invars) -> (loss, (g_consts, g_invars))``.
@@ -732,7 +732,7 @@ def _make_terminal_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
-    def term(consts: tuple[Any, ...], *invars: Any) -> tuple[Any, tuple[Any, tuple[Any, ...]]]:
+    def term(consts: tuple[object, ...], *invars: object) -> tuple[object, tuple[object, tuple[object, ...]]]:
         """Compute the loss and its gradients w.r.t. ``(consts, *invars)`` in one jit.
 
         Wraps the cluster's scalar-loss evaluator in
@@ -753,7 +753,7 @@ def _make_terminal_jit(
 
         with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward"):
 
-            def pure(c: tuple[Any, ...], *xs: Any) -> Any:
+            def pure(c: tuple[object, ...], *xs: object) -> object:
                 """Scalar-loss evaluator, asserts a single cluster output."""
                 with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward/pure_forward"):
                     outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
@@ -770,7 +770,7 @@ def _make_terminal_jit(
             g_invars = tuple(grads[1:])
             return loss, (g_consts, g_invars)
 
-    jit_kwargs: dict[str, Any] = {}
+    jit_kwargs: dict[str, object] = {}
     if donate_argnums:
         jit_kwargs["donate_argnums"] = donate_argnums
     if out_shardings is not None:
@@ -782,7 +782,7 @@ def _make_terminal_jit(
 
 
 def _build_logical_locs(
-    schedule: Any,
+    schedule: object,
     n: int,
     v: int,
 ) -> tuple[tuple[tuple[int, int], ...], dict[tuple[int, int], int], tuple[int, int]]:
@@ -837,10 +837,10 @@ def _build_logical_locs(
 
 def _resolve_concrete_consts(
     outer_jaxpr: jax.core.ClosedJaxpr,
-    outer_flat_args: tuple[Any, ...],
+    outer_flat_args: tuple[object, ...],
     pscan_eqn: JaxprEqn,
     n_body_consts: int,
-) -> tuple[tuple[Any, ...], tuple[int | None, ...]]:
+) -> tuple[tuple[object, ...], tuple[int | None, ...]]:
     """Map the first ``n_body_consts`` operands of ``pscan_eqn`` to concrete values.
 
     At trace time, the inner body jaxpr's "consts" (closure captures
@@ -866,12 +866,12 @@ def _resolve_concrete_consts(
     """
     outer_constvars = list(outer_jaxpr.jaxpr.constvars)
     outer_consts = tuple(outer_jaxpr.consts)
-    const_by_id: dict[int, Any] = {id(v): c for v, c in zip(outer_constvars, outer_consts, strict=True)}
+    const_by_id: dict[int, object] = {id(v): c for v, c in zip(outer_constvars, outer_consts, strict=True)}
 
     outer_invars = list(outer_jaxpr.jaxpr.invars)
     invar_idx_by_id: dict[int, int] = {id(v): i for i, v in enumerate(outer_invars)}
 
-    resolved: list[Any] = []
+    resolved: list[object] = []
     flat_arg_indices: list[int | None] = []
     for operand in pscan_eqn.invars[:n_body_consts]:
         if isinstance(operand, Var):
@@ -892,7 +892,7 @@ def _resolve_concrete_consts(
     return tuple(resolved), tuple(flat_arg_indices)
 
 
-def _arg_leaf_ranges(args: tuple[Any, ...]) -> list[tuple[int, int]]:
+def _arg_leaf_ranges(args: tuple[object, ...]) -> list[tuple[int, int]]:
     """Return flat-leaf ``[start, end)`` ranges for each positional argument."""
     ranges: list[tuple[int, int]] = []
     start = 0
@@ -904,11 +904,11 @@ def _arg_leaf_ranges(args: tuple[Any, ...]) -> list[tuple[int, int]]:
 
 
 def _infer_outer_leaf_shardings(
-    outer_args: tuple[Any, ...],
-    outer_flat_args: tuple[Any, ...],
+    outer_args: tuple[object, ...],
+    outer_flat_args: tuple[object, ...],
     n: int,
-    rank_submeshes: list[Any],
-) -> tuple[list[dict[int, Any]], dict[int, int]]:
+    rank_submeshes: list[object],
+) -> tuple[list[dict[int, object]], dict[int, int]]:
     """Infer per-rank NamedShardings for captured Module leaves.
 
     Mirrors ``sxjit``'s forward-only path: each rank resolves the
@@ -916,7 +916,7 @@ def _infer_outer_leaf_shardings(
     stage-local sub-mesh, so a TP annotation lands on that rank's TP
     devices rather than on the global mesh.
     """
-    leaf_shardings: list[dict[int, Any]] = [{} for _ in range(n)]
+    leaf_shardings: list[dict[int, object]] = [{} for _ in range(n)]
     leaf_stage_owners: dict[int, int] = {}
     for arg in outer_args:
         if not isinstance(arg, Module):
@@ -959,12 +959,12 @@ def _infer_outer_leaf_shardings(
 
 
 def _build_grad_metadata(
-    outer_args: tuple[Any, ...],
+    outer_args: tuple[object, ...],
     outer_jaxpr: jax.core.ClosedJaxpr,
     pscan_eqn: JaxprEqn,
     n_body_consts: int,
-    probed_grad_tree: Any | None,
-) -> tuple[Any, tuple[int, ...], tuple[Any, ...]]:
+    probed_grad_tree: object | None,
+) -> tuple[object, tuple[int, ...], tuple[object, ...]]:
     """Identify the captured module arg and map its grad leaves to body const indices."""
     module_arg_indices = [i for i, arg in enumerate(outer_args) if isinstance(arg, Module)]
     if len(module_arg_indices) != 1:
@@ -1098,7 +1098,7 @@ def _build_invar_sources(
     return invar_sources
 
 
-def _build_schedule_grid(schedule: Any, n: int) -> list[list[Any]]:
+def _build_schedule_grid(schedule: object, n: int) -> list[list[object]]:
     """Build a schedule grid with the same fusion passes used by :func:`sxcall`.
 
     Calls :meth:`Schedule.build` then applies :func:`fuse_1f1b_steady_state`
@@ -1124,7 +1124,7 @@ def _build_schedule_grid(schedule: Any, n: int) -> list[list[Any]]:
     return [list(row) for row in grid]
 
 
-def _put_tree(tree: Any, sharding: Any) -> Any:
+def _put_tree(tree: object, sharding: object) -> object:
     """Apply :func:`jax.device_put` to every array leaf of ``tree``.
 
     Non-array leaves (e.g. Python scalars or ``None``) are passed through
@@ -1145,7 +1145,9 @@ def _put_tree(tree: Any, sharding: Any) -> Any:
     )
 
 
-def _transport_tuple(vals: tuple[Any, ...], src_rank: int, dst_rank: int, stage_shardings: list[Any]) -> tuple[Any, ...]:
+def _transport_tuple(
+    vals: tuple[object, ...], src_rank: int, dst_rank: int, stage_shardings: list[object]
+) -> tuple[object, ...]:
     """Move a tuple of arrays from ``src_rank`` onto ``dst_rank`` if they differ.
 
     Skips the transport when source and destination physical ranks
@@ -1167,7 +1169,7 @@ def _transport_tuple(vals: tuple[Any, ...], src_rank: int, dst_rank: int, stage_
     return tuple(jax.device_put(v, stage_shardings[dst_rank]) for v in vals)
 
 
-def _edge_transfer_target(value: Any, plan: PscanPlan, producer_logical: int, dst_rank: int) -> Any:
+def _edge_transfer_target(value: object, plan: PscanPlan, producer_logical: int, dst_rank: int) -> object:
     """Resolve a destination sharding for a marker-edge cross-rank transport.
 
     When the producing logical stage's :func:`sxstage_iter` carried an
@@ -1195,7 +1197,7 @@ def _edge_transfer_target(value: Any, plan: PscanPlan, producer_logical: int, ds
         return plan.stage_shardings[dst_rank]
     dst_mesh = plan.rank_submeshes[dst_rank]
 
-    def leaf_target(leaf: Any) -> Any:
+    def leaf_target(leaf: object) -> object:
         """Per-leaf NamedSharding on ``dst_mesh`` derived from the edge spec."""
         if not hasattr(leaf, "shape"):
             return plan.stage_shardings[dst_rank]
@@ -1217,9 +1219,9 @@ def _edge_transfer_target(value: Any, plan: PscanPlan, producer_logical: int, ds
 
 
 def _materialize_cotangents(
-    partial: list[Any | None] | None,
-    outputs: tuple[Any, ...],
-) -> tuple[Any, ...]:
+    partial: list[object | None] | None,
+    outputs: tuple[object, ...],
+) -> tuple[object, ...]:
     """Replace missing cotangent slots with zero arrays shaped like ``outputs``.
 
     The dispatcher accumulates downstream cotangents lazily into a
@@ -1242,7 +1244,7 @@ def _materialize_cotangents(
     """
     if partial is None:
         return tuple(jnp.zeros_like(out) for out in outputs)
-    full: list[Any] = []
+    full: list[object] = []
     for slot, out in zip(partial, outputs, strict=True):
         result = getattr(slot, "result", None)
         if callable(result):
@@ -1258,7 +1260,7 @@ def _materialize_cotangents(
     return tuple(full)
 
 
-def _cast_cotangent_like(cotangent: Any, primal: Any) -> Any:
+def _cast_cotangent_like(cotangent: object, primal: object) -> object:
     """Cast a cotangent to its primal output dtype before moving devices."""
     if getattr(cotangent, "dtype", None) == jax.dtypes.float0:
         return cotangent
@@ -1269,7 +1271,7 @@ def _cast_cotangent_like(cotangent: Any, primal: Any) -> Any:
     return cotangent
 
 
-def _add_grad(a: Any, b: Any) -> Any:
+def _add_grad(a: object, b: object) -> object:
     """Add gradient leaves while preserving JAX ``float0`` sentinels."""
     if getattr(a, "dtype", None) == jax.dtypes.float0:
         return b
@@ -1279,12 +1281,12 @@ def _add_grad(a: Any, b: Any) -> Any:
 
 
 def _project_upstream_cotangents(
-    g_invars: tuple[Any, ...],
-    src_outs: tuple[Any, ...],
+    g_invars: tuple[object, ...],
+    src_outs: tuple[object, ...],
     src_to_dst: list[tuple[int, ...]],
-) -> tuple[Any, ...]:
+) -> tuple[object, ...]:
     """Expand downstream input cotangents to the full upstream output tuple."""
-    full: list[Any] = []
+    full: list[object] = []
     for out_idx, dst_indices in enumerate(src_to_dst):
         if not dst_indices:
             full.append(jnp.zeros_like(src_outs[out_idx]))
@@ -1297,11 +1299,11 @@ def _project_upstream_cotangents(
 
 
 def _accumulate_const_grads(
-    accum: list[Any | None] | None,
+    accum: list[object | None] | None,
     const_indices: tuple[int, ...],
-    g_consts: tuple[Any, ...],
+    g_consts: tuple[object, ...],
     n_total_consts: int,
-) -> list[Any | None]:
+) -> list[object | None]:
     """Scatter a cluster's const-grad tuple back into the full body-const slot list.
 
     A cluster only references a subset of the full body's constvars
@@ -1330,10 +1332,10 @@ def _accumulate_const_grads(
             accum[const_idx] = grad
         else:
             accum[const_idx] = jax.tree.map(_add_grad, accum[const_idx], grad)
-    return accum
+    return cast(list[object | None], accum)
 
 
-def _sum_rank_grads(grad_accums: list[list[Any | None] | None], output_sharding: Any) -> Any | None:
+def _sum_rank_grads(grad_accums: list[list[object | None] | None], output_sharding: object) -> object | None:
     """Move per-rank const grads to one sharding and sum them leafwise."""
     total = None
     for grads in grad_accums:
@@ -1349,10 +1351,10 @@ def _sum_rank_grads(grad_accums: list[list[Any | None] | None], output_sharding:
     return total
 
 
-def _pack_grad_tree(plan: PscanPlan, total_const_grads: Any | None) -> Any:
+def _pack_grad_tree(plan: PscanPlan, total_const_grads: object | None) -> object:
     """Unflatten selected const grads into the final model-shaped grad pytree."""
     total_const_grads = () if total_const_grads is None else tuple(total_const_grads)
-    grad_leaves: list[Any] = []
+    grad_leaves: list[object] = []
     for leaf_idx, const_idx in enumerate(plan.grad_const_indices):
         if const_idx < 0 or const_idx >= len(total_const_grads) or total_const_grads[const_idx] is None:
             leaf = jnp.zeros_like(plan.grad_template_leaves[leaf_idx])
@@ -1364,12 +1366,12 @@ def _pack_grad_tree(plan: PscanPlan, total_const_grads: Any | None) -> Any:
 
 def build_pscan_plan(
     outer_jaxpr: jax.core.ClosedJaxpr,
-    outer_args: tuple[Any, ...],
-    outer_flat_args: tuple[Any, ...],
+    outer_args: tuple[object, ...],
+    outer_flat_args: tuple[object, ...],
     pscan_eqn: JaxprEqn,
     mpmd_mesh: MpMdMesh,
-    stage_shardings: list[Any],
-    rank_submeshes: list[Any],
+    stage_shardings: list[object],
+    rank_submeshes: list[object],
 ) -> PscanPlan:
     """Build the :class:`PscanPlan` from a single ``pscan_p`` equation.
 
@@ -1442,13 +1444,13 @@ def build_pscan_plan(
         rank_submeshes,
     )
 
-    per_loc_consts: dict[tuple[int, int], tuple[Any, ...]] = {}
+    per_loc_consts: dict[tuple[int, int], tuple[object, ...]] = {}
     const_indices_per_loc: dict[tuple[int, int], tuple[int, ...]] = {}
     n_invars_per_loc: dict[tuple[int, int], int] = {}
-    fwd_jits: dict[tuple[int, int], Callable[..., Any]] = {}
-    bwd_jits: dict[tuple[int, int], Callable[..., Any] | None] = {}
+    fwd_jits: dict[tuple[int, int], Callable[..., object]] = {}
+    bwd_jits: dict[tuple[int, int], Callable[..., object] | None] = {}
 
-    terminal_jit: Callable[..., Any] | None = None
+    terminal_jit: Callable[..., object] | None = None
     all_const_idx_by_id = {id(v): i for i, v in enumerate(all_constvars)}
 
     for logical, cluster in enumerate(clusters):
@@ -1521,7 +1523,7 @@ def build_pscan_plan(
     )
 
 
-def _iter_actions(row: list[Any]):
+def _iter_actions(row: list[object]):
     """Yield ``(rank, virt, action)`` triples, expanding :class:`FusedTask` cells.
 
     A grid cell may be a plain ``Action``, ``None``, or a fused fwd+bwd
@@ -1538,7 +1540,7 @@ def _iter_actions(row: list[Any]):
             yield rank, cell.virtual_stage, cell
 
 
-def dispatch_pscan(plan: PscanPlan) -> list[Any]:
+def dispatch_pscan(plan: PscanPlan) -> list[object]:
     """Run the schedule-driven dispatch loop and return accumulator values.
 
     Walks ``plan.grid`` step by step, firing the per-rank cluster jit
@@ -1553,11 +1555,11 @@ def dispatch_pscan(plan: PscanPlan) -> list[Any]:
     ops = plan.ops
     grid = plan.grid
 
-    fwd_inputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    fwd_outputs: dict[tuple[int, int, int], tuple[Any, ...]] = {}
-    cotangents_into: dict[tuple[int, int, int], list[Any | None]] = {}
+    fwd_inputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
+    fwd_outputs: dict[tuple[int, int, int], tuple[object, ...]] = {}
+    cotangents_into: dict[tuple[int, int, int], list[object | None]] = {}
 
-    grad_accums: list[list[Any | None] | None] = [None] * n
+    grad_accums: list[list[object | None] | None] = [None] * n
     loss_acc = plan.init_state_template[0] if plan.n_outs >= 1 else None
 
     for row in grid:
@@ -1572,7 +1574,7 @@ def dispatch_pscan(plan: PscanPlan) -> list[Any]:
             key = (rank, virt, mb)
 
             if phase is Phase.FWD:
-                invars_list: list[Any] = []
+                invars_list: list[object] = []
                 for source_kind, source_a, source_b in plan.invar_sources[logical]:
                     if source_kind == "body_invar":
                         if source_a != 0:

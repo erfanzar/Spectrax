@@ -18,8 +18,6 @@ the output finite.
 
 from __future__ import annotations
 
-from typing import Any
-
 from ..core.module import Module
 from ..core.variable import Variable
 
@@ -124,7 +122,7 @@ def _iter_children(module: Module):
         return
 
 
-def _format_key(key: Any) -> str:
+def _format_key(key: object) -> str:
     """Wrap a graph-child key in parentheses, PyTorch-style.
 
     Used by callers that want ``(name)`` / ``(0)`` rather than the bare

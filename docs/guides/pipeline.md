@@ -493,6 +493,69 @@ For multimodal or branched pipelines, `sxstage_region` creates
 independent logical stage sequences before the scheduler maps them to
 physical ranks.
 
+```python
+vision = spx.sxstage_region("vision", schedule=spx.GPipe(microbatches=2))
+text = spx.sxstage_region("text", schedule=spx.GPipe(microbatches=2))
+
+
+def multimodal_loss(image_features, token_features):
+    def vision_path(x):
+        x = vision_block_0(x)
+        x = spx.sxstage_iter(x, stage=0)   # V0 -> V1
+        return vision_block_1(x)
+
+    def text_path(x):
+        x = text_block_0(x)
+        x = spx.sxstage_iter(x, stage=0)   # T0 -> T1
+        return text_block_1(x)
+
+    image = vision(vision_path)(image_features)
+    text_hidden = text(text_path)(token_features)
+    return contrastive_loss(image, text_hidden)
+```
+
+The parent scheduler sees this as two serial two-stage paths:
+
+```text
+logical stage 0: V0
+logical stage 1: V1
+logical stage 2: T0
+logical stage 3: T1
+```
+
+Region-local `sxstage_iter` markers do not leak into the parent
+pipeline. This matters for multimodal models: the vision tower and
+text tower can both use local stage numbers (`0`, `1`, ...) without
+accidentally forming one mixed V/T stage sequence. See
+[`examples/07_mpmd/12_stage_region_multimodal.py`](../../examples/07_mpmd/12_stage_region_multimodal.py)
+for a runnable example.
+
+### Stage-local mesh rule
+
+In true MPMD, the pipeline axis selects the program/rank. It is not
+available as an intra-stage sharding axis. A full mesh like
+`(pp=2, dp=4, tp=2)` becomes a stage-local mesh `(dp=4, tp=2)` inside
+each stage executable.
+
+```python
+from jax.sharding import Mesh, PartitionSpec
+from spectrax.runtime.types import MpMdMesh
+
+full = Mesh(devices.reshape(2, 4, 2), ("pp", "dp", "tp"))
+mpmd = MpMdMesh(full, "pp")
+
+stage0 = mpmd.submesh(0)
+assert stage0.axis_names == ("dp", "tp")
+
+mpmd.sub_sharding(0, PartitionSpec("tp"))  # ok
+mpmd.sub_sharding(0, PartitionSpec("pp"))  # ValueError
+```
+
+This is why MPMD boundary specs should describe only stage-local SPMD
+axes. See
+[`examples/07_mpmd/13_stage_local_mesh_layout.py`](../../examples/07_mpmd/13_stage_local_mesh_layout.py)
+for a concrete inspection script.
+
 ## Debugging tips
 
 ### 1. Run eager first

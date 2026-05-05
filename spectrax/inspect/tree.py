@@ -11,8 +11,7 @@ full ``(GraphDef, State)`` pair).
 
 from __future__ import annotations
 
-from typing import Any
-
+from ..core._typing import DType
 from ..core.graph import export
 from ..core.graph import tree_state as _tree_state
 from ..core.module import Module
@@ -37,7 +36,7 @@ def tree_state(module: Module) -> State:
     return _tree_state(module)
 
 
-def paths_and_shapes(module: Module) -> list[tuple[str, str, tuple[int, ...], Any]]:
+def paths_and_shapes(module: Module) -> list[tuple[str, str, tuple[int, ...], DType]]:
     """List every leaf in ``module`` as ``(collection, path, shape, dtype)``.
 
     Iterates the module's :class:`~spectrax.State` items, captures
@@ -53,7 +52,7 @@ def paths_and_shapes(module: Module) -> list[tuple[str, str, tuple[int, ...], An
         one per leaf variable.
     """
     _gdef, state = export(module)
-    out: list[tuple[str, str, tuple[int, ...], Any]] = []
+    out: list[tuple[str, str, tuple[int, ...], DType]] = []
     for c, p, v in state.items():
         shape = tuple(getattr(v, "shape", ()))
         dtype = getattr(v, "dtype", None)

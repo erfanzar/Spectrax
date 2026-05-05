@@ -17,6 +17,8 @@ under SPMD or MPMD depending on the mesh.
 | [`09_dualpipev_tasks.py`](09_dualpipev_tasks.py)         | Per-rank task list inspection for DualPipe-V (FusedTask / Action breakdown).                             |
 | [`10_mpmd_array.py`](10_mpmd_array.py)                   | `MpMdArray` — build, inspect shards, check locality, gather across processes.                            |
 | [`11_mpmd_jit_generation.py`](11_mpmd_jit_generation.py) | `@mpmd_jit` — jaxpr-split true MPMD generation. Trace → split at markers → per-rank XLA executables. Load real Llama 3.2 3B. |
+| [`12_stage_region_multimodal.py`](12_stage_region_multimodal.py) | `sxstage_region` for serial multimodal towers: V0→V1 followed by T0→T1.                                   |
+| [`13_stage_local_mesh_layout.py`](13_stage_local_mesh_layout.py) | Inspect stage-local sub-meshes: the `pp` axis selects programs and is dropped inside each stage.          |
 
 All examples share `examples/models/llama.py` — write the model
 **once** and let the mesh decide whether it runs as SPMD or MPMD.
@@ -25,4 +27,5 @@ Run any example:
 
 ```bash
 python -m examples.07_mpmd.01_train_homogeneous
+python -m examples.07_mpmd.12_stage_region_multimodal
 ```

@@ -64,6 +64,6 @@ def orthogonal(gain: float = 1.0) -> Initializer:
         q = q * d
         if flat[0] < flat[1]:
             q = q.T
-        return np.asarray(gain * q.reshape(shape), dtype=np.dtype(dtype))
+        return jnp.asarray(np.asarray(gain * q.reshape(shape), dtype=np.dtype(dtype)))
 
     return init

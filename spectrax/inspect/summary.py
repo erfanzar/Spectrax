@@ -14,8 +14,6 @@ trigger forward / variable observers.
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 
 from ..core.graph import live_variables
@@ -24,7 +22,7 @@ from ..core.module import Module, _inside_transform, _set_inside_transform
 __all__ = ["summary"]
 
 
-def summary(module: Module, *example_inputs: Any, **example_kwargs: Any) -> str:
+def summary(module: Module, *example_inputs: object, **example_kwargs: object) -> str:
     """Return a deterministic multi-line text summary of ``module``.
 
     The report lists every live :class:`~spectrax.Variable` (after

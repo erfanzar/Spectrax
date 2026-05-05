@@ -20,11 +20,25 @@ optax = pytest.importorskip("optax")
 
 from spectrax.contrib.optimizer import MultiOptimizer, Optimizer  # noqa: E402
 from spectrax.core.graph import export  # noqa: E402
+from spectrax.core.module import Module  # noqa: E402
 from spectrax.core.state import State  # noqa: E402
 from spectrax.nn.linear import Linear  # noqa: E402
-from spectrax.nn.lora import LoraParameter  # noqa: E402
+from spectrax.nn.lora import LoraParameter, wrap_lora  # noqa: E402
 from spectrax.rng.rngs import Rngs  # noqa: E402
 from spectrax.transforms.grad import value_and_grad  # noqa: E402
+
+
+class NestedLoRA(Module):
+    """Tiny module whose LoRA leaves live under a dotted path."""
+
+    def __init__(self, *, rngs: Rngs):
+        """Create a LoRA-wrapped child layer."""
+        super().__init__()
+        self.fc = wrap_lora(Linear(2, 2, rngs=rngs), rank=1, rngs=rngs)
+
+    def forward(self, x):
+        """Forward through the wrapped projection."""
+        return self.fc(x)
 
 
 def test_optimizer_create_constructs_with_adamw():
@@ -170,6 +184,24 @@ def test_multi_optimizer_create_and_update():
         for p, v in d.items():
             assert jnp.allclose(new_params.raw()[c][p], v)
     assert int(new_mopt.subs[0].step) == 1
+
+
+def test_multi_optimizer_handles_nested_lora_paths():
+    """Nested dotted paths are sliced correctly for per-selector updates."""
+    m = NestedLoRA(rngs=Rngs(0))
+    mopt = MultiOptimizer.create(m, {"parameters": optax.sgd(0.01), "lora": optax.adam(0.01)})
+    _gdef, state = export(m)
+    params = state.filter("parameters", "lora", copy=True)
+    grads = params.map(lambda leaf: jnp.ones_like(leaf), copy=True)
+
+    lora_before = params.get("lora", "fc.lora_a")
+    new_params, new_mopt = mopt.update(params, grads)
+
+    assert int(new_mopt.subs[0].step) == 1
+    assert int(new_mopt.subs[1].step) == 1
+    assert new_params.get("parameters", "fc.base_module.weight") is not None
+    assert new_params.get("lora", "fc.lora_a") is not None
+    assert not jnp.allclose(new_params.get("lora", "fc.lora_a"), lora_before)
 
 
 def test_multi_optimizer_is_pytree():

@@ -13,6 +13,8 @@ so the block is residual-shape compatible by default.
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..core._typing import Array, ArrayLike, DType
 from ..core.module import Module
 from ..core.sharding import AxisNames, Sharding
@@ -138,4 +140,4 @@ class MLPBlock(Module):
         else:
             raise ValueError(f"Unknown activation: {self.activation!r}")
         y = self.drop(y, rngs=rngs)
-        return self.fc2(y)
+        return cast(Array, self.fc2(y))

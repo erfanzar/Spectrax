@@ -26,15 +26,13 @@ ignored by the SPMD orchestrator.
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 
 __all__ = ["boundary"]
 
 
 @jax.custom_jvp
-def _boundary(x: Any) -> Any:
+def _boundary(x: object) -> object:
     """Identity primitive that survives jaxpr lowering as a named op.
 
     Decorating with :func:`jax.custom_jvp` keeps the call from being
@@ -43,7 +41,7 @@ def _boundary(x: Any) -> Any:
     pipeline passes can recognise and use as a stage-split anchor.
 
     Args:
-        x: Any JAX-compatible value.
+        x: object JAX-compatible value.
 
     Returns:
         ``x`` unchanged.
@@ -52,7 +50,7 @@ def _boundary(x: Any) -> Any:
 
 
 @_boundary.defjvp
-def _boundary_jvp(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[Any, Any]:
+def _boundary_jvp(primals: tuple[object, ...], tangents: tuple[object, ...]) -> tuple[object, object]:
     """JVP rule for :func:`_boundary` — pass primal and tangent through.
 
     Because :func:`_boundary` is mathematically the identity, the
@@ -72,7 +70,7 @@ def _boundary_jvp(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[
     return x, t
 
 
-def boundary(x: Any) -> Any:
+def boundary(x: object) -> object:
     """Mark a pipeline stage boundary inside a ``forward`` method.
 
     Outside a pipeline context this is a no-op identity function, so
@@ -85,7 +83,7 @@ def boundary(x: Any) -> Any:
     source of stage structure and treats ``boundary`` as advisory.
 
     Args:
-        x: Any JAX-compatible value. Passed through unchanged.
+        x: object JAX-compatible value. Passed through unchanged.
 
     Returns:
         ``x`` unmodified. The call is preserved in the jaxpr as an

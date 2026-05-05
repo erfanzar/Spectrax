@@ -26,7 +26,6 @@ from __future__ import annotations
 import operator
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
 
 from .context import get as _scope_get
 from .context import scope
@@ -56,7 +55,7 @@ recover the ``(current, total)`` pair stamped at construction time.
 """
 
 
-def _normalize_assignment(current: Any, total: Any) -> tuple[int, int]:
+def _normalize_assignment(current: object, total: object) -> tuple[int, int]:
     """Validate and normalize a ``(current, total)`` stage hint.
 
     Coerces both arguments through :func:`operator.index` so that any
@@ -93,7 +92,7 @@ def assign_stage(*, total: int, current: int) -> Iterator[None]:
     """Stamp subsequently-created variables with a pipeline stage hint.
 
     Pushes a frame onto :mod:`spectrax.core.context` carrying a normalized
-    ``(current, total)`` tuple. Any :class:`~spectrax.Variable` constructed
+    ``(current, total)`` tuple. object :class:`~spectrax.Variable` constructed
     inside the ``with`` block (for which the subclass opts in via
     :attr:`~spectrax.Variable.inherit_stage_assignment`) records the tuple
     under :data:`PIPELINE_STAGE_METADATA_KEY` in
@@ -148,7 +147,7 @@ def current_stage_assignment() -> tuple[int, int] | None:
     return _normalize_assignment(*assignment)
 
 
-def metadata_stage_assignment(metadata: Mapping[str, Any] | None) -> tuple[int, int] | None:
+def metadata_stage_assignment(metadata: Mapping[str, object] | None) -> tuple[int, int] | None:
     """Extract a normalized stage hint from variable metadata.
 
     Reads :data:`PIPELINE_STAGE_METADATA_KEY` from a variable's

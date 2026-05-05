@@ -34,12 +34,15 @@ import typing as tp
 from concurrent.futures import Future
 
 import jax
+from jax.sharding import Mesh, Sharding
 
+from ..types import MpMdMesh
 from .runtime import (
     _apply_out_shardings,
     _assemble_invars,
     _assemble_invars_from_plan,
     _assemble_outputs,
+    _InvarAssemblyPlan,
     _prepare_invar_assembly_plan,
     _restore_result_treedef,
 )
@@ -49,8 +52,35 @@ __all__ = [
     "MpmdPipelineExecutor",
 ]
 
-_MpmdState = dict[str, tp.Any]
-_CompiledStage = tuple[tp.Callable[..., tp.Any], tp.Any, tp.Any, tp.Any, list[tuple]]
+PyTree: tp.TypeAlias = object
+StageOutputs: tp.TypeAlias = tuple[PyTree, ...]
+StageCallable: tp.TypeAlias = tp.Callable[..., StageOutputs]
+InvarSource: tp.TypeAlias = tuple[str, int] | tuple[str, int, int] | tuple[str, int, int, PyTree]
+InvarMap: tp.TypeAlias = list[InvarSource]
+
+
+class _MpmdState(tp.TypedDict, total=False):
+    """Prepared forward-only state exposed by ``sxjit._mpmd_prepare``.
+
+    The state is intentionally a partially-typed mapping because it is a private
+    handoff between ``sxjit`` and the host pipeline executor. The fixed entries
+    below are the keys consumed by this executor; optional entries are present
+    only when callers request explicit output shardings or modern dynamic-leaf
+    remapping.
+    """
+
+    compiled: list[_CompiledStage]
+    placed: dict[tuple[int, int], PyTree]
+    dynamic: set[int]
+    explicit_in_sh: dict[int, PyTree]
+    fn_outvar_map: PyTree
+    mpmd_mesh: MpMdMesh
+    dynamic_flat_to_orig_flat: dict[int, int]
+    out_shardings: PyTree
+    result_treedef: PyTree
+
+
+_CompiledStage: tp.TypeAlias = tuple[StageCallable, Mesh, Sharding, Sharding | None, InvarMap]
 
 
 class _MpmdPreparedCallable(tp.Protocol):
@@ -63,11 +93,11 @@ class _MpmdPreparedCallable(tp.Protocol):
     path that exposes compiled per-stage executables and routing metadata.
     """
 
-    def __call__(self, *args: tp.Any, **kwargs: tp.Any) -> tp.Any:
+    def __call__(self, *args: PyTree, **kwargs: PyTree) -> PyTree:
         """Execute the wrapped function with normal ``sxjit`` semantics."""
         ...
 
-    def _mpmd_prepare(self, *args: tp.Any) -> _MpmdState:
+    def _mpmd_prepare(self, *args: PyTree) -> _MpmdState:
         """Return the prepared forward-only MPMD state for ``args``.
 
         The returned mapping is produced by ``sxjit`` and contains the compiled
@@ -143,7 +173,7 @@ class _PreparedCall:
     """
 
     state: _MpmdState
-    flat_args: list[tp.Any]
+    flat_args: list[PyTree]
 
 
 @dataclasses.dataclass
@@ -179,13 +209,15 @@ class _PrepareCacheEntry:
     """
 
     state: _MpmdState
-    flat_args_template: list[tp.Any]
-    runtime_static_cache: dict[tuple[int, int], tp.Any]
-    runtime_static_flat_args: dict[int, tp.Any]
+    flat_args_template: list[PyTree]
+    runtime_static_cache: dict[tuple[int, int], PyTree]
+    runtime_static_flat_args: dict[int, PyTree]
     arg_offsets: tuple[int, ...]
     arg_leaf_counts: tuple[int, ...]
-    invar_plans: tuple[tp.Any, ...]
-    runtime_static_invar_plan_cache: dict[frozenset[int], tuple[tp.Any, ...]] = dataclasses.field(default_factory=dict)
+    invar_plans: tuple[_InvarAssemblyPlan, ...]
+    runtime_static_invar_plan_cache: dict[frozenset[int], tuple[_InvarAssemblyPlan, ...]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -199,10 +231,10 @@ class _StageTask:
         future: Future completed by the worker with the stage's flat outputs.
     """
 
-    stage_jit: tp.Callable[..., tp.Any]
-    submesh: tp.Any
-    invars: list[tp.Any]
-    future: Future[tuple]
+    stage_jit: StageCallable
+    submesh: Mesh
+    invars: list[PyTree]
+    future: Future[StageOutputs]
 
 
 class _StageWorker:
@@ -228,7 +260,7 @@ class _StageWorker:
         self._thread = threading.Thread(target=self._run, name=f"spx-mpmd-stage-{rank}", daemon=True)
         self._thread.start()
 
-    def submit(self, *, stage_jit: tp.Callable[..., tp.Any], submesh: tp.Any, invars: list[tp.Any]) -> Future[tuple]:
+    def submit(self, *, stage_jit: StageCallable, submesh: Mesh, invars: list[PyTree]) -> Future[StageOutputs]:
         """Queue one stage invocation and return its completion future.
 
         Args:
@@ -240,7 +272,7 @@ class _StageWorker:
             A future that resolves to the stage's flat output tuple, or carries
             the raised exception from the worker thread.
         """
-        future: Future[tuple] = Future()
+        future: Future[StageOutputs] = Future()
         self._queue.put(_StageTask(stage_jit=stage_jit, submesh=submesh, invars=invars, future=future))
         return future
 
@@ -282,7 +314,7 @@ class MpmdPipelineExecutor:
     state, and an optional prepare-cache key for a stable decode bucket.
     """
 
-    def __init__(self, *, stage_meshes: tp.Sequence[tp.Any] | None = None, use_workers: bool = False) -> None:
+    def __init__(self, *, stage_meshes: tp.Sequence[Mesh] | None = None, use_workers: bool = False) -> None:
         """Create an executor.
 
         Args:
@@ -323,7 +355,7 @@ class MpmdPipelineExecutor:
         """
         self._prepare_cache.clear()
 
-    def dispatch(self, sxjit_fn: _MpmdPreparedCallable, *args: tp.Any) -> tp.Any:
+    def dispatch(self, sxjit_fn: _MpmdPreparedCallable, *args: PyTree) -> PyTree:
         """Execute one ``sxjit`` call through the pipeline executor.
 
         This is a convenience wrapper around ``dispatch_many`` for callers that
@@ -337,12 +369,12 @@ class MpmdPipelineExecutor:
     def dispatch_many(
         self,
         sxjit_fn: _MpmdPreparedCallable,
-        arg_batches: tp.Iterable[tuple],
+        arg_batches: tp.Iterable[tuple[PyTree, ...]],
         *,
         carry_input_output_map: tp.Mapping[int, tp.Mapping[int, int]] | None = None,
         prepare_cache_key: tp.Hashable | None = None,
         runtime_static_argnums: tp.Iterable[int] | None = None,
-    ) -> list[tp.Any]:
+    ) -> list[PyTree]:
         """Execute same-shaped microbatches as a pipeline wavefront.
 
         The executor consumes SpectraX's private forward-only MPMD plan. For a
@@ -433,7 +465,7 @@ class MpmdPipelineExecutor:
         runtime_static_cache = cached_entry.runtime_static_cache if cached_entry is not None else None
         invar_plans = cached_entry.invar_plans if cached_entry is not None else None
         runtime_static_plan_key: frozenset[int] | None = None
-        runtime_static_plan_updates: list[tp.Any | None] | None = None
+        runtime_static_plan_updates: list[_InvarAssemblyPlan | None] | None = None
         if cached_entry is not None and runtime_static_flat_indices:
             runtime_static_plan_key = frozenset(runtime_static_flat_indices)
             resolved_plans = cached_entry.runtime_static_invar_plan_cache.get(runtime_static_plan_key)
@@ -444,8 +476,8 @@ class MpmdPipelineExecutor:
         rank_submeshes = [stage[1] for stage in compiled]
         rank_device_sets = [set(submesh.devices.flat) for submesh in rank_submeshes]
         mpmd_mesh = self._resolve_mpmd_mesh(prepared[0].state, rank_submeshes, sxjit_fn=sxjit_fn)
-        futures: list[list[Future[tuple] | None]] = [[None] * len(compiled) for _ in prepared]
-        cluster_outputs: list[list[tuple | None]] = [[None] * len(compiled) for _ in prepared]
+        futures: list[list[Future[StageOutputs] | None]] = [[None] * len(compiled) for _ in prepared]
+        cluster_outputs: list[list[StageOutputs | None]] = [[None] * len(compiled) for _ in prepared]
         stage_dispatch_time = 0.0
         queue_wait_time = 0.0
         submit_time = 0.0
@@ -455,7 +487,7 @@ class MpmdPipelineExecutor:
 
         if not self.use_workers and len(prepared) == 1:
             call = prepared[0]
-            cluster_outputs: list[tuple | None] = [None] * len(compiled)
+            cluster_outputs: list[StageOutputs | None] = [None] * len(compiled)
             for stage_idx, (stage_jit, _submesh, my_sh, _, invar_map) in enumerate(compiled):
                 t_submit = time.time()
                 prev_outputs = cluster_outputs[stage_idx - 1] if stage_idx > 0 else ()
@@ -528,11 +560,11 @@ class MpmdPipelineExecutor:
             )
             return [result]
 
-        def wait_stage(mb_idx: int, stage_idx: int) -> tuple:
+        def wait_stage(mb_idx: int, stage_idx: int) -> StageOutputs:
             nonlocal stage_dispatch_time, queue_wait_time
             ready = cluster_outputs[mb_idx][stage_idx]
             if ready is not None:
-                return ready
+                return tp.cast(StageOutputs, ready)
             if not self.use_workers:
                 raise RuntimeError(f"internal error: stage {stage_idx} microbatch {mb_idx} was not dispatched")
             future = futures[mb_idx][stage_idx]
@@ -560,7 +592,7 @@ class MpmdPipelineExecutor:
                 t_submit = time.time()
                 stage_jit, submesh, my_sh, _, invar_map = compiled[stage_idx]
                 rank_devices = rank_device_sets[stage_idx]
-                prev_outputs: tuple = ()
+                prev_outputs: StageOutputs = ()
                 if stage_idx > 0:
                     prev_outputs = wait_stage(mb_idx, stage_idx - 1)
 
@@ -686,7 +718,7 @@ class MpmdPipelineExecutor:
                 normalized[stage_idx] = stage_map
         return normalized
 
-    def _prepare_call(self, sxjit_fn: _MpmdPreparedCallable, args: tuple) -> _PreparedCall:
+    def _prepare_call(self, sxjit_fn: _MpmdPreparedCallable, args: tuple[PyTree, ...]) -> _PreparedCall:
         """Ask ``sxjit`` for its MPMD stage plan and flatten runtime leaves.
 
         Args:
@@ -704,7 +736,7 @@ class MpmdPipelineExecutor:
         prepare = getattr(sxjit_fn, "_mpmd_prepare", None)
         if prepare is None:
             raise TypeError("MpmdPipelineExecutor requires a SpectraX sxjit function with _mpmd_prepare.")
-        state = dict(prepare(*args))
+        state = tp.cast(_MpmdState, dict(prepare(*args)))
         if "compiled" not in state:
             raise TypeError("MpmdPipelineExecutor only supports forward-only sxjit plans.")
         return _PreparedCall(state=state, flat_args=jax.tree.leaves(args))
@@ -712,8 +744,8 @@ class MpmdPipelineExecutor:
     def _make_cache_entry(
         self,
         state: _MpmdState,
-        args: tuple,
-        flat_args: list[tp.Any],
+        args: tuple[PyTree, ...],
+        flat_args: list[PyTree],
         *,
         runtime_static_argnums: tp.Iterable[int] | None,
     ) -> _PrepareCacheEntry:
@@ -734,7 +766,7 @@ class MpmdPipelineExecutor:
             counts.append(count)
             offset += count
         static_argnums = self._normalize_runtime_static_argnums(runtime_static_argnums, len(args))
-        static_flat_args: dict[int, tp.Any] = {}
+        static_flat_args: dict[int, PyTree] = {}
         for argnum in static_argnums:
             start = offsets[argnum]
             count = counts[argnum]
@@ -752,10 +784,10 @@ class MpmdPipelineExecutor:
 
     def _fold_runtime_static_slots_into_plan(
         self,
-        plan: tp.Any,
-        invars: list[tp.Any],
+        plan: _InvarAssemblyPlan,
+        invars: list[PyTree],
         runtime_static_flat_indices: set[int],
-    ) -> tp.Any:
+    ) -> _InvarAssemblyPlan:
         """Return an invar plan with stable dynamic slots pre-filled.
 
         Runtime integrations such as eSurge pass graph definitions and weights
@@ -818,7 +850,7 @@ class MpmdPipelineExecutor:
         args: tuple,
         *,
         runtime_static_argnums: tp.Iterable[int] | None,
-    ) -> list[tp.Any]:
+    ) -> list[PyTree]:
         """Flatten args while reusing selected static leaves from the cache.
 
         EasyDeL passes graph definitions and weight pytrees through the same
@@ -880,17 +912,17 @@ class MpmdPipelineExecutor:
         *,
         call: _PreparedCall,
         stage_idx: int,
-        invar_map: list[tuple],
-        invar_plan: tp.Any | None,
-        my_sh: tp.Any,
-        rank_devices: set,
-        rank_submeshes: list[tp.Any],
-        mpmd_mesh: tp.Any,
-        prev_outputs: tuple,
-        all_cluster_outputs: list[tuple | None],
+        invar_map: InvarMap,
+        invar_plan: _InvarAssemblyPlan | None,
+        my_sh: Sharding,
+        rank_devices: set[jax.Device],
+        rank_submeshes: list[Mesh],
+        mpmd_mesh: MpMdMesh | None,
+        prev_outputs: StageOutputs,
+        all_cluster_outputs: list[StageOutputs | None],
         runtime_static_flat_indices: set[int] | None,
-        runtime_static_cache: dict[tuple[int, int], tp.Any] | None,
-    ) -> list:
+        runtime_static_cache: dict[tuple[int, int], PyTree] | None,
+    ) -> list[PyTree]:
         """Materialize one stage's positional inputs for one microbatch.
 
         SpectraX's compiled stage plan describes each input as one of three
@@ -937,7 +969,7 @@ class MpmdPipelineExecutor:
             runtime_static_cache=runtime_static_cache,
         )
 
-    def _make_invar_plans(self, state: _MpmdState) -> tuple[tp.Any, ...]:
+    def _make_invar_plans(self, state: _MpmdState) -> tuple[_InvarAssemblyPlan, ...]:
         """Precompute stage-input routing plans for the cached prepare state.
 
         Each compiled stage carries an ``invar_map`` describing where every
@@ -957,7 +989,7 @@ class MpmdPipelineExecutor:
             for stage_idx, (*_, invar_map) in enumerate(compiled)
         )
 
-    def _assemble_result(self, call: _PreparedCall, outputs: list[tuple | None]) -> tp.Any:
+    def _assemble_result(self, call: _PreparedCall, outputs: list[StageOutputs | None]) -> PyTree:
         """Rebuild the user-facing pytree from per-stage flat outputs.
 
         Args:
@@ -969,7 +1001,7 @@ class MpmdPipelineExecutor:
             The exact pytree shape that a direct ``sxjit`` call would return,
             with optional ``out_shardings`` applied by Spectrax's normal rules.
         """
-        ready_outputs: list[tuple] = []
+        ready_outputs: list[StageOutputs] = []
         for idx, value in enumerate(outputs):
             if value is None:
                 raise RuntimeError(f"internal error: missing output for stage {idx}")
@@ -986,9 +1018,9 @@ class MpmdPipelineExecutor:
     def _resolve_mpmd_mesh(
         self,
         state: _MpmdState,
-        rank_submeshes: list[tp.Any],
+        rank_submeshes: list[Mesh],
         sxjit_fn: _MpmdPreparedCallable | None,
-    ) -> tp.Any:
+    ) -> MpMdMesh | None:
         """Find the owning MPMD mesh for device placement decisions.
 
         The forward plan normally carries this directly in ``state``. The

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 import jax
 import numpy as np
@@ -30,7 +30,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 __all__ = ["MpMdMesh", "resolve_mpmd_mesh"]
 
 
-def resolve_mpmd_mesh(mesh: Any) -> MpMdMesh:
+def resolve_mpmd_mesh(mesh: object) -> MpMdMesh:
     """Coerce ``mesh`` to a :class:`MpMdMesh`.
 
     Accepts:
@@ -52,7 +52,7 @@ def resolve_mpmd_mesh(mesh: Any) -> MpMdMesh:
                 "create_mesh(..., mpmd_axis=<axis>); got an SpxMesh "
                 "with no mpmd_axis set."
             )
-        return mesh.mpmd_mesh
+        return cast(MpMdMesh, mesh.mpmd_mesh)
     if isinstance(mesh, MpMdMesh):
         return mesh
     raise TypeError(f"mesh must be SpxMesh or MpMdMesh, got {type(mesh).__name__}.")
@@ -138,7 +138,9 @@ class MpMdMesh:
             axis=self.mpmd_axis,
         )
         spmd_axis_types = tuple(
-            t for n, t in zip(self.jax_mesh.axis_names, self.jax_mesh.axis_types, strict=False) if n != self.mpmd_axis_name
+            t
+            for n, t in zip(self.jax_mesh.axis_names, self.jax_mesh.axis_types, strict=False)
+            if n != self.mpmd_axis_name
         )
         return Mesh(devices, self.spmd_axis_names, axis_types=spmd_axis_types)
 
@@ -180,7 +182,7 @@ class MpMdMesh:
                 )
         return NamedSharding(self.submesh(mpmd_idx), spec)
 
-    def device_mpmd_idx(self, device: Any) -> int:
+    def device_mpmd_idx(self, device: jax.Device) -> int:
         """Return the MPMD stage a device belongs to.
 
         Args:

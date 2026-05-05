@@ -34,7 +34,7 @@ not invoked at all.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import cast
 
 import jax
 import jax.lax as lax
@@ -77,7 +77,7 @@ def _find_modulelists(module: Module, prefix: tuple[str, ...] = ()):
             yield from _find_modulelists(value, (*prefix, name))
 
 
-def _inject_traced_caches(module: Module, caches: dict[tuple[str, ...], tuple[Any, Any]]) -> None:
+def _inject_traced_caches(module: Module, caches: dict[tuple[str, ...], tuple[object]]) -> None:
     """Attach pre-computed ``(gdef, stacked_state)`` caches to nested ``ModuleList`` instances.
 
     For each ``(path, cache)`` entry, walks ``module`` along ``path`` to
@@ -101,11 +101,11 @@ def _inject_traced_caches(module: Module, caches: dict[tuple[str, ...], tuple[An
 
 
 def _run_branch(
-    gdef: Any,
+    gdef: object,
     state: State,
-    fn: Callable[..., Any],
-    operands: tuple[Any, ...],
-) -> tuple[Any, State]:
+    fn: Callable[..., object],
+    operands: tuple[object, ...],
+) -> tuple[object, State]:
     """Rebind a fresh module from ``(gdef, state)``, run the branch body, and re-export.
 
     Helper for the :func:`cond` and :func:`switch` branch wrappers. The
@@ -134,13 +134,13 @@ def _run_branch(
 
 
 def cond(
-    pred: Any,
-    on_true: Callable[..., Any],
-    on_false: Callable[..., Any],
+    pred: object,
+    on_true: Callable[..., object],
+    on_false: Callable[..., object],
     module: Module,
-    *operands: Any,
+    *operands: object,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.lax.cond`.
 
     Selects between ``on_true`` and ``on_false`` based on ``pred``,
@@ -202,7 +202,7 @@ def cond(
         return lax.cond(pred, t_fn, f_fn, operands)
     carry, invariant = mutable_sel.partition_state(module, state)
 
-    def _wrap(branch: Callable[..., Any]) -> Callable[[State, tuple[Any, ...]], tuple[Any, State]]:
+    def _wrap(branch: Callable[..., object]) -> Callable[[State, tuple[object, ...]], tuple[object, State]]:
         """Wrap a user branch into a ``(carry, ops) -> (y, new_carry)`` ``lax.cond`` body.
 
         The wrapper merges the invariant state back in before running
@@ -212,7 +212,7 @@ def cond(
         incomplete, which would corrupt cross-branch state).
         """
 
-        def wrapped(c: State, ops: tuple[Any, ...]) -> tuple[Any, State]:
+        def wrapped(c: State, ops: tuple[object, ...]) -> tuple[object, State]:
             """Merge invariant+carry, run the branch, re-partition the new state.
 
             Single iteration of the cond body: overlay the captured
@@ -249,12 +249,12 @@ def cond(
 
 
 def switch(
-    index: Any,
-    branches: Sequence[Callable[..., Any]],
+    index: object,
+    branches: Sequence[Callable[..., object]],
     module: Module,
-    *operands: Any,
+    *operands: object,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.lax.switch`.
 
     Selects ``branches[index]`` and runs it as
@@ -306,7 +306,7 @@ def switch(
         return lax.switch(index, wrapped_branches, operands)
     carry, invariant = mutable_sel.partition_state(module, state)
 
-    def _wrap(branch: Callable[..., Any]) -> Callable[[State, tuple[Any, ...]], tuple[Any, State]]:
+    def _wrap(branch: Callable[..., object]) -> Callable[[State, tuple[object, ...]], tuple[object, State]]:
         """Wrap a user branch into a ``(carry, ops) -> (y, new_carry)`` ``lax.switch`` body.
 
         Same semantics as the :func:`cond` wrapper: merge invariant
@@ -315,7 +315,7 @@ def switch(
         argument so the loop variable doesn't leak between branches.
         """
 
-        def wrapped(c: State, ops: tuple[Any, ...]) -> tuple[Any, State]:
+        def wrapped(c: State, ops: tuple[object, ...]) -> tuple[object, State]:
             """Merge invariant+carry, run the branch, re-partition the resulting state.
 
             Per-branch :func:`jax.lax.switch` body: behaves identically
@@ -350,13 +350,13 @@ def switch(
 
 
 def while_loop(
-    cond_fn: Callable[[Module, Any], Any],
-    body_fn: Callable[[Module, Any], Any],
+    cond_fn: Callable[[Module]],
+    body_fn: Callable[[Module]],
     init_module: Module,
-    init_carry: Any,
+    init_carry: object,
     *,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.lax.while_loop`.
 
     Iterates ``body_fn(module, user_carry)`` until
@@ -413,7 +413,7 @@ def while_loop(
         return lax.while_loop(cond_wrap, body_wrap, init_carry)
     carry_state, invariant = mutable_sel.partition_state(init_module, state)
 
-    def cond_wrap(loop_carry: tuple[State, Any]) -> Any:
+    def cond_wrap(loop_carry: tuple[State]) -> object:
         """:func:`jax.lax.while_loop` predicate.
 
         Unpacks the ``(state_carry, user_carry)`` loop tuple, overlays
@@ -431,7 +431,7 @@ def while_loop(
         finally:
             _set_inside_transform(False)
 
-    def body_wrap(loop_carry: tuple[State, Any]) -> tuple[State, Any]:
+    def body_wrap(loop_carry: tuple[State, object]) -> tuple[State, object]:
         """:func:`jax.lax.while_loop` body.
 
         Same module-binding dance as :func:`cond_wrap`: merge invariant
@@ -452,7 +452,7 @@ def while_loop(
         new_c, new_inv = (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)
         _check_invariant_equal(invariant, new_inv)
         assert_state_unchanged(init_module, invariant, new_inv)
-        return new_c, new_uc
+        return new_c, cast(object, new_uc)
 
     final_c, final_uc = lax.while_loop(cond_wrap, body_wrap, (carry_state, init_carry))
     apply_mutations(
@@ -466,12 +466,12 @@ def while_loop(
 def fori_loop(
     lower: int,
     upper: int,
-    body_fn: Callable[[int, Module, Any], Any],
+    body_fn: Callable[[int, Module]],
     init_module: Module,
-    init_carry: Any,
+    init_carry: object,
     *,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.lax.fori_loop`.
 
     Iterates ``body_fn(i, module, user_carry)`` for ``i`` in
@@ -520,7 +520,7 @@ def fori_loop(
 
     from ..core.containers import _stack_module_states
 
-    modulelist_caches: dict[tuple[str, ...], tuple[Any, Any]] = {}
+    modulelist_caches: dict[tuple[str, ...], tuple[object]] = {}
     for path, ml in _find_modulelists(init_module):
         if not ml._spx_items:
             continue
@@ -536,7 +536,7 @@ def fori_loop(
         return lax.fori_loop(lower, upper, body_wrap, init_carry)
     if mutable_sel is None:
 
-        def body_wrap(i: Any, user_carry: Any) -> Any:
+        def body_wrap(i: object, user_carry: object) -> object:
             """``fori_loop`` body for the no-mutation-but-has-ModuleList path.
 
             Binds a fresh module from the original ``state``, injects
@@ -562,7 +562,7 @@ def fori_loop(
         return lax.fori_loop(lower, upper, body_wrap, init_carry)
     carry_state, invariant = mutable_sel.partition_state(init_module, state)
 
-    def body_wrap(i: Any, loop_carry: tuple[State, Any]) -> tuple[State, Any]:
+    def body_wrap(i: object, loop_carry: tuple[State, object]) -> tuple[State, object]:
         """``fori_loop`` body for the mutable-state path.
 
         Unpacks ``(state_carry, user_carry)``, binds a fresh module
@@ -586,7 +586,7 @@ def fori_loop(
         new_c, new_inv = (State({}), new_state) if mutable_sel is None else mutable_sel.partition_state(m, new_state)
         _check_invariant_equal(invariant, new_inv)
         assert_state_unchanged(init_module, invariant, new_inv)
-        return new_c, new_uc
+        return new_c, cast(object, new_uc)
 
     final_c, final_uc = lax.fori_loop(lower, upper, body_wrap, (carry_state, init_carry))
     apply_mutations(
@@ -598,16 +598,16 @@ def fori_loop(
 
 
 def remat_scan(
-    fn: Callable[[Module, Any], Any],
+    fn: Callable[[Module]],
     init_module: Module,
-    xs: Any,
+    xs: object,
     *,
     length: int | None = None,
     mutable: SelectorSugar = (),
-    policy: Callable[..., Any] | None = None,
+    policy: Callable[..., object] | None = None,
     prevent_cse: bool = True,
     unroll: int = 1,
-) -> Any:
+) -> object:
     """Scan ``fn`` with each step run under :func:`jax.checkpoint`.
 
     Equivalent to :func:`~spectrax.scan` (``fn(module, x) -> y``) but
@@ -658,7 +658,7 @@ def remat_scan(
     gdef, state = export(init_module)
     carry_state, invariant = mutable_sel.partition_state(init_module, state)
 
-    def step(c: State, x: Any) -> tuple[State, Any]:
+    def step(c: State, x: object) -> tuple[State, object]:
         """Single ``remat_scan`` step body, wrapped in :func:`jax.checkpoint` by the caller.
 
         Overlays the captured invariant on the current carry, rebinds a

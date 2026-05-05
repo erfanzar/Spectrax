@@ -44,7 +44,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -249,7 +248,7 @@ class _HashableSchedule:
 
     __slots__ = ("schedule",)
 
-    def __init__(self, schedule: Any) -> None:
+    def __init__(self, schedule: object) -> None:
         """Store ``schedule`` unchanged; comparisons and hashes go by ``id``."""
         self.schedule = schedule
 
@@ -352,12 +351,12 @@ def _pscan_abstract(
     return [v.aval for v in jaxpr.jaxpr.outvars]
 
 
-def _unwrap_schedule(schedule: Any) -> Any:
+def _unwrap_schedule(schedule: object) -> object:
     """Return the underlying schedule object from a :class:`_HashableSchedule` wrapper."""
     return schedule.schedule if isinstance(schedule, _HashableSchedule) else schedule
 
 
-def _unwrap_ops(ops: Any) -> tuple:
+def _unwrap_ops(ops: object) -> tuple:
     """Return the underlying ops tuple from a :class:`_HashableOps` wrapper."""
     return ops.ops if isinstance(ops, _HashableOps) else tuple(ops)
 
@@ -394,7 +393,7 @@ def _pscan_lowering(
 mlir.register_lowering(pscan_p, _pscan_lowering)
 
 
-def _is_scalar_aval(aval: Any) -> bool:
+def _is_scalar_aval(aval: object) -> bool:
     """Return ``True`` iff ``aval`` is a rank-0 array-like abstract value."""
     return hasattr(aval, "shape") and tuple(aval.shape) == ()
 
@@ -411,7 +410,7 @@ def _prune_closed_jaxpr_to_outputs(
     from pre-differentiated bodies.
     """
     needed: set[int] = {id(v) for v in keep_outvars}
-    kept_rev: list[Any] = []
+    kept_rev: list[object] = []
     for eqn in reversed(closed_jaxpr.jaxpr.eqns):
         eqn_outvars = [v for v in eqn.outvars if isinstance(v, Var)]
         if not any(id(v) in needed for v in eqn_outvars):
@@ -432,9 +431,9 @@ def _prune_closed_jaxpr_to_outputs(
 
 
 def _probe_body(
-    fun: Callable[[jax.Array], Any],
+    fun: Callable[[jax.Array]],
     probe_idx: jax.Array,
-) -> tuple[str, ClosedJaxpr, ClosedJaxpr, Any | None, Any]:
+) -> tuple[str, ClosedJaxpr, ClosedJaxpr | None, object | None, object]:
     """Trace ``fun`` once and classify its output convention.
 
     Supported conventions:
@@ -465,12 +464,12 @@ def _probe_body(
 
 
 def treduce(
-    fun: Callable[[Any], Any],
-    xs: Any,
-    schedule: Any,
+    fun: Callable[[object]],
+    xs: object,
+    schedule: object,
     axis: int = 0,
-    operation: Any = None,
-) -> Any:
+    operation: object = None,
+) -> object:
     """Reduce ``fun`` over microbatches of ``xs`` under a pipeline schedule.
 
     ``xs`` is a pytree with a common leading microbatch axis (``axis``).
@@ -501,7 +500,7 @@ def treduce(
         raise ValueError("treduce: xs is empty.")
     length = flat_leaves[0].shape[axis]
 
-    def wrap(i: jax.Array) -> Any:
+    def wrap(i: jax.Array) -> object:
         """Select the ``i``-th microbatch from ``xs`` and call ``fun``."""
         mb = jax.tree.map(lambda arr: jax.lax.dynamic_index_in_dim(arr, i, axis=axis, keepdims=False), xs)
         return fun(mb)
@@ -510,11 +509,11 @@ def treduce(
 
 
 def treduce_i(
-    fun: Callable[[jax.Array], Any],
+    fun: Callable[[jax.Array]],
     length: int,
-    schedule: Any,
-    operation: Any = None,
-) -> Any:
+    schedule: object,
+    operation: object = None,
+) -> object:
     """Reduce ``fun(i)`` for ``i`` in ``[0, length)`` under a pipeline schedule.
 
     Unlike :func:`treduce`, this passes the microbatch index directly

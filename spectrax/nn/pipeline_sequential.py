@@ -20,7 +20,6 @@ surgery.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any
 
 from spectrax.core.module import Module
 from spectrax.core.variable import Variable
@@ -120,7 +119,7 @@ class PipelineSequential(Module):
         """
         return list(self._spx_items)
 
-    def forward(self, x: Any) -> Any:
+    def forward(self, x: object) -> object:
         """Apply every stage in order (eager / single-device path).
 
         Each stage is called as ``stage(x)`` and its return value

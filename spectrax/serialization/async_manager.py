@@ -178,6 +178,7 @@ class AsyncCheckpointManager:
         path: str | os.PathLike,
         *,
         prefix: str,
+        mesh: Mesh | None = None,
         dtype: jnp.dtype | None = None,
         extras: dict | None = None,
         write_index: bool = True,
@@ -196,6 +197,9 @@ class AsyncCheckpointManager:
                 ``"gs://bucket/path"``).
             prefix: Logical namespace for the saved tree (e.g. ``"model"``,
                 ``"tx"``). Must be a non-empty string.
+            mesh: Optional compatibility argument accepted by older call sites.
+                Save preserves each array's existing sharding, so the mesh is
+                only needed on load and is intentionally ignored here.
             dtype: Optional dtype to cast floating-point arrays to before
                 saving. If ``None``, the original dtypes are preserved.
             extras: Optional dictionary of extra metadata stored inside the

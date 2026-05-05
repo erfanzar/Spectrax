@@ -37,7 +37,7 @@ is exactly zero — no hidden mode switch, no API to forget.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import jax.numpy as jnp
 
@@ -124,7 +124,7 @@ class LoRA(Module):
         rank: int,
         d_out: int,
         *,
-        base_module: Callable[..., Any] | None = None,
+        base_module: Callable[..., Array] | None = None,
         alpha: float | None = None,
         rngs: Rngs | int | None = None,
         a_init: Initializer | None = None,
@@ -194,7 +194,7 @@ class LoRA(Module):
             return 1.0
         return jnp.asarray(self.alpha / self.rank, dtype=out_dtype)
 
-    def forward(self, x: ArrayLike, *args: Any, **kwargs: Any) -> Array:
+    def forward(self, x: ArrayLike, *args: object, **kwargs: object) -> Array:
         """Return ``base(x) + scale * (x @ A @ B)`` — or just the delta.
 
         Downcasts the factors to ``x``'s dtype when ``x`` is lower
@@ -326,7 +326,7 @@ class LoRALinear(Module):
             dtype=dtype,
         )
 
-    def forward(self, x: ArrayLike, **kwargs: Any) -> Array:
+    def forward(self, x: ArrayLike, **kwargs: object) -> Array:
         """Apply the base Linear and add the LoRA delta.
 
         Args:

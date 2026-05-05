@@ -38,7 +38,7 @@ import contextlib
 import itertools
 import threading
 from collections.abc import Callable, Iterator
-from typing import Any, ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -53,7 +53,7 @@ from .stage_assignment import (
     resolve_stage_rank,
 )
 
-InitPlacementHook = Callable[[Any, dict[str, Any], bool], Any | None]
+InitPlacementHook = Callable[[object, dict[str, object], bool], object | None]
 
 __all__ = [
     "KINDS_BUILTIN",
@@ -77,13 +77,13 @@ def _fresh_ref_id() -> int:
         return next(_REF_COUNTER)
 
 
-def _maybe_stamped_sharding(value: Any) -> Sharding | None:
+def _maybe_stamped_sharding(value: object) -> Sharding | None:
     """Return any initializer-stamped sharding metadata on ``value``."""
     stamped = getattr(value, "_spx_sharding", None)
     return normalize_sharding(stamped) if stamped is not None else None
 
 
-def _existing_value_sharding(value: Any) -> Any | None:
+def _existing_value_sharding(value: object) -> object | None:
     """Return the concrete sharding already carried by ``value``, if any.
 
     Tracers carry only a derived/origin sharding — accessing it triggers
@@ -99,7 +99,7 @@ def _existing_value_sharding(value: Any) -> Any | None:
 _WRITE_HOOK: threading.local = threading.local()
 
 
-def _set_write_hook(hook: Callable[[Variable, Any], bool] | None) -> None:
+def _set_write_hook(hook: Callable[[Variable], bool] | None) -> None:
     """Install a thread-local write hook for :class:`Variable` writes.
 
     The hook signature is ``hook(var, new) -> bool``. If the hook returns
@@ -113,7 +113,7 @@ def _set_write_hook(hook: Callable[[Variable, Any], bool] | None) -> None:
     _WRITE_HOOK.hook = hook
 
 
-def _get_write_hook() -> Callable[[Variable, Any], bool] | None:
+def _get_write_hook() -> Callable[[Variable], bool] | None:
     """Return the currently-installed write hook, or ``None``."""
     return getattr(_WRITE_HOOK, "hook", None)
 
@@ -121,17 +121,17 @@ def _get_write_hook() -> Callable[[Variable, Any], bool] | None:
 _READ_HOOK: threading.local = threading.local()
 
 
-def _set_read_hook(hook: Callable[[Variable], Any] | None) -> None:
+def _set_read_hook(hook: Callable[[Variable]] | None) -> None:
     """Install a thread-local read hook for :class:`Variable` reads.
 
-    The hook signature is ``hook(var) -> Any`` and its return value is
+    The hook signature is ``hook(var) -> object`` and its return value is
     used in place of the underlying ``_value``. Passing ``None`` restores
     the default eager read behavior.
     """
     _READ_HOOK.hook = hook
 
 
-def _get_read_hook() -> Callable[[Variable], Any] | None:
+def _get_read_hook() -> Callable[[Variable]] | None:
     """Return the currently-installed read hook, or ``None``."""
     return getattr(_READ_HOOK, "hook", None)
 
@@ -154,7 +154,7 @@ def variable_init_placement(hook: InitPlacementHook) -> Iterator[None]:
     context).
 
     The hook signature is
-    ``(value, metadata, explicit_sharding) -> Any | None`` where
+    ``(value, metadata, explicit_sharding) -> object | None`` where
     ``explicit_sharding`` is ``True`` when the variable's constructor
     received an explicit ``sharding=`` argument.
 
@@ -243,9 +243,9 @@ class Variable:
         "ref_id",
     )
 
-    _value: Any
+    _value: object
     kind: str
-    metadata: dict[str, Any]
+    metadata: dict[str, object]
     ref_id: int
     _observers: list[VariableObserver]
 
@@ -254,7 +254,7 @@ class Variable:
         value: ArrayLike,
         *,
         kind: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, object] | None = None,
         ref_id: int | None = None,
     ) -> None:
         """Construct a reference cell wrapping ``value``.
@@ -297,8 +297,8 @@ class Variable:
         """
         read_hook = _get_read_hook()
         if read_hook is not None:
-            return read_hook(self)
-        return self._value
+            return cast(Array, read_hook(self))
+        return cast(Array, self._value)
 
     @value.setter
     def value(self, new: ArrayLike) -> None:
@@ -322,7 +322,7 @@ class Variable:
             with contextlib.suppress(Exception):
                 obs(self, old, new)
 
-    def _raw_get(self) -> Any:
+    def _raw_get(self) -> object:
         """Return the underlying value, bypassing any installed hooks.
 
         Used by the graph / transform machinery that must not be
@@ -330,7 +330,7 @@ class Variable:
         """
         return self._value
 
-    def _raw_set(self, new: Any) -> None:
+    def _raw_set(self, new: object) -> None:
         """Write ``new`` to the cell, bypassing hooks and observers.
 
         Used by the graph / transform machinery to apply a state patch
@@ -393,7 +393,7 @@ class Variable:
         assignment = self.stage_assignment
         return assignment[1] if assignment is not None else None
 
-    def resolved_stage_index(self, mesh_or_dim: Any) -> int | None:
+    def resolved_stage_index(self, mesh_or_dim: object) -> int | None:
         """Resolve :attr:`stage_index` onto a physical MPMD stage index.
 
         ``mesh_or_dim`` may be:
@@ -436,7 +436,7 @@ class Variable:
             return None
         return resolve_stage_rank(self.stage_assignment, mpmd_dim)
 
-    def stage_mesh(self, mesh: Any) -> Any:
+    def stage_mesh(self, mesh: object) -> object:
         """Return the stage-local mesh this variable should live on.
 
         For non-MPMD meshes, returns the input mesh unchanged (or its
@@ -463,7 +463,7 @@ class Variable:
             return mesh.submesh(owner) if owner is not None else mesh.jax_mesh
         return mesh
 
-    def named_sharding(self, mesh: Any) -> Any:
+    def named_sharding(self, mesh: object) -> object:
         """Resolve this variable's metadata to a ``NamedSharding``.
 
         Args:
@@ -505,7 +505,7 @@ class Variable:
         return tuple(self.value.shape)
 
     @property
-    def dtype(self) -> Any:
+    def dtype(self) -> object:
         """Dtype of the stored array."""
         return self.value.dtype
 
@@ -530,7 +530,7 @@ class Variable:
         """
         return jnp.asarray(self.value, dtype=dtype)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> object:
         """Delegate unknown attribute lookups to the underlying array.
 
         This lets array methods (``transpose``, ``reshape``, ``swapaxes``,
@@ -542,7 +542,7 @@ class Variable:
         return getattr(self.value, name)
 
     @staticmethod
-    def _v(other: Any) -> Any:
+    def _v(other: object) -> object:
         """Unwrap a :class:`Variable` (or pass through) for arithmetic ops."""
         return other.value if isinstance(other, Variable) else other
 
@@ -558,63 +558,63 @@ class Variable:
         """``abs(var)``."""
         return abs(self.value)
 
-    def __add__(self, o: Any) -> Array:
+    def __add__(self, o: object) -> Array:
         """``var + o``."""
         return self.value + self._v(o)
 
-    def __radd__(self, o: Any) -> Array:
+    def __radd__(self, o: object) -> Array:
         """``o + var``."""
         return self._v(o) + self.value
 
-    def __sub__(self, o: Any) -> Array:
+    def __sub__(self, o: object) -> Array:
         """``var - o``."""
         return self.value - self._v(o)
 
-    def __rsub__(self, o: Any) -> Array:
+    def __rsub__(self, o: object) -> Array:
         """``o - var``."""
         return self._v(o) - self.value
 
-    def __mul__(self, o: Any) -> Array:
+    def __mul__(self, o: object) -> Array:
         """``var * o``."""
         return self.value * self._v(o)
 
-    def __rmul__(self, o: Any) -> Array:
+    def __rmul__(self, o: object) -> Array:
         """``o * var``."""
         return self._v(o) * self.value
 
-    def __truediv__(self, o: Any) -> Array:
+    def __truediv__(self, o: object) -> Array:
         """``var / o``."""
         return self.value / self._v(o)
 
-    def __rtruediv__(self, o: Any) -> Array:
+    def __rtruediv__(self, o: object) -> Array:
         """``o / var``."""
         return self._v(o) / self.value
 
-    def __floordiv__(self, o: Any) -> Array:
+    def __floordiv__(self, o: object) -> Array:
         """``var // o``."""
         return self.value // self._v(o)
 
-    def __mod__(self, o: Any) -> Array:
+    def __mod__(self, o: object) -> Array:
         """``var % o``."""
         return self.value % self._v(o)
 
-    def __pow__(self, o: Any) -> Array:
+    def __pow__(self, o: object) -> Array:
         """``var ** o``."""
         return self.value ** self._v(o)
 
-    def __rpow__(self, o: Any) -> Array:
+    def __rpow__(self, o: object) -> Array:
         """``o ** var``."""
         return self._v(o) ** self.value
 
-    def __matmul__(self, o: Any) -> Array:
+    def __matmul__(self, o: object) -> Array:
         """``var @ o``."""
         return self.value @ self._v(o)
 
-    def __rmatmul__(self, o: Any) -> Array:
+    def __rmatmul__(self, o: object) -> Array:
         """``o @ var``."""
         return self._v(o) @ self.value
 
-    def __getitem__(self, idx: Any) -> Array:
+    def __getitem__(self, idx: object) -> Array:
         """``var[idx]`` — indexes into the stored array."""
         return self.value[idx]
 
@@ -668,7 +668,7 @@ class Parameter(Variable):
         sharding: Sharding | AxisNames | None = None,
         axis_names: AxisNames | None = None,
         trainable: bool = True,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, object] | None = None,
         ref_id: int | None = None,
     ) -> None:
         """Construct a parameter cell.
@@ -685,7 +685,7 @@ class Parameter(Variable):
             metadata: Additional metadata (merged into :attr:`metadata`).
             ref_id: Explicit ``ref_id`` to adopt.
         """
-        meta: dict[str, Any] = dict(metadata) if metadata else {}
+        meta: dict[str, object] = dict(metadata) if metadata else {}
         stamped_sharding = _maybe_stamped_sharding(value)
         assignment = current_stage_assignment()
         if sharding is not None:
@@ -722,7 +722,7 @@ class Buffer(Variable):
         kind: str | None = None,
         sharding: Sharding | AxisNames | None = None,
         axis_names: AxisNames | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, object] | None = None,
         ref_id: int | None = None,
     ) -> None:
         """Construct a buffer cell.
@@ -737,7 +737,7 @@ class Buffer(Variable):
             metadata: Additional metadata.
             ref_id: Explicit ``ref_id`` to adopt.
         """
-        meta: dict[str, Any] = dict(metadata) if metadata else {}
+        meta: dict[str, object] = dict(metadata) if metadata else {}
         stamped_sharding = _maybe_stamped_sharding(value)
         assignment = current_stage_assignment()
         if sharding is not None:
@@ -774,14 +774,14 @@ class DeferredParameter(Parameter):
     def __init__(
         self,
         shape_spec: tuple[int | None, ...],
-        init: Callable[[Any, tuple[int, ...], Any], Any],
-        rngs: Any,
-        dtype: Any,
+        init: Callable[[object, tuple[int, ...]]],
+        rngs: object,
+        dtype: object,
         *,
         sharding: Sharding | AxisNames | None = None,
         axis_names: AxisNames | None = None,
         trainable: bool = True,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, object] | None = None,
         ref_id: int | None = None,
     ) -> None:
         """Construct a deferred parameter with a (possibly partial) shape spec.
@@ -816,7 +816,7 @@ class DeferredParameter(Parameter):
                 :attr:`Variable.metadata`.
             ref_id: Optional explicit ``ref_id`` to adopt.
         """
-        meta: dict[str, Any] = dict(metadata) if metadata else {}
+        meta: dict[str, object] = dict(metadata) if metadata else {}
         if sharding is not None:
             meta["sharding"] = normalize_sharding(sharding)
         if axis_names is not None:
@@ -914,14 +914,14 @@ class DeferredBuffer(Buffer):
     def __init__(
         self,
         shape_spec: tuple[int | None, ...],
-        init: Callable[[Any, tuple[int, ...], Any], Any],
-        rngs: Any,
-        dtype: Any,
+        init: Callable[[object, tuple[int, ...]]],
+        rngs: object,
+        dtype: object,
         *,
         kind: str | None = None,
         sharding: Sharding | AxisNames | None = None,
         axis_names: AxisNames | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, object] | None = None,
         ref_id: int | None = None,
     ) -> None:
         """Construct a deferred buffer.
@@ -944,7 +944,7 @@ class DeferredBuffer(Buffer):
             metadata: Additional metadata.
             ref_id: Optional explicit ``ref_id`` to adopt.
         """
-        meta: dict[str, Any] = dict(metadata) if metadata else {}
+        meta: dict[str, object] = dict(metadata) if metadata else {}
         if sharding is not None:
             meta["sharding"] = normalize_sharding(sharding)
         if axis_names is not None:
@@ -1025,9 +1025,9 @@ def _initialize_value(
     value: ArrayLike,
     dtype: DType | None,
     *,
-    metadata: dict[str, Any],
+    metadata: dict[str, object],
     explicit_sharding: bool,
-) -> Any:
+) -> object:
     """Coerce ``value`` and apply constructor-time sharding when available.
 
     Pipeline:
@@ -1100,7 +1100,7 @@ def _initialize_value(
     return jax.device_put(arr, sharding)
 
 
-def _coerce_value(value: ArrayLike, dtype: DType | None) -> Any:
+def _coerce_value(value: ArrayLike, dtype: DType | None) -> object:
     """Coerce ``value`` while preserving existing JAX-array sharding.
 
     Note: prefer ``isinstance(value, jax.Array)`` over
@@ -1117,7 +1117,7 @@ def _coerce_value(value: ArrayLike, dtype: DType | None) -> Any:
     return _as_array(value)
 
 
-def _as_array(value: ArrayLike) -> Any:
+def _as_array(value: ArrayLike) -> object:
     """Coerce ``value`` to a JAX array when it is concrete enough to do so.
 
     Pass-through on values that are already traced or unrecognized so
@@ -1128,7 +1128,7 @@ def _as_array(value: ArrayLike) -> Any:
     return value
 
 
-def _deferred_aux(v: Variable) -> dict[str, Any] | None:
+def _deferred_aux(v: Variable) -> dict[str, object] | None:
     """Capture DeferredParameter/DeferredBuffer private state for pytree round-trips."""
     if not isinstance(v, DeferredParameter | DeferredBuffer):
         return None
@@ -1142,7 +1142,7 @@ def _deferred_aux(v: Variable) -> dict[str, Any] | None:
     }
 
 
-def _restore_deferred_aux(v: Variable, deferred: dict[str, Any] | None) -> None:
+def _restore_deferred_aux(v: Variable, deferred: dict[str, object] | None) -> None:
     """Restore DeferredParameter/DeferredBuffer private state captured in aux."""
     if deferred is None:
         return
@@ -1154,15 +1154,15 @@ def _restore_deferred_aux(v: Variable, deferred: dict[str, Any] | None) -> None:
     object.__setattr__(v, "_deferred_materialized", deferred["materialized"])
 
 
-_VariableAux = tuple[type[Variable], str, dict[str, Any], int, dict[str, Any] | None]
+_VariableAux = tuple[type[Variable], str, dict[str, object], int, dict[str, object] | None]
 
 
-def _variable_flatten(v: Variable) -> tuple[list[Any], _VariableAux]:
+def _variable_flatten(v: Variable) -> tuple[list[object], _VariableAux]:
     """Flatten a Variable to its value leaf."""
     return ([v.value], (type(v), v.kind, dict(v.metadata), v.ref_id, _deferred_aux(v)))
 
 
-def _variable_unflatten(aux: _VariableAux, children: list[Any]) -> Variable:
+def _variable_unflatten(aux: _VariableAux, children: list[object]) -> Variable:
     """Reconstruct a Variable (or subclass) from its value.
 
     We use ``object.__new__`` to bypass custom ``__init__`` logic in
@@ -1184,7 +1184,7 @@ def _variable_unflatten(aux: _VariableAux, children: list[Any]) -> Variable:
 
 def _variable_flatten_with_keys(
     v: Variable,
-) -> tuple[list[tuple[jax.tree_util.KeyEntry, Any]], _VariableAux]:
+) -> tuple[list[tuple[jax.tree_util.KeyEntry, Array]], _VariableAux]:
     """Keyed flatten for :func:`jax.tree_util.register_pytree_with_keys`."""
     return (
         [(jax.tree_util.GetAttrKey("value"), v.value)],
@@ -1201,7 +1201,7 @@ for _var_cls in (Variable, Parameter, Buffer, DeferredParameter, DeferredBuffer)
     )
 
 
-def _auto_register_init_subclass(cls, **kwargs: Any) -> None:
+def _auto_register_init_subclass(cls, **kwargs: object) -> None:
     """Hook that PyTree-registers every new Variable subclass."""
     super(Variable, cls).__init_subclass__(**kwargs)
     if cls not in (Variable, Parameter, Buffer, DeferredParameter, DeferredBuffer):

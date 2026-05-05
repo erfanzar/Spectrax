@@ -26,7 +26,7 @@ cross-rank transport via :func:`jax.lax.ppermute`.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -49,11 +49,11 @@ _PHASE_MAP = {
 }
 
 
-def _drop0(tree: Any) -> Any:
+def _drop0(tree: object) -> object:
     """Strip the leading size-1 pp axis from every leaf in ``tree``.
 
     Args:
-        tree: Any pytree of arrays.
+        tree: object pytree of arrays.
 
     Returns:
         Same pytree with each leaf indexed at ``[0]``.
@@ -61,14 +61,14 @@ def _drop0(tree: Any) -> Any:
     return jax.tree.map(lambda a: a[0], tree)
 
 
-def _add0(tree: Any) -> Any:
+def _add0(tree: object) -> object:
     """Add a leading size-1 pp axis to every leaf in ``tree``.
 
     Inverse of :func:`_drop0`; used on out-bound carries that need
     to satisfy a ``PartitionSpec(pp_axis)`` ``out_specs`` entry.
 
     Args:
-        tree: Any pytree of arrays.
+        tree: object pytree of arrays.
 
     Returns:
         Same pytree with each leaf gaining a leading axis of size 1.
@@ -183,13 +183,13 @@ def make_scheduled_body(
     n_stages: int,
     microbatches: int,
     pp_axis: str,
-    fwd_fn: Callable[[Any, Any], Any],
-    bwd_fn: Callable[[Any, Any, Any], tuple[Any, Any]],
-    loss_and_g_y: Callable[..., tuple[Any, Any]],
+    fwd_fn: Callable[[object]],
+    bwd_fn: Callable[[object], tuple[object]],
+    loss_and_g_y: Callable[..., tuple[object]],
     mode: Literal["train"] = "train",
     checkpoint_policy: Callable[..., bool] | None = None,
     use_scan: bool = False,
-) -> Callable[..., Any]:
+) -> Callable[..., object]:
     """Build a :func:`jax.shard_map` body that executes ``schedule``.
 
     Args:

@@ -11,6 +11,7 @@ well under 100 LOC.
 | `03_export_bind.py`        | Round-tripping a module via `spx.export` -> `(GraphDef, State)` and `spx.bind` back to a live module.     |
 | `04_state_pop_update.py`   | State-pytree surgery: `spx.tree_state`, `spx.clone`, `spx.update`, and `spx.pop` on `Parameter`/`Buffer`. |
 | `05_optimizer.py`          | Training with `spectrax.contrib.Optimizer` wrapping `optax.adam`, inside a jitted step.                   |
+| `06_multi_optimizer_lora.py` | Separate optimizer policies for base `"parameters"` and LoRA `"lora"` collections with `MultiOptimizer`. |
 
 All examples run on CPU with small sizes (`d=32`, `hidden=64`, `bs=8`)
 and finish in a few seconds.

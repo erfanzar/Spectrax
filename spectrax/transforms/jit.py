@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, TypeVar
+from typing import TypeVar, cast
 
 import jax
 
@@ -49,17 +49,17 @@ from .split_merge import (
 
 __all__ = ["jit"]
 
-F = TypeVar("F", bound=Callable[..., Any])
+F = TypeVar("F", bound=Callable[..., object])
 
-_UNSET: Any = object()
+_UNSET: object = object()
 """Sentinel indicating that a keyword was not supplied, so JAX's own
 ``UnspecifiedValue`` default is used.
 """
 
 
 def _live_module_refs(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> tuple[tuple[Any, ...], tuple[Any, ...], tuple[int, ...]]:
+    args: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[tuple[object, ...], tuple[object, ...], tuple[int, ...]]:
     """Build cache-key tuples for the top-level :class:`~spectrax.Module` arguments.
 
     Used by the readonly fast path in :func:`jit`: instead of going
@@ -86,8 +86,8 @@ def _live_module_refs(
         * ``id_key`` collects the Python ``id`` of each module instance
           for the identity-based hot-path cache.
     """
-    layout: list[Any] = []
-    gdefs: list[Any] = []
+    layout: list[object] = []
+    gdefs: list[object] = []
     ids: list[int] = []
     epoch = _graph_epoch()
     for i, value in enumerate(args):
@@ -117,20 +117,20 @@ def jit(
     fn: F | None = None,
     *,
     mutable: SelectorSugar = (),
-    mesh: Any | None = None,
-    schedule: Any | None = None,
-    in_shardings: Any = _UNSET,
-    out_shardings: Any = _UNSET,
+    mesh: object | None = None,
+    schedule: object | None = None,
+    in_shardings: object = _UNSET,
+    out_shardings: object = _UNSET,
     static_argnums: int | Sequence[int] | None = None,
     static_argnames: str | Iterable[str] | None = None,
     donate_argnums: int | Sequence[int] | None = None,
     donate_argnames: str | Iterable[str] | None = None,
     batch_argnums: int | Sequence[int] | None = None,
     keep_unused: bool = False,
-    device: Any = None,
+    device: object = None,
     backend: str | None = None,
     inline: bool = False,
-    compiler_options: dict[str, Any] | None = None,
+    compiler_options: dict[str, object] | None = None,
 ) -> F:
     """Module-aware ``jax.jit``.
 
@@ -227,23 +227,26 @@ def jit(
             routing to ``sxjit``.
     """
     if fn is None:
-        return lambda f: jit(
-            f,
-            mutable=mutable,
-            mesh=mesh,
-            schedule=schedule,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            static_argnums=static_argnums,
-            static_argnames=static_argnames,
-            donate_argnums=donate_argnums,
-            donate_argnames=donate_argnames,
-            batch_argnums=batch_argnums,
-            keep_unused=keep_unused,
-            device=device,
-            backend=backend,
-            inline=inline,
-            compiler_options=compiler_options,
+        return cast(
+            F,
+            lambda f: jit(
+                f,
+                mutable=mutable,
+                mesh=mesh,
+                schedule=schedule,
+                in_shardings=in_shardings,
+                out_shardings=out_shardings,
+                static_argnums=static_argnums,
+                static_argnames=static_argnames,
+                donate_argnums=donate_argnums,
+                donate_argnames=donate_argnames,
+                batch_argnums=batch_argnums,
+                keep_unused=keep_unused,
+                device=device,
+                backend=backend,
+                inline=inline,
+                compiler_options=compiler_options,
+            ),
         )
 
     if mesh is not None and _is_mpmd_mesh(mesh):
@@ -258,16 +261,19 @@ def jit(
         )
         from ..runtime.mpmd import sxjit
 
-        return sxjit(
-            fn,
-            mesh=mesh,
-            schedule=schedule,
-            static_argnums=_normalize_argnums_for_sxjit(static_argnums),
-            static_argnames=_normalize_argnames_for_sxjit(static_argnames),
-            donate_argnums=_normalize_argnums_for_sxjit(donate_argnums),
-            batch_argnums=_normalize_argnums_for_sxjit(batch_argnums),
-            in_shardings=None if in_shardings is _UNSET else in_shardings,
-            out_shardings=None if out_shardings is _UNSET else out_shardings,
+        return cast(
+            F,
+            sxjit(
+                fn,
+                mesh=mesh,
+                schedule=schedule,
+                static_argnums=_normalize_argnums_for_sxjit(static_argnums),
+                static_argnames=_normalize_argnames_for_sxjit(static_argnames),
+                donate_argnums=_normalize_argnums_for_sxjit(donate_argnums),
+                batch_argnums=_normalize_argnums_for_sxjit(batch_argnums),
+                in_shardings=None if in_shardings is _UNSET else in_shardings,
+                out_shardings=None if out_shardings is _UNSET else out_shardings,
+            ),
         )
     if schedule is not None:
         raise ValueError("spx.jit(..., schedule=...) requires an MPMD mesh.")
@@ -276,7 +282,7 @@ def jit(
 
     mutable_sel = resolve_mutable(mutable)
 
-    jit_kwargs: dict[str, Any] = {
+    jit_kwargs: dict[str, object] = {
         "static_argnums": static_argnums,
         "static_argnames": static_argnames,
         "donate_argnums": donate_argnums,
@@ -292,10 +298,10 @@ def jit(
     if out_shardings is not _UNSET:
         jit_kwargs["out_shardings"] = out_shardings
 
-    _compile_cache: dict[tuple[Any, ...], Any] = {}
-    _id_cache: dict[tuple[int, ...], tuple[int, tuple[Any, ...], Any]] = {}
-    _id_cache_one: dict[int, tuple[int, tuple[Any, ...], Any]] = {}
-    _ctx_compile_cache: dict[tuple[Any, ...], Any] = {}
+    _compile_cache: dict[tuple[object, ...], object] = {}
+    _id_cache: dict[tuple[int, ...], tuple[int, tuple[object, ...]]] = {}
+    _id_cache_one: dict[int, tuple[int, tuple[object, ...]]] = {}
+    _ctx_compile_cache: dict[tuple[object, ...], object] = {}
 
     _locate = locate_and_strip
     _locate_fast = locate_and_strip_fast
@@ -308,11 +314,11 @@ def jit(
     _make_pure_ctx = make_pure_ctx
     _jax_jit = jax.jit
     _ctx_stack_get = _CTX_STACK.get
-    _empty_kwargs: dict[str, Any] = {}
+    _empty_kwargs: dict[str, object] = {}
     _direct_guarded = make_direct_readonly(fn)
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Dispatch through the graph-def-keyed compile cache.
 
         Two-level cache:
@@ -435,10 +441,10 @@ def jit(
         return out
 
     def _wrapped_with_ctx(
-        ctx_stack: tuple[dict[str, Any], ...],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> Any:
+        ctx_stack: tuple[dict[str, object], ...],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> object:
         """Scope-active dispatch path.
 
         Flattens the scope stack, splits it into
@@ -449,7 +455,7 @@ def jit(
         inside the traced body resolve to tracers rather than the
         constants captured at the trace-time snapshot.
         """
-        snap: dict[str, Any] = {}
+        snap: dict[str, object] = {}
         for frame in ctx_stack:
             snap.update(frame)
         traced_ctx, static_ctx = _ctx_partition(snap)
@@ -469,7 +475,7 @@ def jit(
         _apply(refs, new_states, mutable_sel)
         return out
 
-    def lower(*args: Any, **kwargs: Any) -> Any:
+    def lower(*args: object, **kwargs: object) -> object:
         """Lower the call to a :class:`jax.stages.Lowered` without dispatching it.
 
         Mirrors :meth:`jax.jit.lower` for ahead-of-time users while still
@@ -485,7 +491,7 @@ def jit(
         """
         ctx_stack = _ctx_stack_get()
         if ctx_stack:
-            snap: dict[str, Any] = {}
+            snap: dict[str, object] = {}
             for frame in ctx_stack:
                 snap.update(frame)
             traced_ctx, static_ctx = _ctx_partition(snap)
@@ -553,10 +559,10 @@ def jit(
     wrapped._spx_id_cache = _id_cache
     wrapped._spx_ctx_compile_cache = _ctx_compile_cache
     wrapped.lower = lower
-    return wrapped
+    return cast(F, wrapped)
 
 
-def _is_mpmd_mesh(mesh: Any) -> bool:
+def _is_mpmd_mesh(mesh: object) -> bool:
     """Return whether ``mesh`` is an MPMD mesh requiring the ``sxjit`` runtime.
 
     Treats either an explicit ``is_mpmd`` boolean attribute or the
@@ -587,10 +593,10 @@ def _raise_if_unsupported_mpmd_jit_options(
     mutable: SelectorSugar,
     donate_argnames: str | Iterable[str] | None,
     keep_unused: bool,
-    device: Any,
+    device: object,
     backend: str | None,
     inline: bool,
-    compiler_options: dict[str, Any] | None,
+    compiler_options: dict[str, object] | None,
 ) -> None:
     """Raise if the user passed a ``jax.jit`` option that ``sxjit`` cannot honor.
 

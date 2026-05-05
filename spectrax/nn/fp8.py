@@ -61,7 +61,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import partial
-from typing import Any, ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -533,7 +533,7 @@ class Fp8DotGeneral(Module):
         lhs: ArrayLike,
         rhs: ArrayLike,
         dimension_numbers: tuple,
-        precision: Any = None,
+        precision: lax.PrecisionLike = None,
         compute_dtype: DType | None = None,
     ) -> Array:
         """Fake-quantize both operands and run :func:`jax.lax.dot_general`.
@@ -580,7 +580,7 @@ class Fp8DotGeneral(Module):
 
         y = lax.dot_general(q_lhs, q_rhs, dimension_numbers, precision=precision)
         y = out_qdq(comp, e5m2, y, self.output_grad_scale.value, self.output_grad_amax_history.value)
-        return y
+        return cast(Array, y)
 
 
 def _ones_scale(shape: tuple[int, ...], dtype: DType) -> Array:
@@ -619,8 +619,8 @@ class Fp8Linear(Module):
         amax_history_length: Forwarded to :class:`Fp8DotGeneral`.
     """
 
-    weight: Any
-    bias: Any
+    weight: Parameter
+    bias: Parameter
     qdot: Fp8DotGeneral
 
     def __init__(
@@ -713,7 +713,7 @@ class Fp8Linear(Module):
             if b.dtype != y.dtype and jnp.issubdtype(b.dtype, jnp.floating) and jnp.issubdtype(y.dtype, jnp.floating):
                 b = b.astype(y.dtype)
             y = y + b
-        return y
+        return cast(Array, y)
 
 
 class Fp8Einsum(Module):
@@ -739,8 +739,8 @@ class Fp8Einsum(Module):
         amax_history_length: Forwarded to :class:`Fp8DotGeneral`.
     """
 
-    weight: Any
-    bias: Any
+    weight: Parameter
+    bias: Parameter
     qdot: Fp8DotGeneral
 
     def __init__(
@@ -849,4 +849,4 @@ class Fp8Einsum(Module):
         )
         if self.use_bias:
             y = y + self.bias.value
-        return y
+        return cast(Array, y)

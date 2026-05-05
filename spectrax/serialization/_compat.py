@@ -6,19 +6,18 @@
 
 from __future__ import annotations
 
-import typing as tp
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
-PyTree = tp.Any
+PyTree = object
 
 
 def flatten_dict(
     xs: dict | Mapping,
     keep_empty_nodes: bool = False,
-    is_leaf: tp.Callable[[tuple, tp.Any], bool] | None = None,
+    is_leaf: Callable[[tuple[object, ...], object], bool] | None = None,
     sep: str | None = None,
     fumap: bool = False,
-) -> dict[tuple | str, tp.Any]:
+) -> dict[tuple[object, ...] | str, object]:
     """Flatten a nested dictionary into a single-level mapping.
 
     Recursively walks *xs* and produces a flat dictionary whose keys are
@@ -50,17 +49,17 @@ def flatten_dict(
         if not isinstance(xs, Mapping):
             raise TypeError(f"expected dict or Mapping; got {type(xs)}")
 
-    def _key(path: tuple) -> tuple | str:
+    def _key(path: tuple[object, ...]) -> tuple[object, ...] | str:
         """Format *path* as a tuple or a ``sep``-joined string."""
         if sep is None:
             return path
         return sep.join(str(p) for p in path)
 
-    def _flatten(obj: tp.Any, prefix: tuple) -> dict:
+    def _flatten(obj: object, prefix: tuple[object, ...]) -> dict[tuple[object, ...] | str, object]:
         """Recursively flatten *obj*, emitting ``{_key(prefix): obj}`` at leaves."""
         if not isinstance(obj, dict) or (is_leaf and is_leaf(prefix, obj)):
             return {_key(prefix): obj}
-        result: dict = {}
+        result: dict[tuple[object, ...] | str, object] = {}
         is_empty = True
         for key, value in obj.items():
             is_empty = False

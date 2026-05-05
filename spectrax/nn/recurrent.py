@@ -28,7 +28,7 @@ training stable).
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any, ClassVar
+from typing import ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,8 @@ from ..core.variable import Parameter
 from ..functional.conv import conv as F_conv
 from ..init import kaiming_uniform, orthogonal, zeros
 from ..rng.rngs import Rngs, resolve_rngs
+
+Carry = object
 
 __all__ = [
     "RNN",
@@ -74,7 +76,7 @@ class RNNCellBase(Module):
         batch_shape: Sequence[int],
         *,
         dtype: DType | None = None,
-    ) -> Any:
+    ) -> Carry:
         """Return the zero-valued carry for ``batch_shape``.
 
         Args:
@@ -95,7 +97,7 @@ class RNNCellBase(Module):
         """
         raise NotImplementedError
 
-    def forward(self, carry: Any, x: ArrayLike) -> tuple[Any, Array]:
+    def forward(self, carry: Carry, x: ArrayLike) -> tuple[Carry, Array]:
         """Advance the recurrent state by one step.
 
         Args:
@@ -765,10 +767,10 @@ class RNN(Module):
         self,
         xs: ArrayLike,
         *,
-        initial_carry: Any = None,
+        initial_carry: Carry | None = None,
         reverse: bool | None = None,
         return_carry: bool | None = None,
-    ) -> Array | tuple[Array, Any]:
+    ) -> Array | tuple[Array, Carry]:
         """Scan the cell across every step of the time axis.
 
         Steps performed:
@@ -819,7 +821,7 @@ class RNN(Module):
 
         cell = self.cell
 
-        def step(c: Any, x: Array) -> tuple[Any, Array]:
+        def step(c: Carry, x: Array) -> tuple[Carry, Array]:
             """Single :func:`jax.lax.scan` step.
 
             Delegates to the captured cell's :meth:`forward` so the
@@ -898,7 +900,7 @@ class Bidirectional(Module):
         self,
         xs: ArrayLike,
         *,
-        initial_carry: tuple[Any, Any] | None = None,
+        initial_carry: tuple[Carry, Carry] | None = None,
     ) -> Array:
         """Run both directions and merge the outputs.
 
@@ -921,7 +923,7 @@ class Bidirectional(Module):
         if self.merge_mode == "concat":
             return jnp.concatenate([ys_f, ys_b], axis=-1)
         if self.merge_mode == "sum":
-            return ys_f + ys_b
+            return cast(Array, ys_f + ys_b)
         if self.merge_mode == "mul":
-            return ys_f * ys_b
-        return 0.5 * (ys_f + ys_b)
+            return cast(Array, ys_f * ys_b)
+        return cast(Array, 0.5 * (ys_f + ys_b))

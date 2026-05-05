@@ -47,7 +47,7 @@ lower-level MPMD API.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal
+from typing import Literal
 
 import jax
 
@@ -55,7 +55,7 @@ from .core._weakcache import weak_invalidate
 from .core.graph import bind, export
 from .core.module import Module
 from .core.paths import str_to_path
-from .core.state import _nested_set
+from .core.state import State, _nested_set
 from .runtime.mpmd.runtime import sxcall
 from .runtime.schedules import GPipe as _DefaultGPipe
 from .sharding.mesh import SpxMesh
@@ -65,10 +65,10 @@ __all__ = ["run"]
 
 _SPMD_FWD_CACHE: dict[int, Callable] = {}
 _SPMD_TRAIN_CACHE: dict[tuple, Callable] = {}
-_SPMD_STATE_CACHE: dict[tuple, Any] = {}
+_SPMD_STATE_CACHE: dict[tuple[object, ...], State] = {}
 
 
-def _as_call(payload: Any) -> tuple[tuple, dict]:
+def _as_call(payload: object) -> tuple[tuple[object, ...], dict[str, object]]:
     """Normalize an ``inputs`` / ``targets`` payload into ``(args, kwargs)``.
 
     Implements the three accepted call shapes documented on
@@ -95,7 +95,7 @@ def _as_call(payload: Any) -> tuple[tuple, dict]:
     return (payload,), {}
 
 
-def _place_state(state, model: Module, mesh):
+def _place_state(state: State, model: Module, mesh: object) -> State:
     """Place every leaf of a :class:`State` onto its target device sharding.
 
     Asks the model for a ``{collection: {path: NamedSharding}}`` map
@@ -116,7 +116,7 @@ def _place_state(state, model: Module, mesh):
         with each leaf placed onto its requested sharding.
     """
     shards = get_named_sharding(model, mesh)
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, dict[str, object]] = {}
     for col, path, leaf in state.items():
         sh = shards.get(col, {}).get(path)
         placed = jax.device_put(leaf, sh) if sh is not None else leaf
@@ -124,7 +124,7 @@ def _place_state(state, model: Module, mesh):
     return type(state)._from_raw(out, writers=state._writers)
 
 
-def _mpmd_dummy_loss(y, *_a):
+def _mpmd_dummy_loss(y: object, *_a: object) -> jax.Array:
     """Stable dummy loss used when MPMD ``mode='forward'`` needs a loss arg.
 
     :func:`spectrax.runtime.sxcall` always takes a ``loss_fn`` parameter;
@@ -145,14 +145,14 @@ def _mpmd_dummy_loss(y, *_a):
 
 def _run_spmd(
     model: Module,
-    args: tuple,
-    kwargs: dict,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
     *,
     mesh: SpxMesh,
     mode: str,
-    loss_args: tuple,
-    loss_kwargs: dict,
-    loss_fn: Callable | None,
+    loss_args: tuple[object, ...],
+    loss_kwargs: dict[str, object],
+    loss_fn: Callable[..., object] | None,
 ):
     """Run ``model`` under pure SPMD (``pjit``) — forward-only or train.
 
@@ -258,16 +258,16 @@ def _run_spmd(
 
 def _run_mpmd(
     model: Module,
-    args: tuple,
-    kwargs: dict,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
     *,
     mesh: SpxMesh,
     mode: str,
-    loss_args: tuple,
-    loss_kwargs: dict,
-    loss_fn: Callable | None,
+    loss_args: tuple[object, ...],
+    loss_kwargs: dict[str, object],
+    loss_fn: Callable[..., object] | None,
     microbatches: int,
-    schedule: Any = None,
+    schedule: object = None,
     fuse_1f1b: bool | None = None,
     fuse_zb: bool | None = None,
     has_aux: bool = False,
@@ -330,7 +330,7 @@ def _run_mpmd(
         target_vals = tuple(loss_kwargs.values())
         original_loss = loss_fn
 
-        def _wrapped_loss(out, *vals):
+        def _wrapped_loss(out: object, *vals: object) -> object:
             """Re-key positional pipeline targets back to keyword args for ``loss_fn``.
 
             Pairs each value in ``vals`` with the corresponding key in
@@ -374,17 +374,17 @@ def _run_mpmd(
 def run(
     model: Module,
     *,
-    inputs: Any,
-    targets: Any = None,
+    inputs: object,
+    targets: object = None,
     mesh: SpxMesh,
     mode: Literal["train", "forward"] = "forward",
-    loss_fn: Callable | None = None,
+    loss_fn: Callable[..., object] | None = None,
     microbatches: int = 1,
-    schedule: Any = None,
+    schedule: object = None,
     fuse_1f1b: bool | None = None,
     fuse_zb: bool | None = None,
     has_aux: bool = False,
-) -> Any:
+) -> object:
     """Run a model under SPMD or MPMD — the mesh decides which.
 
     Two modes, because that's all there is:

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import TypeAlias
 
 from ._typing import Path
 from .errors import CyclicGraphError, GraphStructureError
@@ -52,7 +52,7 @@ __all__ = [
 ]
 
 
-def _freeze_static(x: Any) -> Any:
+def _freeze_static(x: object) -> object:
     """Recursively convert a static value into a hashable tuple form.
 
     Dicts become sorted-tuple-of-pairs, lists become tuples,
@@ -87,10 +87,10 @@ class ModuleNode:
     """
 
     class_name: str
-    static_fields: tuple[tuple[str, Any], ...]
+    static_fields: tuple[tuple[str], ...]
     children: tuple[tuple[str | int, int], ...]
     container_kind: str
-    opaque: tuple[tuple[str, Any], ...] = ()
+    opaque: tuple[tuple[str], ...] = ()
 
     def __hash__(self) -> int:
         """Structural hash across all fields."""
@@ -110,7 +110,7 @@ class VarNode:
 
     class_name: str
     collection: str
-    metadata: tuple[tuple[str, Any], ...]
+    metadata: tuple[tuple[str], ...]
 
     def __hash__(self) -> int:
         """Structural hash across all fields."""
@@ -214,13 +214,13 @@ def _container_kind(m: Module) -> str:
     return getattr(type(m), "_spx_container_kind", "module")
 
 
-def _metadata_tuple(v: Variable) -> tuple[tuple[str, Any], ...]:
+def _metadata_tuple(v: Variable) -> tuple[tuple[str], ...]:
     """Project a :class:`Variable`'s metadata into a hashable tuple.
 
     Non-hashable metadata values are dropped silently so that the
     resulting :class:`VarNode` remains hashable.
     """
-    out: list[tuple[str, Any]] = []
+    out: list[tuple[str]] = []
     for k in sorted(v.metadata):
         val = v.metadata[k]
         try:
@@ -231,7 +231,7 @@ def _metadata_tuple(v: Variable) -> tuple[tuple[str, Any], ...]:
     return tuple(out)
 
 
-def _leaf_sort_key(entry: tuple[str, str, Variable]) -> tuple[tuple[bool, Any], tuple[tuple[bool, Any], ...]]:
+def _leaf_sort_key(entry: tuple[str, str, Variable]) -> tuple[tuple[bool, int | str], tuple[tuple[bool, int | str], ...]]:
     """Return the same deterministic order used by :class:`State` flattening."""
     kind, path, _var = entry
     return _sort_key(kind), tuple(_sort_key(part) for part in str_to_path(path))
@@ -241,7 +241,7 @@ def _build_export_cache(
     epoch: int,
     gdef: GraphDef,
     var_entries_tuple: tuple[tuple[str, str, Variable], ...],
-) -> tuple[Any, ...]:
+) -> tuple[object, ...]:
     """Build the cached export metadata shared by :func:`export` and :func:`bind`."""
     sorted_var_entries = tuple(sorted(var_entries_tuple, key=_leaf_sort_key))
     path_sorted_var_entries = tuple(sorted(var_entries_tuple, key=lambda entry: entry[1]))
@@ -310,19 +310,19 @@ def export(module: Module) -> tuple[GraphDef, State]:
         value back without re-walking the tree.
         """
 
-        def writer(new_value: Any, _var: Variable = var) -> None:
+        def writer(new_value: object, _var: Variable = var) -> None:
             """Write ``new_value`` into the captured ``Variable``."""
             _var.value = new_value
 
         return writer
 
-    def _nested_from_entries(entries: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
+    def _nested_from_entries(entries: tuple[tuple[str], ...]) -> dict[str, object]:
         """Build a nested dict from ``(dotted_path, value)`` pairs.
 
         *value* may be a raw array or a :class:`~spectrax.Variable`; in the
         latter case ``._raw_get()`` is called to extract the stored array.
         """
-        out: dict[str, Any] = {}
+        out: dict[str, object] = {}
         for path_str, value in entries:
             leaf = value._raw_get() if hasattr(value, "_raw_get") else value
             _nested_set(out, str_to_path(path_str), leaf)
@@ -333,7 +333,7 @@ def export(module: Module) -> tuple[GraphDef, State]:
     if cache is not None and cache[0] == epoch:
         gdef: GraphDef = cache[1]
         grouped: dict[str, tuple[tuple[str, Variable], ...]] = cache[4]
-        state_data: dict[str, dict[str, Any]] = {c: _nested_from_entries(entries) for c, entries in grouped.items()}
+        state_data: dict[str, dict[str, object]] = {c: _nested_from_entries(entries) for c, entries in grouped.items()}
         writers = {
             (collection, path): _make_writer(var) for collection, entries in grouped.items() for path, var in entries
         }
@@ -683,7 +683,7 @@ def live_variables(module: Module) -> list[tuple[str, Variable]]:
 
 def iter_variables(
     module: Module,
-    select: Any = None,
+    select: object = None,
 ) -> Iterator[tuple[str, Variable]]:
     """Walk the graph yielding ``(canonical_path, variable)`` pairs.
 
@@ -699,7 +699,7 @@ def iter_variables(
 
             * ``None`` (default) — every variable is yielded; equivalent
               to iterating over :func:`live_variables`.
-            * Any :data:`~spectrax.core.selector.SelectorSugar` — a
+            * object :data:`~spectrax.core.selector.SelectorSugar` — a
               collection-name string (e.g. ``"parameters"``), a
               :class:`~spectrax.Variable` subclass (e.g.
               :class:`~spectrax.nn.LoraParameter`), a
@@ -728,7 +728,7 @@ def iter_variables(
 
 def find(
     module: Module,
-    select: Any = None,
+    select: object = None,
 ) -> tuple[str, Module | Variable] | None:
     """Return the first ``(path, target)`` matching ``select``, or ``None``.
 
@@ -770,7 +770,7 @@ def find(
     return None
 
 
-def _check_static_field_value(v: Any) -> None:
+def _check_static_field_value(v: object) -> None:
     """Raise :class:`GraphStructureError` if ``v`` is not a permissible
     static field value (static scalar or :class:`Opaque`).
     """
@@ -783,7 +783,7 @@ def iter_modules(
     *,
     with_path: bool = True,
     skip_root: bool = False,
-    select: Any = None,
+    select: object = None,
 ) -> Iterator[tuple[str, Module]] | Iterator[Module]:
     """Walk the tree yielding every unique :class:`Module` once.
 
@@ -862,7 +862,7 @@ def iter_modules(
     return iter(m for _, m in out)
 
 
-def pop(module: Module, selector: Any) -> State:
+def pop(module: Module, selector: object) -> State:
     """Remove-and-return variables matching ``selector`` from ``module``.
 
     Every matched variable is detached from its owning module (its
@@ -885,7 +885,7 @@ def pop(module: Module, selector: Any) -> State:
         keyed by the variable's collection and canonical path.
     """
     sel = as_selector(selector)
-    collected: dict[str, dict[str, Any]] = {}
+    collected: dict[str, dict[str, object]] = {}
     to_delete: list[tuple[Module, str | int, bool]] = []
 
     def find_parents(m: Module, var: Variable) -> tuple[Module, str | int, bool] | None:

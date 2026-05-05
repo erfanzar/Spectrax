@@ -33,7 +33,7 @@ import threading
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, is_dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, ClassVar, Self
 
 import jax
 import jax.numpy as jnp
@@ -101,14 +101,14 @@ def _graph_epoch() -> int:
     return _GRAPH_EPOCH
 
 
-def _public_value(value: Any) -> Any:
+def _public_value(value: object) -> object:
     """Return the value users should see for wrapper-backed attributes."""
     if isinstance(value, Opaque | Static):
         return value.value
     return value
 
 
-def _opaque_hash_payload(value: Any) -> Any:
+def _opaque_hash_payload(value: object) -> object:
     """Build a best-effort stable payload for an opaque Python object."""
     if isinstance(value, Opaque):
         return {"opaque": _opaque_hash_payload(value.value)}
@@ -134,7 +134,7 @@ def _opaque_hash_payload(value: Any) -> Any:
     }
 
 
-def _normalize_hash_payload(value: Any, *, _seen: set[int] | None = None) -> Any:
+def _normalize_hash_payload(value: object, *, _seen: set[int] | None = None) -> object:
     """Normalize arbitrary metadata into a deterministic JSON-like tree.
 
     Arrays are represented by shape and dtype only, never by values.
@@ -213,7 +213,7 @@ def _normalize_hash_payload(value: Any, *, _seen: set[int] | None = None) -> Any
     return value
 
 
-def _digest_payload(payload: Any) -> str:
+def _digest_payload(payload: object) -> str:
     """Return a stable hex digest for a normalized payload."""
     normalized = _normalize_hash_payload(payload)
     encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
@@ -245,13 +245,13 @@ class Opaque:
 
     __slots__ = ("value",)
 
-    value: Any
+    value: object
 
-    def __init__(self, value: Any) -> None:
+    def __init__(self, value: object) -> None:
         """Wrap ``value`` as an opaque attribute.
 
         Args:
-            value: Any Python object. No coercion or copy is performed.
+            value: object Python object. No coercion or copy is performed.
         """
         self.value = value
 
@@ -272,10 +272,10 @@ class _HookHandle:
 
     __slots__ = ("_fn", "_list")
 
-    _list: list[Any]
-    _fn: Any
+    _list: list[object]
+    _fn: object
 
-    def __init__(self, lst: list[Any], fn: Any) -> None:
+    def __init__(self, lst: list[object], fn: object) -> None:
         """Record the destination list and the registered callable.
 
         Args:
@@ -303,7 +303,7 @@ class _HookHandle:
 _HOOK_WARNING_ONCE: set[int] = set()
 
 
-def _is_context_manager(value: Any) -> bool:
+def _is_context_manager(value: object) -> bool:
     """Return ``True`` when ``value`` implements the context-manager protocol.
 
     Duck-typed: any object exposing both ``__enter__`` and ``__exit__``
@@ -312,7 +312,7 @@ def _is_context_manager(value: Any) -> bool:
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
 
-def _context_factory(value: Any) -> Any:
+def _context_factory(value: object) -> object:
     """Normalize a registered context or zero-arg context factory.
 
     Reusable context-manager objects (such as a single
@@ -407,14 +407,14 @@ class Module:
     """Private slot names reserved by the :class:`Module` machinery."""
 
     _spx_attr_order: list[str]
-    _spx_static: dict[str, Any]
+    _spx_static: dict[str, object]
     _spx_training: bool
     _spx_fwd_hooks: list[ForwardHook]
     _spx_pre_hooks: list[ForwardPreHook]
-    _spx_contexts: list[Any]
+    _spx_contexts: list[object]
     _spx_policy: Policy | None
     _spx_opaque: dict[str, Opaque]
-    _spx_scan_plan_cache: Any
+    _spx_scan_plan_cache: object
     _spx_scan_safe_static_fields: ClassVar[frozenset[str] | tuple[str, ...]] = frozenset()
     _spx_scan_safe_opaque_fields: ClassVar[frozenset[str] | tuple[str, ...]] = frozenset()
     """Private scan metadata.
@@ -424,7 +424,7 @@ class Module:
     treated as behavior-changing and form separate scan graph families.
     """
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+    def __new__(cls, *args: object, **kwargs: object) -> Self:
         """Allocate the instance and pre-initialise private slots.
 
         Slots are created here (rather than in ``__init__``) so that
@@ -451,7 +451,7 @@ class Module:
         ``super().__init__()``.
         """
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
+    def __init_subclass__(cls, **kwargs: object) -> None:
         """Register every :class:`Module` subclass as a JAX pytree.
 
         JAX's :func:`jax.tree_util.register_pytree_with_keys` takes a
@@ -466,7 +466,7 @@ class Module:
         super().__init_subclass__(**kwargs)
         _register_module_pytree(cls)
 
-    def __setattr__(self, name: str, value: Any) -> None:
+    def __setattr__(self, name: str, value: object) -> None:
         """Enforce module attribute discipline.
 
         Names starting with ``_spx_`` bypass all checks (implementation
@@ -566,7 +566,7 @@ class Module:
             if isinstance(value, Module | Variable):
                 yield name, value
 
-    def _spx_static_fields(self) -> dict[str, Any]:
+    def _spx_static_fields(self) -> dict[str, object]:
         """Return a shallow copy of :attr:`_spx_static` for graph-def export."""
         return dict(self._spx_static)
 
@@ -663,7 +663,7 @@ class Module:
         """
         return self.train(False)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         """Invoke the module's forward pipeline.
 
         The full ordering is:
@@ -711,7 +711,7 @@ class Module:
                 for make_context in list(self._spx_contexts):
                     stack.enter_context(make_context())
                 stack.enter_context(push_policy(policy))
-                out: Any = self.forward(*args, **kwargs)
+                out: object = self.forward(*args, **kwargs)
         else:
             with push_policy(policy):
                 out = self.forward(*args, **kwargs)
@@ -728,7 +728,7 @@ class Module:
             out = policy.cast_output(out)
         return out
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
+    def forward(self, *args: object, **kwargs: object) -> object:
         """Compute and return the module output.
 
         Subclasses override this method. The default implementation
@@ -782,7 +782,7 @@ class Module:
         self._spx_fwd_hooks.append(fn)
         return _HookHandle(self._spx_fwd_hooks, fn)
 
-    def register_context(self, *contexts: Any, **scope_values: Any) -> _HookHandle:
+    def register_context(self, *contexts: object, **scope_values: object) -> _HookHandle:
         """Register contexts entered around every ``forward`` invocation.
 
         Positional arguments may be reusable context-manager objects or
@@ -837,7 +837,7 @@ class Module:
         self,
         collection: str,
         name: str,
-        value: Any,
+        value: object,
         *,
         reduce: str = "last",
     ) -> None:
@@ -916,8 +916,8 @@ class Module:
     def init(
         self,
         rngs: Rngs | int | None = None,
-        *example_args: Any,
-        **example_kwargs: Any,
+        *example_args: object,
+        **example_kwargs: object,
     ) -> Module:
         """Attach an :class:`~spectrax.Rngs` and optionally run a dry forward.
 
@@ -961,7 +961,7 @@ class Module:
             self.sequential_init(*example_args, **example_kwargs)
         return self
 
-    def sequential_init(self, *example_args: Any, **example_kwargs: Any) -> Module:
+    def sequential_init(self, *example_args: object, **example_kwargs: object) -> Module:
         """Materialize lazy descendants explicitly using example inputs.
 
         Runs ``self(*example_args, **example_kwargs)`` once with the
@@ -1050,7 +1050,7 @@ class Module:
             if _materialization_allowed() or not _explicit_lazy_mode():
                 var.materialize()
 
-    def freeze(self, selector: Any = "parameters") -> Module:
+    def freeze(self, selector: object = "parameters") -> Module:
         """Move every matched :class:`~spectrax.Variable`'s kind to ``"buffers"``.
 
         Each matched variable's previous :attr:`~spectrax.Variable.kind`
@@ -1083,7 +1083,7 @@ class Module:
             _bump_graph_epoch()
         return self
 
-    def unfreeze(self, selector: Any = "buffers") -> Module:
+    def unfreeze(self, selector: object = "buffers") -> Module:
         """Reverse :meth:`freeze` — move matched variables back to their pre-freeze kind.
 
         For every matched variable that carries a ``"frozen_from"``
@@ -1115,7 +1115,7 @@ class Module:
             _bump_graph_epoch()
         return self
 
-    def perturb(self, name: str, x: Any) -> Any:
+    def perturb(self, name: str, x: object) -> object:
         """Insert an identity perturbation variable and add it to ``x``.
 
         On the first call a zero-valued :class:`~spectrax.Variable` is
@@ -1148,8 +1148,8 @@ class Module:
     def set_attributes(
         self,
         *,
-        filter_fn: Any = None,
-        **attrs: Any,
+        filter_fn: object = None,
+        **attrs: object,
     ) -> Module:
         """Bulk-set attributes on ``self`` and every descendant module.
 
@@ -1250,13 +1250,13 @@ class _ModuleAux:
     the same model instance across steps.
     """
 
-    gdef: Any
+    gdef: object
     leaf_spec: tuple[tuple[str, str], ...]
     training: bool
     fwd_hooks: list
     pre_hooks: list
     contexts: list
-    policy: Any
+    policy: object
     opaque: dict
 
     def __hash__(self) -> int:
@@ -1300,7 +1300,7 @@ registration; the set guards against that.
 """
 
 
-def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[Any, Any], ...], _ModuleAux]:
+def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[object], ...], _ModuleAux]:
     """Pytree flatten-with-keys for any :class:`Module` instance.
 
     Reads the hot :func:`spectrax.export` cache and returns the raw
@@ -1336,7 +1336,7 @@ def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[Any, Any], ...], _
     return tuple(key_leaves), aux
 
 
-def _module_flatten(m: Module) -> tuple[list[Any], _ModuleAux]:
+def _module_flatten(m: Module) -> tuple[list[object], _ModuleAux]:
     """Pytree flatten (no keys) — complement of :func:`_module_flatten_with_keys`.
 
     Needed by :func:`jax.tree_util.register_pytree_with_keys` so
@@ -1367,7 +1367,7 @@ def _module_flatten(m: Module) -> tuple[list[Any], _ModuleAux]:
     return list(leaves), aux
 
 
-def _module_unflatten(aux: _ModuleAux, leaves: Any) -> Module:
+def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
     """Rebuild a :class:`Module` from ``(aux, leaves)``.
 
     Reassembles the :class:`~spectrax.State` directly from the ordered
@@ -1381,7 +1381,7 @@ def _module_unflatten(aux: _ModuleAux, leaves: Any) -> Module:
     from .paths import str_to_path
     from .state import State, _nested_set
 
-    state_data: dict[str, dict[str, Any]] = {}
+    state_data: dict[str, dict[str, object]] = {}
     if len(aux.leaf_spec) != len(leaves):
         raise ValueError(
             "Module pytree leaf count mismatch during unflatten: "

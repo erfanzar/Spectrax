@@ -29,7 +29,7 @@ import os
 import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 import jax
 import numpy as np
@@ -176,7 +176,7 @@ class SpxMesh:
         Mirrors :meth:`__enter__`: the SpectraX-level ``_CURRENT_MESH``
         stack is unwound to ``self`` (handling well-nested and
         out-of-order exits) before the JAX mesh's ``__exit__`` runs.
-        Any exception from the JAX side propagates unchanged.
+        object exception from the JAX side propagates unchanged.
         """
         stack = list(getattr(_CURRENT_MESH, "stack", ()))
         for idx in range(len(stack) - 1, -1, -1):
@@ -230,7 +230,7 @@ _AXIS_TYPE_BY_NAME: dict[str, AxisType] = {
 }
 
 
-_SPX_MESH_CACHE: dict[tuple[Any, ...], SpxMesh] = {}
+_SPX_MESH_CACHE: dict[tuple[object, ...], SpxMesh] = {}
 _SPX_TOPOLOGY_MESH_CACHE: dict[tuple[int, str], Mesh] = {}
 
 
@@ -247,7 +247,7 @@ def use_mesh(mesh: SpxMesh | Mesh) -> Iterator[SpxMesh]:
         yield spx_mesh
 
 
-def _device_sort_key(device: Any) -> tuple[Any, ...]:
+def _device_sort_key(device: object) -> tuple[object, ...]:
     """Build a stable sort key for a JAX device.
 
     The key is ``(process_index, slice_index, *coords, id)``, ordered
@@ -327,7 +327,7 @@ def _topology_mpmd_order(jax_mesh: Mesh, mpmd_axis: str) -> tuple[int, ...] | No
     if n <= 2:
         return None
     centers: list[tuple[float, ...]] = []
-    tie_keys: list[tuple[Any, ...]] = []
+    tie_keys: list[tuple[object, ...]] = []
     for idx in range(n):
         sub = np.take(jax_mesh.devices, indices=[idx], axis=axis)
         center = _stage_center(sub)
@@ -377,7 +377,7 @@ def _topology_order_mpmd_axis(jax_mesh: Mesh, mpmd_axis: str | None) -> Mesh:
     return reordered
 
 
-def _get_num_slices(devices: Sequence[Any]) -> int:
+def _get_num_slices(devices: Sequence[object]) -> int:
     """Count the distinct TPU pod slices across ``devices``.
 
     Inspects each device for a ``slice_index`` attribute (exposed on
@@ -855,7 +855,7 @@ def create_cpu_mesh(
 
 
 @contextlib.contextmanager
-def force_cpu() -> Iterator[Any]:
+def force_cpu() -> Iterator[object]:
     """Temporarily pin JAX's default device to CPU.
 
     Unrelated state (meshes, already-placed arrays) is not affected.

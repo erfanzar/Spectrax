@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TypeVar, cast
 
 import jax
 
@@ -43,13 +43,13 @@ from .split_merge import (
 
 __all__ = ["vmap"]
 
-F = TypeVar("F", bound=Callable[..., Any])
+F = TypeVar("F", bound=Callable[..., object])
 
-AxisName = Any
+AxisName = object
 """Placeholder for JAX axis-name sentinels (hashable values)."""
 
 
-def _specialized_in_axes(in_axes: Any, nargs: int, locator: int) -> tuple[Any, ...]:
+def _specialized_in_axes(in_axes: object, nargs: int, locator: int) -> tuple[object, ...]:
     """Strip the module position from a user-provided positional ``in_axes`` spec.
 
     Used on the single-positional-Module fast path: the underlying pure
@@ -80,8 +80,8 @@ def vmap(
     fn: F | None = None,
     *,
     mutable: SelectorSugar = (),
-    in_axes: Any = 0,
-    out_axes: Any = 0,
+    in_axes: object = 0,
+    out_axes: object = 0,
     axis_name: AxisName | None = None,
     axis_size: int | None = None,
     spmd_axis_name: AxisName | tuple[AxisName, ...] | None = None,
@@ -136,22 +136,25 @@ def vmap(
         A wrapped function with the same call signature as ``fn``.
     """
     if fn is None:
-        return lambda f: vmap(
-            f,
-            mutable=mutable,
-            in_axes=in_axes,
-            out_axes=out_axes,
-            axis_name=axis_name,
-            axis_size=axis_size,
-            spmd_axis_name=spmd_axis_name,
-            sum_match=sum_match,
+        return cast(
+            F,
+            lambda f: vmap(
+                f,
+                mutable=mutable,
+                in_axes=in_axes,
+                out_axes=out_axes,
+                axis_name=axis_name,
+                axis_size=axis_size,
+                spmd_axis_name=spmd_axis_name,
+                sum_match=sum_match,
+            ),
         )
 
     mutable_sel = resolve_mutable(mutable)
-    empty_kwargs: dict[str, Any] = {}
+    empty_kwargs: dict[str, object] = {}
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Locate modules, build a pure callable, and dispatch through :func:`jax.vmap`.
 
         Selects the single-positional-Module fast path when there are no
@@ -217,4 +220,4 @@ def vmap(
         apply_mutations(refs, list(new_states), mutable_sel)
         return out
 
-    return wrapped
+    return cast(F, wrapped)

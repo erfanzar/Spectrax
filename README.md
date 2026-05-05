@@ -19,9 +19,10 @@
 SpectraX is a JAX-native neural-network library built around **true MPMD
 pipeline parallelism**. Each physical rank compiles and runs its own XLA
 program — no shared `shard_map` HLO, no SPMD-same-shape constraint.
-Heterogeneous stages (embed → blocks → head), nine pipeline schedules
-(GPipe, 1F1B, ZeroBubble, Interleaved, DualPipeV, …), and a unified
-`spx.run()`/`spx.jit()` entry point that dispatches to SPMD or MPMD from the same
+Heterogeneous stages (embed → blocks → head), multimodal stage regions
+(vision V0→V3, text T0→T3, …), nine pipeline schedules (GPipe, 1F1B,
+ZeroBubble, Interleaved, DualPipeV, …), and a unified `spx.run()` /
+`spx.jit()` entry point that dispatches to SPMD or MPMD from the same
 training script.
 
 The module API is eager and debuggable — subclass `Module`, override
@@ -34,6 +35,18 @@ The module API is eager and debuggable — subclass `Module`, override
 > and pipeline plumbing. SpectraX is the JAX-only NN core; EasyDeL is
 > the model zoo + training/serving stack.
 
+**What is actually different?**
+
+* `sxjit` captures one function, splits its jaxpr at stage markers, and
+  emits **one executable per pipeline rank**.
+* `sxstage_region` gives each branch or tower its own local stage
+  sequence, so multimodal models can lay out vision and text pipelines
+  independently instead of pretending they are one long stack.
+* Forward, backward, and schedule cells all run through the same true
+  MPMD dispatcher — no hidden shard-map fallback when gradients start.
+* MPMD stage meshes drop the pipeline axis before inner SPMD layout,
+  keeping FSDP/TP/EP constraints stage-local and cache-friendly.
+
 ---
 
 ## Why SpectraX?
@@ -42,6 +55,7 @@ The module API is eager and debuggable — subclass `Module`, override
 | ------------------------ | --------------------------------------- | ------------------- | -------------------------- |
 | **True MPMD**            | built-in (`sxcall`, `sxjit`, `spx.run`) | hand-rolled         | SPMD-only                  |
 | **Heterogeneous stages** | native (different class/shape per rank) | fragile             | not supported              |
+| **Stage regions**        | branch-local markers for multimodal PP  | very manual         | not supported              |
 | **Pipeline schedules**   | 9 schedules (GPipe → DualPipeV)         | hand-rolled         | limited                    |
 | **Unified runtime**      | `spx.run(mesh)` → SPMD or MPMD          | separate code paths | separate APIs              |
 | **Eager modules**        | `model(x)` + pytree-native              | functional only     | functional or ref-tracking |
@@ -123,7 +137,57 @@ This is the same pattern EasyDeL uses to keep activation sharding
 stable across stage boundaries — see
 `easydel.infra.base_module._maybe_emit_stage_boundary`.
 
-### 3 · One-call MPMD training — `spx.run`
+### 3 · Stage regions — multimodal pipelines without fake stages
+
+`sxstage_iter` marks a linear sequence. `sxstage_region` marks a
+region-local sequence. That is the difference between accidentally
+building one giant serial pipeline and deliberately placing each tower:
+
+```text
+vision region:  logical stage 0: V0   logical stage 1: V1
+                logical stage 2: V2   logical stage 3: V3
+
+text region:    logical stage 0: T0   logical stage 1: T1
+                logical stage 2: T2   logical stage 3: T3
+```
+
+```python
+import spectrax as spx
+
+vision = spx.sxstage_region("vision", schedule=spx.GPipe(microbatches=4))
+text = spx.sxstage_region("text", schedule=spx.Std1F1B(microbatches=8))
+
+@spx.jit(mesh=mesh, schedule=spx.DualPipeV(microbatches=8))
+def multimodal_forward(model, image, tokens):
+    def vision_path(image):
+        v = model.vision.patch_embed(image)  # V0
+        v = spx.sxstage_iter(v, stage=0)
+        v = model.vision.stage1(v)           # V1
+        v = spx.sxstage_iter(v, stage=1)
+        v = model.vision.stage2(v)           # V2
+        v = spx.sxstage_iter(v, stage=2)
+        return model.vision.projector(v)     # V3
+
+    def text_path(tokens, vision_features):
+        h = model.text.embed(tokens)         # T0
+        h = spx.sxstage_iter(h, stage=0)
+        h = model.text.stage1(h)             # T1
+        h = spx.sxstage_iter(h, stage=1)
+        h = model.text.stage2(h)             # T2
+        h = spx.sxstage_iter(h, stage=2)
+        return model.text.fuse(h, vision_features)  # T3
+
+    v = vision(vision_path)(image)
+    h = text(text_path)(tokens, v)
+    return model.lm_head(h)
+```
+
+The vision markers are scoped to the vision region; the text markers
+are scoped to the text region. Each region can use its own schedule,
+boundary shardings, and logical stage count, while the outer MPMD
+`spx.jit` / `sxjit` still compiles true per-rank programs.
+
+### 4 · One-call MPMD training — `spx.run`
 
 ```python
 from spectrax.sharding import logical_axis_rules
@@ -145,7 +209,7 @@ with logical_axis_rules(FSDP_TP_RULES), mesh:
 Drop `mpmd_axis="pp"` and the same code path runs under pure SPMD —
 same model, same script, no rewrites.
 
-### 4 · Deferred initialization — infer shapes at runtime
+### 5 · Deferred initialization — infer shapes at runtime
 
 ```python
 model = nn.Sequential(
@@ -205,7 +269,7 @@ SpectraX threads them into `model.forward(...)` and `loss_fn(...)`.
 | `sxgrad` / `sxvalue_and_grad` | Schedule-faithful gradients of an `sxjit` function.                                               |
 | `treduce`                     | Schedule-driven microbatch reduction — binds a body + schedule into the traced jaxpr.             |
 | `sxstage_iter`                | Marker primitive for stage boundaries inside `sxjit`.                                             |
-| `sxstage_region`              | Region marker for multimodal/branched pipelines that need separate logical stage sequences.       |
+| `sxstage_region`              | Region marker for multimodal/branched pipelines that need independent logical stage sequences.    |
 | `spx.assign_stage`            | Context manager that stamps subsequently-created variables with a `(current, total)` stage tag.   |
 
 ### Supported schedules
@@ -504,12 +568,14 @@ single-Module forward passes to multi-device MPMD pipeline training:
 | [`04_surgery/`](examples/04_surgery/)                           | Selectors, LoRA injection, FP8, freezing, swapping                  |
 | [`05_shardings/`](examples/05_shardings/)                       | FSDP, TP, hybrid sharding, logical axis rules                       |
 | [`06_spmd_scheduled/`](examples/06_spmd_scheduled/)             | Pipeline runtime with all schedules                                 |
-| [`07_mpmd/`](examples/07_mpmd/)                                 | Real MPMD pipeline via `spx.run` — train, forward, decode, 3-D mesh |
+| [`07_mpmd/`](examples/07_mpmd/)                                 | Real MPMD pipeline via `spx.run` / `sxjit` — train, forward, decode, stage regions, stage-local meshes |
 
 ```bash
 python -m examples.01_basics.02_training_loop
+python -m examples.01_basics.06_multi_optimizer_lora
 python -m examples.02_implementation_guide.01_llama3
 python -m examples.07_mpmd.01_train_homogeneous
+python -m examples.07_mpmd.12_stage_region_multimodal
 ```
 
 Most examples run on CPU with small configs; sharding and pipeline
@@ -601,7 +667,7 @@ pytest tests/test_conformance.py
 
 ## Status
 
-`v0.0.3` — alpha. API may still move; pin the version if you depend
+`v0.1.0` — alpha. API may still move; pin the version if you depend
 on behavioural stability. See [CHANGELOG.md](CHANGELOG.md) for the
 release log.
 

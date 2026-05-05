@@ -15,7 +15,6 @@ import os
 import typing
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import jax
 import numpy as np
@@ -58,7 +57,7 @@ def join_key(prefix: str | None, k: str | None) -> str:
     return f"{prefix}.{k}" if prefix else k
 
 
-def _keyentry_to_str(path_elem: Any) -> str:
+def _keyentry_to_str(path_elem: object) -> str:
     """Convert a JAX tree path element to a string representation.
 
     Handles various JAX tree path element types including ``DictKey``,
@@ -95,7 +94,7 @@ def _keyentry_to_str(path_elem: Any) -> str:
     return s
 
 
-def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[Any], bool] | None = None):
+def leaf_key_paths(pytree: object, prefix: str | None = "", *, is_leaf: Callable[[object], bool] | None = None):
     """Create dotted key paths for each leaf in a pytree.
 
     Returns a pytree of the same structure where each leaf is replaced by its
@@ -114,7 +113,7 @@ def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[A
     """
     path_value_pairs, treedef = jtu.tree_flatten_with_path(pytree, is_leaf=is_leaf)
 
-    def path_to_str(path: Sequence[Any]) -> str:
+    def path_to_str(path: Sequence[object]) -> str:
         """Convert a JAX tree path to a dotted string.
 
         Args:
@@ -132,7 +131,7 @@ def leaf_key_paths(pytree: Any, prefix: str | None = "", *, is_leaf: Callable[[A
     return jtu.tree_unflatten(treedef, leaf_paths)
 
 
-def is_array_like(x: Any) -> bool:
+def is_array_like(x: object) -> bool:
     """Check if an object is array-like.
 
     Minimal check similar to ``equinox.is_array_like``, checking for ``shape``
@@ -208,7 +207,7 @@ def tree_serialize_leaves(
         """Simple pair of a filesystem path and a pytree leaf."""
 
         path: str
-        leaf: Any
+        leaf: object
 
     zipped = jax.tree.map(lambda x, y: Pair(x, y), paths, pytree, is_leaf=_is_none)
     paired_leaves = jax.tree.leaves(zipped)
@@ -384,7 +383,7 @@ def tree_deserialize_leaves(
     prefix: str | None = None,
     sharding_rules: Sequence[tuple[str, NamedSharding]] | None = None,
     partition_rules: Sequence[tuple[str, PartitionSpec]] | None = None,
-    shardings: PyTree | dict[Callable] | None = None,
+    shardings: PyTree | dict[Callable[..., object], object] | None = None,
     callback: Callable[[jax.Array, str], jax.Array] | None = None,
     chunk_size: int | None = None,
 ):

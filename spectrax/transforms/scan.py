@@ -28,7 +28,7 @@ Two functions are exported:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import cast
 
 import jax.lax as lax
 
@@ -43,14 +43,14 @@ __all__ = ["associative_scan", "scan"]
 
 
 def associative_scan(
-    fn: Callable[[Module, Any, Any], Any],
+    fn: Callable[[Module]],
     module: Module,
-    elems: Any,
+    elems: object,
     *,
     reverse: bool = False,
     axis: int = 0,
     mutable: SelectorSugar = (),
-) -> Any:
+) -> object:
     """Module-aware :func:`jax.lax.associative_scan`.
 
     ``fn`` has the shape ``(module, a, b) -> c`` and must be associative
@@ -86,7 +86,7 @@ def associative_scan(
 
     gdef, state = export(module)
 
-    def combine(a: Any, b: Any) -> Any:
+    def combine(a: object, b: object) -> object:
         """Rebind a fresh module for this pairwise combine and forbid every write.
 
         :func:`jax.lax.associative_scan` calls the combine ``O(n log n)``
@@ -127,14 +127,14 @@ def associative_scan(
 
 
 def scan(
-    fn: Callable[[Module, Any], Any],
+    fn: Callable[[Module]],
     init_module: Module,
-    xs: Any,
+    xs: object,
     *,
     length: int | None = None,
     mutable: SelectorSugar = (),
     unroll: int = 1,
-) -> Any:
+) -> object:
     """Scan ``fn`` over ``xs`` threading ``init_module`` as state.
 
     Args:
@@ -179,7 +179,7 @@ def scan(
     gdef, state = export(init_module)
     carry_state, invariant = mutable_sel.partition_state(init_module, state)
 
-    def step(carry: State, x: Any) -> tuple[State, Any]:
+    def step(carry: State, x: object) -> tuple[State, object]:
         """Single scan step: merge invariant onto carry, run ``fn``, re-partition.
 
         Overlays the per-iteration ``carry`` on top of the captured
@@ -206,7 +206,7 @@ def scan(
         )
         _check_invariant_equal(invariant, new_invariant)
         assert_state_unchanged(m, invariant, new_invariant)
-        return new_carry, y
+        return new_carry, cast(object, y)
 
     final_carry, ys = lax.scan(step, carry_state, xs, length=length, unroll=unroll)
     apply_mutations(

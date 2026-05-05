@@ -22,6 +22,8 @@ Decode caches live in :class:`~spectrax.Buffer` cells under the
 
 from __future__ import annotations
 
+from typing import cast
+
 import jax
 import jax.numpy as jnp
 
@@ -347,7 +349,7 @@ class MultiheadAttention(Module):
                 is_causal=is_causal,
             )
         out = self._merge_heads(out)
-        return self.out_proj(out)
+        return cast(Array, self.out_proj(out))
 
 
 class CausalSelfAttention(Module):
@@ -415,4 +417,4 @@ class CausalSelfAttention(Module):
             ``(..., seq, embed_dim)`` output tensor with the lower
             triangular causal mask applied.
         """
-        return self.attn(x, is_causal=True, rngs=rngs)
+        return cast(Array, self.attn(x, is_causal=True, rngs=rngs))

@@ -26,7 +26,7 @@ familiar ``opt.apply_eager(model, grads)`` shape.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Protocol, cast
 
 import jax
 
@@ -49,7 +49,19 @@ if TYPE_CHECKING:
 __all__ = ["MultiOptimizer", "Optimizer"]
 
 
-def _require_optax() -> Any:
+class _OptaxModule(Protocol):
+    """Subset of :mod:`optax` used by this wrapper."""
+
+    def apply_updates(self, params: State, updates: State) -> State:
+        """Apply optax updates to a :class:`State` tree."""
+        ...
+
+
+OptState = object
+StepValue = int | jax.Array
+
+
+def _require_optax() -> _OptaxModule:
     """Return the imported :mod:`optax` module, raising if it isn't installed.
 
     The optax import is attempted once at module load and cached in
@@ -69,7 +81,7 @@ def _require_optax() -> Any:
             "spectrax.contrib.Optimizer requires optax. Install with "
             "`pip install spectrax-lib[contrib]` or `pip install optax`."
         ) from _optax_import_error
-    return _optax
+    return cast(_OptaxModule, _optax)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -120,8 +132,8 @@ class Optimizer:
         self,
         tx: optax.GradientTransformation,
         selector: Selector,
-        opt_state: Any,
-        step: Any,
+        opt_state: OptState,
+        step: StepValue,
     ) -> None:
         """Low-level constructor; prefer :meth:`create`.
 
@@ -232,7 +244,7 @@ class Optimizer:
         update(module, new_parameters)
         return new_opt
 
-    def tree_flatten(self) -> tuple[tuple[Any, Any], tuple[Any, Selector]]:
+    def tree_flatten(self) -> tuple[tuple[OptState, StepValue], tuple[optax.GradientTransformation, Selector]]:
         """Pytree flatten: expose ``opt_state`` and ``step`` as dynamic leaves.
 
         The optax transformation and the selector are carried as
@@ -247,7 +259,11 @@ class Optimizer:
         return (self.opt_state, self.step), (self.tx, self.selector)
 
     @classmethod
-    def tree_unflatten(cls, aux: tuple[Any, Selector], children: tuple[Any, Any]) -> Optimizer:
+    def tree_unflatten(
+        cls,
+        aux: tuple[optax.GradientTransformation, Selector],
+        children: tuple[OptState, StepValue],
+    ) -> Optimizer:
         """Rebuild an :class:`Optimizer` from its flattened representation.
 
         Inverse of :meth:`tree_flatten`. Calls :meth:`__init__` directly
@@ -434,9 +450,9 @@ def _slice_state(state: State, paths: set[tuple[str, str]] | frozenset[tuple[str
     Returns:
         A new :class:`State` containing only the listed leaves.
     """
-    out: dict[str, dict[str, Any]] = {}
+    out = State()
     for c, p in paths:
-        d = state.raw().get(c, {})
-        if p in d:
-            out.setdefault(c, {})[p] = d[p]
-    return State(out)
+        value = state.get(c, p, default=None)
+        if value is not None:
+            out.set(c, p, value)
+    return out

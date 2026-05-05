@@ -20,13 +20,14 @@ some sub-arrays live in other processes and are *not* addressable here
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from ...core._typing import DType
 
 __all__ = ["StagesArray", "abstract_stages_array"]
 
@@ -44,7 +45,7 @@ class StagesArray:
             ops; not verified at construction time.
     """
 
-    shards: Mapping[int, Any]
+    shards: Mapping[int, jax.Array]
     replicated: bool = field(default=False)
 
     def __post_init__(self) -> None:
@@ -78,7 +79,7 @@ class StagesArray:
         return first.shape
 
     @property
-    def dtype(self) -> Any:
+    def dtype(self) -> DType:
         """Dtype of each per-stage shard."""
         first = next(iter(self.shards.values()))
         return first.dtype
@@ -179,7 +180,7 @@ class StagesArray:
         """Return the number of shards."""
         return len(self.shards)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[jax.Array]:
         """Iterate over shards in sorted index order."""
         for idx in sorted(self.shards.keys()):
             yield self.shards[idx]
@@ -288,7 +289,7 @@ StagesArray.__array__ = _stages_array_no_ndarray_conversion
 
 def abstract_stages_array(
     shape: tuple[int, ...],
-    dtype: Any,
+    dtype: DType,
     mpmd_idxs: frozenset[int] | set[int] | list[int] | tuple[int, ...],
     *,
     replicated: bool = False,

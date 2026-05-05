@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import os
-import typing as tp
 
 from .base import Logger
 from .tensorboard import TensorBoardBackend
@@ -28,7 +27,7 @@ class SummaryWriter(Logger):
         log_dir: str | os.PathLike[str] | None = None,
         *,
         auto_flush: bool = True,
-        **kwargs: tp.Any,
+        **kwargs: object,
     ):
         log_dir = log_dir or kwargs.pop("logdir", None) or "runs"
         super().__init__([TensorBoardBackend(log_dir)], auto_flush=auto_flush)

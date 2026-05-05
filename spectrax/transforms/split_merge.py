@@ -27,7 +27,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import NoReturn, cast
 
 import jax
 
@@ -59,8 +59,8 @@ __all__ = [
 
 
 PureFn = Callable[
-    [tuple[State, ...], tuple[Any, ...], dict[str, Any]],
-    tuple[Any, tuple[State, ...]],
+    [tuple[State, ...], tuple[object, ...], dict[str, object]],
+    tuple[object, tuple[State, ...]],
 ]
 """Type of the pure function produced by :func:`make_pure`."""
 
@@ -85,7 +85,7 @@ class _ModuleRef:
     state: State
 
 
-def locate_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[_ModuleRef]:
+def locate_modules(args: tuple[object, ...], kwargs: dict[str, object]) -> list[_ModuleRef]:
     """Scan ``args`` / ``kwargs`` and return one :class:`_ModuleRef` per :class:`Module`.
 
     Each reference carries a freshly-computed ``(gdef, state)`` snapshot
@@ -112,7 +112,7 @@ def locate_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[_Modul
     return refs
 
 
-def locate_and_strip_fast(args: tuple[Any, ...]) -> tuple[list[_ModuleRef], tuple[Any, ...]]:
+def locate_and_strip_fast(args: tuple[object, ...]) -> tuple[list[_ModuleRef], tuple[object, ...]]:
     """Kwargs-less fast variant of :func:`locate_and_strip`.
 
     Single pass over positional ``args``; each :class:`Module` is
@@ -129,7 +129,7 @@ def locate_and_strip_fast(args: tuple[Any, ...]) -> tuple[list[_ModuleRef], tupl
         :class:`~spectrax.Module` replaced by ``None``.
     """
     refs: list[_ModuleRef] = []
-    stripped: list[Any] = []
+    stripped: list[object] = []
     for i, a in enumerate(args):
         if isinstance(a, Module):
             g, s = export(a)
@@ -141,8 +141,8 @@ def locate_and_strip_fast(args: tuple[Any, ...]) -> tuple[list[_ModuleRef], tupl
 
 
 def locate_and_strip(
-    args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> tuple[list[_ModuleRef], tuple[Any, ...], dict[str, Any]]:
+    args: tuple[object, ...], kwargs: dict[str, object]
+) -> tuple[list[_ModuleRef], tuple[object, ...], dict[str, object]]:
     """Locate modules and strip them to ``None`` placeholders in one pass.
 
     Fused equivalent of :func:`locate_modules` followed by
@@ -168,14 +168,14 @@ def locate_and_strip(
         * ``stripped_kwargs`` — same substitution applied to ``kwargs``.
     """
     refs: list[_ModuleRef] = []
-    new_args_list: list[Any] = [None] * len(args)
+    new_args_list: list[object] = [None] * len(args)
     for i, a in enumerate(args):
         if isinstance(a, Module):
             g, s = export(a)
             refs.append(_ModuleRef("arg", i, a, g, s))
         else:
             new_args_list[i] = a
-    new_kwargs: dict[str, Any] = {}
+    new_kwargs: dict[str, object] = {}
     for k, v in kwargs.items():
         if isinstance(v, Module):
             g, s = export(v)
@@ -186,7 +186,7 @@ def locate_and_strip(
     return refs, tuple(new_args_list), new_kwargs
 
 
-def strip_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+def strip_modules(args: tuple[object, ...], kwargs: dict[str, object]) -> tuple[tuple[object, ...], dict[str, object]]:
     """Replace :class:`Module` entries with ``None`` placeholders.
 
     Used by callers that have already located the modules via
@@ -210,11 +210,11 @@ def strip_modules(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[
 
 
 def splice_modules(
-    stripped_args: tuple[Any, ...],
-    stripped_kwargs: dict[str, Any],
+    stripped_args: tuple[object, ...],
+    stripped_kwargs: dict[str, object],
     refs: list[_ModuleRef],
     modules: list[Module],
-) -> tuple[tuple[Any, ...], dict[str, Any]]:
+) -> tuple[tuple[object, ...], dict[str, object]]:
     """Write freshly-bound ``modules`` back into the stripped-arg tree.
 
     The inverse of :func:`strip_modules`. Iterates ``refs`` and
@@ -245,15 +245,15 @@ def splice_modules(
 
 
 def _run_pure_body(
-    fn: Callable[..., Any],
+    fn: Callable[..., object],
     gdefs: tuple[GraphDef, ...],
     orig_modules: tuple[Module, ...],
     refs: list[_ModuleRef],
     states: tuple[State, ...],
-    stripped_args: tuple[Any, ...],
-    stripped_kwargs: dict[str, Any],
-    ctx: dict[str, Any] | None,
-) -> tuple[Any, tuple[State, ...]]:
+    stripped_args: tuple[object, ...],
+    stripped_kwargs: dict[str, object],
+    ctx: dict[str, object] | None,
+) -> tuple[object, tuple[State, ...]]:
     """Shared trace-time body of :func:`make_pure` and :func:`make_pure_ctx`.
 
     Rebinds fresh modules from ``states``, snapshots each live
@@ -266,9 +266,9 @@ def _run_pure_body(
     modules = [bind(g, s) for g, s in zip(gdefs, states, strict=False)]
     for src, dst in zip(orig_modules, modules, strict=False):
         _copy_runtime_state(src, dst)
-    initial: list[list[tuple[str, Any, Any]]] = []
+    initial: list[list[tuple[str]]] = []
     for m in modules:
-        entries: list[tuple[str, Any, Any]] = []
+        entries: list[tuple[str]] = []
         for path, v in live_variables(m):
             entries.append((path, v, v._value))
         initial.append(entries)
@@ -284,7 +284,7 @@ def _run_pure_body(
         _set_inside_transform(False)
     new_states: list[State] = []
     for entries in initial:
-        changed: dict[str, dict[str, Any]] = {}
+        changed: dict[str, dict[str, object]] = {}
         for path, var, init_val in entries:
             cur = var._value
             if cur is not init_val:
@@ -293,7 +293,7 @@ def _run_pure_body(
     return out, tuple(new_states)
 
 
-def _raise_illegal_mutation(collection: str, path: str) -> None:
+def _raise_illegal_mutation(collection: str, path: str) -> NoReturn:
     """Raise the standard undeclared-mutation error.
 
     Centralized helper so every callsite produces an identically-worded
@@ -315,11 +315,11 @@ def _raise_illegal_mutation(collection: str, path: str) -> None:
 
 
 def make_direct_readonly(
-    fn: Callable[..., Any],
+    fn: Callable[..., object],
     *,
     explicit_modules: tuple[Module, ...] | None = None,
     structural_error_message: str | None = None,
-) -> Callable[..., Any]:
+) -> Callable[..., object]:
     """Wrap ``fn`` so any direct module write raises :class:`IllegalMutationError`.
 
     Used by transforms that bypass the ``(GraphDef, State)`` round-trip
@@ -362,7 +362,7 @@ def make_direct_readonly(
     """
 
     @functools.wraps(fn)
-    def guarded(*args: Any, **kwargs: Any) -> Any:
+    def guarded(*args: object, **kwargs: object) -> object:
         """Variable-write-protected wrapper around ``fn``.
 
         Snapshots all live variables of the module(s) involved,
@@ -382,7 +382,7 @@ def make_direct_readonly(
                     modules.append(value)
 
         epoch_before = _graph_epoch()
-        snapshots: list[tuple[str, str, Any, Any]] = []
+        snapshots: list[tuple[str, str]] = []
         for module in modules:
             for path, var in live_variables(module):
                 snapshots.append((path, var.kind, var, var._value))
@@ -390,7 +390,7 @@ def make_direct_readonly(
         prev_hook = _get_write_hook()
         prev_active = _inside_transform()
 
-        def readonly_hook(var: Any, _new: Any) -> bool:
+        def readonly_hook(var: object, _new: object) -> bool:
             """Write hook installed during a readonly transform — every write is an error.
 
             Looks up the variable in the pre-recorded snapshots so the
@@ -427,15 +427,15 @@ def make_direct_readonly(
 
 
 def _run_readonly_body(
-    fn: Callable[..., Any],
+    fn: Callable[..., object],
     gdefs: tuple[GraphDef, ...],
     orig_modules: tuple[Module, ...],
     refs: list[_ModuleRef],
     states: tuple[State, ...],
-    stripped_args: tuple[Any, ...],
-    stripped_kwargs: dict[str, Any],
-    ctx: dict[str, Any] | None,
-) -> Any:
+    stripped_args: tuple[object, ...],
+    stripped_kwargs: dict[str, object],
+    ctx: dict[str, object] | None,
+) -> object:
     """Trace-time body shared by every readonly pure-fn factory.
 
     Mirror image of :func:`_run_pure_body` but enforces that no
@@ -469,9 +469,9 @@ def _run_readonly_body(
     for src, dst in zip(orig_modules, modules, strict=False):
         _copy_runtime_state(src, dst)
     epoch_before = _graph_epoch()
-    initial: list[list[tuple[str, str, Any, Any]]] = []
+    initial: list[list[tuple[str, str]]] = []
     for m in modules:
-        entries: list[tuple[str, str, Any, Any]] = []
+        entries: list[tuple[str, str]] = []
         for path, v in live_variables(m):
             entries.append((path, v.kind, v, v._value))
         initial.append(entries)
@@ -498,15 +498,15 @@ def _run_readonly_body(
 
 
 def _run_single_positional_body(
-    fn: Callable[..., Any],
+    fn: Callable[..., object],
     gdef: GraphDef,
     orig_module: Module,
     locator: int,
     state: State,
-    args_without_module: tuple[Any, ...],
+    args_without_module: tuple[object, ...],
     *,
     readonly: bool,
-) -> Any:
+) -> object:
     """Specialized trace body for one positional Module and no kwargs.
 
     Roughly 2x faster than the general path on the dispatch hot path —
@@ -538,7 +538,7 @@ def _run_single_positional_body(
     """
     module = bind(gdef, state)
     _copy_runtime_state(orig_module, module)
-    initial: list[tuple[str, str, Any, Any]] = []
+    initial: list[tuple[str, str]] = []
     for path, v in live_variables(module):
         initial.append((path, v.kind, v, v._value))
     epoch_before = _graph_epoch()
@@ -559,7 +559,7 @@ def _run_single_positional_body(
             if var._value is not initial_value:
                 _raise_illegal_mutation(kind, path)
         return out
-    changed: dict[str, dict[str, Any]] = {}
+    changed: dict[str, dict[str, object]] = {}
     for path, _kind, var, initial_value in initial:
         cur = var._value
         if cur is not initial_value:
@@ -567,7 +567,7 @@ def _run_single_positional_body(
     return out, State(changed)
 
 
-def make_pure(fn: Callable[..., Any], refs: list[_ModuleRef]) -> PureFn:
+def make_pure(fn: Callable[..., object], refs: list[_ModuleRef]) -> PureFn:
     """Construct the pure function fed into :mod:`jax`.
 
     The returned function has signature
@@ -607,16 +607,16 @@ def make_pure(fn: Callable[..., Any], refs: list[_ModuleRef]) -> PureFn:
 
     def pure(
         states: tuple[State, ...],
-        stripped_args: tuple[Any, ...],
-        stripped_kwargs: dict[str, Any],
-    ) -> tuple[Any, tuple[State, ...]]:
+        stripped_args: tuple[object, ...],
+        stripped_kwargs: dict[str, object],
+    ) -> tuple[object, tuple[State, ...]]:
         """JAX-traced body: rebind modules, invoke ``fn``, emit only mutated leaves."""
         return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
 
     return pure
 
 
-def make_pure_readonly(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+def make_pure_readonly(fn: Callable[..., object], refs: list[_ModuleRef]) -> Callable[..., object]:
     """Construct a pure function that rejects all module mutations.
 
     Same shape as :func:`make_pure` but uses :func:`_run_readonly_body`
@@ -640,16 +640,16 @@ def make_pure_readonly(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callab
 
     def pure(
         states: tuple[State, ...],
-        stripped_args: tuple[Any, ...],
-        stripped_kwargs: dict[str, Any],
-    ) -> Any:
+        stripped_args: tuple[object, ...],
+        stripped_kwargs: dict[str, object],
+    ) -> object:
         """JAX-traced body: rebind modules read-only, invoke ``fn``, return its output."""
         return _run_readonly_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
 
     return pure
 
 
-def make_pure_single_positional(fn: Callable[..., Any], ref: _ModuleRef) -> Callable[..., Any]:
+def make_pure_single_positional(fn: Callable[..., object], ref: _ModuleRef) -> Callable[..., object]:
     """Specialized pure fn factory for the one-positional-Module hot path.
 
     The returned callable has shape
@@ -673,22 +673,25 @@ def make_pure_single_positional(fn: Callable[..., Any], ref: _ModuleRef) -> Call
         raise TypeError("make_pure_single_positional() requires a positional Module ref")
     locator = int(ref.locator)
 
-    def pure(state: State, *args_without_module: Any) -> tuple[Any, State]:
+    def pure(state: State, *args_without_module: object) -> tuple[object, State]:
         """One-module variant: rebind, run ``fn``, return ``(output, mutated_state)``."""
-        return _run_single_positional_body(
-            fn,
-            ref.gdef,
-            ref.module,
-            locator,
-            state,
-            args_without_module,
-            readonly=False,
+        return cast(
+            tuple[object, State],
+            _run_single_positional_body(
+                fn,
+                ref.gdef,
+                ref.module,
+                locator,
+                state,
+                args_without_module,
+                readonly=False,
+            ),
         )
 
     return pure
 
 
-def make_pure_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+def make_pure_ctx(fn: Callable[..., object], refs: list[_ModuleRef]) -> Callable[..., object]:
     """Variant of :func:`make_pure` that reinstates a scope frame before ``fn``.
 
     Used by :func:`~spectrax.jit` when the caller has active
@@ -715,17 +718,17 @@ def make_pure_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..
 
     def pure(
         states: tuple[State, ...],
-        traced_ctx: dict[str, Any],
-        stripped_args: tuple[Any, ...],
-        stripped_kwargs: dict[str, Any],
-    ) -> tuple[Any, tuple[State, ...]]:
+        traced_ctx: dict[str, object],
+        stripped_args: tuple[object, ...],
+        stripped_kwargs: dict[str, object],
+    ) -> tuple[object, tuple[State, ...]]:
         """Same shape as :func:`make_pure`'s pure, plus a ``traced_ctx`` arg."""
         return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, traced_ctx)
 
     return pure
 
 
-def make_pure_readonly_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Callable[..., Any]:
+def make_pure_readonly_ctx(fn: Callable[..., object], refs: list[_ModuleRef]) -> Callable[..., object]:
     """Readonly variant of :func:`make_pure_ctx`.
 
     Same scope-frame reinstatement as :func:`make_pure_ctx` but routes
@@ -747,10 +750,10 @@ def make_pure_readonly_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Ca
 
     def pure(
         states: tuple[State, ...],
-        traced_ctx: dict[str, Any],
-        stripped_args: tuple[Any, ...],
-        stripped_kwargs: dict[str, Any],
-    ) -> Any:
+        traced_ctx: dict[str, object],
+        stripped_args: tuple[object, ...],
+        stripped_kwargs: dict[str, object],
+    ) -> object:
         """Same shape as :func:`make_pure_readonly`'s ``pure``, plus a ``traced_ctx`` arg."""
         return _run_readonly_body(
             fn,
@@ -766,7 +769,7 @@ def make_pure_readonly_ctx(fn: Callable[..., Any], refs: list[_ModuleRef]) -> Ca
     return pure
 
 
-def make_pure_readonly_single_positional(fn: Callable[..., Any], ref: _ModuleRef) -> Callable[..., Any]:
+def make_pure_readonly_single_positional(fn: Callable[..., object], ref: _ModuleRef) -> Callable[..., object]:
     """Readonly counterpart of :func:`make_pure_single_positional`.
 
     Returns a callable shaped ``pure(state, *args_without_module) -> out``
@@ -782,7 +785,7 @@ def make_pure_readonly_single_positional(fn: Callable[..., Any], ref: _ModuleRef
         raise TypeError("make_pure_readonly_single_positional() requires a positional Module ref")
     locator = int(ref.locator)
 
-    def pure(state: State, *args_without_module: Any) -> Any:
+    def pure(state: State, *args_without_module: object) -> object:
         """One-module readonly variant: rebind, run ``fn``, return only its output."""
         return _run_single_positional_body(
             fn,
@@ -912,7 +915,7 @@ def apply_mutations(
         if not new_state:
             continue
 
-        vars_by_path: dict[tuple[str, str], Any] | None = None
+        vars_by_path: dict[tuple[str, str], object] | None = None
         allowed: set[tuple[str, str]] | None = None
 
         for c, p, new_val in new_state.items():
@@ -957,7 +960,7 @@ def _copy_runtime_state(src: Module, dst: Module) -> None:
             _copy_runtime_state(sc, dc)
 
 
-def _is_same(a: Any, b: Any) -> bool:
+def _is_same(a: object, b: object) -> bool:
     """Return whether ``a`` and ``b`` represent the same array value.
 
     Identity-equal values short-circuit to ``True``. Otherwise the
@@ -982,7 +985,7 @@ def _is_same(a: Any, b: Any) -> bool:
         return False
 
 
-def resolve_mutable(mutable: SelectorSugar | tuple[()] | list[Any]) -> Selector | None:
+def resolve_mutable(mutable: SelectorSugar | tuple[()] | list[object]) -> Selector | None:
     """Coerce a ``mutable=`` argument into a :class:`~spectrax.Selector` or ``None``.
 
     Centralizes the user-facing convention that an empty container

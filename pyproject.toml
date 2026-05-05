@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "spectrax-lib"
-version = "0.0.8"
+version = "0.1.0"
 authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
 description = "SpectraX: a JAX-only neural-network library with a True MPMD pipeline parallelism for JAX — with an eager module API."
 readme = "README.md"
@@ -43,8 +43,8 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["jax[cuda13]>=0.10.0"]
 tpu = ["jax[tpu]>=0.10.0"]
-test = ["pytest>=7"]
-dev = ["ruff>=0.6", "pytest>=7"]
+test = ["pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
+dev = ["ruff>=0.6", "basedpyright>=1.34", "pytest>=7", "gcsfs>=2024.2,<2026", "optax>=0.2.8"]
 contrib = ["optax>=0.2.8"]
 docs = [
     "sphinx>=7",
@@ -92,6 +92,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403"]
+"docs/conf.py" = ["A001"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -117,6 +118,29 @@ reportAny = "none"
 reportCallIssue = "none"
 reportUnknownArgumentType = "none"
 reportRedeclaration = "none"
+reportCallInDefaultInitializer = "none"
+reportConstantRedefinition = "none"
+reportDeprecated = "none"
+reportFunctionMemberAccess = "none"
+reportImportCycles = "none"
+reportImplicitRelativeImport = "none"
+reportInconsistentConstructor = "none"
+reportInvalidCast = "none"
+reportInvalidTypeForm = "none"
+reportInvalidTypeVarUse = "none"
+reportMissingTypeStubs = "none"
+reportOptionalSubscript = "none"
+reportPossiblyUnboundVariable = "none"
+reportPropertyTypeMismatch = "none"
+reportTypedDictNotRequiredAccess = "none"
+reportUnnecessaryComparison = "none"
+reportUnnecessaryTypeIgnoreComment = "none"
+reportUntypedBaseClass = "none"
+reportUntypedFunctionDecorator = "none"
+reportUnusedClass = "none"
+reportUnusedFunction = "none"
+reportUnusedImport = "none"
+reportUnusedVariable = "none"
 reportIgnoreCommentWithoutRule = "none"
 reportUnnecessaryIsInstance = "none"
 reportUnusedCallResult = "none"

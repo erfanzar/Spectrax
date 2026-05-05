@@ -17,7 +17,7 @@ accepted by layer initializers, module hooks, and variable observers.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -26,8 +26,8 @@ if TYPE_CHECKING:
     from jax.typing import ArrayLike as _ArrayLike
     from jax.typing import DTypeLike as _DTypeLike
 else:
-    _ArrayLike = Any
-    _DTypeLike = Any
+    _ArrayLike = object
+    _DTypeLike = object
 
 
 Array: TypeAlias = jax.Array
@@ -53,6 +53,13 @@ Shape: TypeAlias = tuple[int, ...]
 
 PRNGKey: TypeAlias = jax.Array
 """A JAX PRNG key array, as returned by :func:`jax.random.PRNGKey`."""
+
+PyTree: TypeAlias = object
+"""An arbitrary JAX pytree.
+
+This intentionally uses ``object`` as the dynamic top type so callers
+do not lose type checking around values that happen to be pytrees.
+"""
 
 
 PathComponent: TypeAlias = str | int
@@ -81,12 +88,12 @@ class Initializer(Protocol):
         ...
 
 
-ModulePredicate: TypeAlias = "Callable[[Any, str], bool]"
+ModulePredicate: TypeAlias = "Callable[[object, str], bool]"
 """Callable ``(module, path) -> bool`` predicate used by
 :class:`~spectrax.Selector` to filter modules.
 """
 
-VariablePredicate: TypeAlias = "Callable[[Any, str], bool]"
+VariablePredicate: TypeAlias = "Callable[[object, str], bool]"
 """Callable ``(variable, path) -> bool`` predicate used by
 :class:`~spectrax.Selector` to filter variables.
 """
@@ -103,10 +110,10 @@ class ForwardPreHook(Protocol):
 
     def __call__(
         self,
-        module: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-    ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+        module: object,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> tuple[tuple[object, ...], dict[str, object]] | None:
         """Optionally rewrite ``(args, kwargs)`` before ``forward`` runs."""
         ...
 
@@ -121,11 +128,11 @@ class ForwardHook(Protocol):
 
     def __call__(
         self,
-        module: Any,
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
-        output: Any,
-    ) -> Any | None:
+        module: object,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        output: object,
+    ) -> object | None:
         """Optionally rewrite the forward output. Return ``None`` to keep it unchanged."""
         ...
 
@@ -139,6 +146,6 @@ class VariableObserver(Protocol):
     exceptions raised by an observer are swallowed.
     """
 
-    def __call__(self, var: Any, old: Any, new: Any) -> None:
+    def __call__(self, var: object, old: object, new: object) -> None:
         """React to ``var`` having its value changed from ``old`` to ``new``."""
         ...

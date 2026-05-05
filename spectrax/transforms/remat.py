@@ -24,7 +24,7 @@ from __future__ import annotations
 import functools
 import importlib
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TypeVar, cast
 
 import jax
 
@@ -43,7 +43,7 @@ from .split_merge import (
 
 __all__ = ["remat"]
 
-F = TypeVar("F", bound=Callable[..., Any])
+F = TypeVar("F", bound=Callable[..., object])
 
 
 _REMAT_CLASS_CACHE: dict[tuple, type] = {}
@@ -55,7 +55,7 @@ call: avoids re-registering the pytree and lets
 """
 
 
-def _hashable_cache_key(value: Any) -> Any:
+def _hashable_cache_key(value: object) -> object:
     """Convert selector-like containers into deterministic, hashable cache-key values.
 
     The :data:`_REMAT_CLASS_CACHE` is keyed on a tuple that includes
@@ -132,27 +132,33 @@ def remat(
     if not isinstance(prevent_cse, bool):
         raise TypeError(f"prevent_cse must be a bool, got {type(prevent_cse).__name__}.")
     if fn is None:
-        return lambda f: remat(
-            f,
-            mutable=mutable,
-            prevent_cse=prevent_cse,
-            policy=policy,
-            static_argnums=static_argnums,
-        )
-
-    if isinstance(fn, type):
-        if issubclass(fn, Module):
-            return _remat_module_class(
-                fn,
+        return cast(
+            F,
+            lambda f: remat(
+                f,
                 mutable=mutable,
                 prevent_cse=prevent_cse,
                 policy=policy,
                 static_argnums=static_argnums,
+            ),
+        )
+
+    if isinstance(fn, type):
+        if issubclass(fn, Module):
+            return cast(
+                F,
+                _remat_module_class(
+                    fn,
+                    mutable=mutable,
+                    prevent_cse=prevent_cse,
+                    policy=policy,
+                    static_argnums=static_argnums,
+                ),
             )
 
     mutable_sel = resolve_mutable(mutable)
 
-    def _should_be_static_kwarg(x: Any) -> bool:
+    def _should_be_static_kwarg(x: object) -> bool:
         """Return whether ``x`` must be closed over rather than traced by :func:`jax.checkpoint`.
 
         :func:`jax.checkpoint` traces every input through a fresh JAX
@@ -184,7 +190,7 @@ def remat(
         return False
 
     @functools.wraps(fn)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def wrapped(*args: object, **kwargs: object) -> object:
         """Dispatch the call through :func:`jax.checkpoint` wrapped around a pure body.
 
         Locates module arguments via
@@ -223,10 +229,10 @@ def remat(
             _static = static_kwargs
 
             def pure_with_static(
-                states: tuple[Any, ...],
-                stripped_args_: tuple[Any, ...],
-                stripped_kwargs_: dict[str, Any],
-            ) -> Any:
+                states: tuple[object, ...],
+                stripped_args_: tuple[object, ...],
+                stripped_kwargs_: dict[str, object],
+            ) -> object:
                 """Pure ``(states, stripped_args, stripped_kwargs) -> output`` adapter.
 
                 Re-injects the captured ``static_kwargs`` (those filtered
@@ -274,7 +280,7 @@ def remat(
         apply_mutations(refs, list(new_states), mutable_sel)
         return out
 
-    return wrapped
+    return cast(F, wrapped)
 
 
 def _remat_module_class(
@@ -341,7 +347,7 @@ def _remat_module_class(
         gradient checkpointing.
         """
 
-        def forward(self, *args: Any, **kwargs: Any) -> Any:
+        def forward(self, *args: object, **kwargs: object) -> object:
             """Invoke the parent ``forward`` under the cached :func:`remat` wrapper.
 
             ``self`` is passed as the first positional argument so the

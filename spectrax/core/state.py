@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
-from typing import Any
+from typing import cast
 
 import jax
 
@@ -26,19 +26,19 @@ from .paths import path_to_str, str_to_path
 
 __all__ = ["State"]
 
-Leaf = Array | Any
+Leaf = Array | object
 """A stored leaf. Typically an :class:`Array` but left wide for traced values."""
 
 Writer = Callable[[Leaf], None]
 """Setter callback for live-backed leaves exported from a module."""
 
 
-def _is_leaf(v: Any) -> bool:
+def _is_leaf(v: object) -> bool:
     """Return ``True`` if *v* is a leaf (not a nested dict)."""
     return not isinstance(v, dict)
 
 
-def _nested_items(d: dict[str, Any], prefix: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], Any]]:
+def _nested_items(d: dict[str, object], prefix: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], object]]:
     """Yield ``(path_tuple, value)`` for every leaf in nested dict *d*."""
     for k in sorted(d.keys(), key=_sort_key):
         v = d[k]
@@ -48,7 +48,7 @@ def _nested_items(d: dict[str, Any], prefix: tuple[str, ...] = ()) -> Iterator[t
             yield (*prefix, k), v
 
 
-def _nested_paths(d: dict[str, Any], prefix: tuple[str, ...] = ()) -> Iterator[tuple[str, ...]]:
+def _nested_paths(d: dict[str, object], prefix: tuple[str, ...] = ()) -> Iterator[tuple[str, ...]]:
     """Yield ``path_tuple`` for every leaf in nested dict *d*."""
     for k in sorted(d.keys(), key=_sort_key):
         v = d[k]
@@ -58,7 +58,7 @@ def _nested_paths(d: dict[str, Any], prefix: tuple[str, ...] = ()) -> Iterator[t
             yield (*prefix, k)
 
 
-def _sorted_nested_dict(d: dict[str, Any]) -> dict[str, Any]:
+def _sorted_nested_dict(d: dict[str, object]) -> dict[str, object]:
     """Return a recursively key-sorted copy of nested dict *d*."""
     return {
         k: _sorted_nested_dict(v) if isinstance(v, dict) and v else v
@@ -66,7 +66,7 @@ def _sorted_nested_dict(d: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _nested_get(d: dict[str, Any], path: tuple[str, ...], default: Any = ...) -> Any:
+def _nested_get(d: dict[str, object], path: tuple[str, ...], default: object = ...) -> object:
     """Traverse nested dict *d* along *path* and return the leaf.
 
     Raises ``KeyError`` when a segment is missing and no *default* was
@@ -82,22 +82,22 @@ def _nested_get(d: dict[str, Any], path: tuple[str, ...], default: Any = ...) ->
         raise
 
 
-def _nested_set(d: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+def _nested_set(d: dict[str, object], path: tuple[str, ...], value: object) -> None:
     """Set *value* at *path* inside nested dict *d*, mutating in place."""
     for key in path[:-1]:
         d = d.setdefault(key, {})
     d[path[-1]] = value
 
 
-def _deep_copy_nested(d: dict[str, Any]) -> dict[str, Any]:
+def _deep_copy_nested(d: dict[str, object]) -> dict[str, object]:
     """Recursively copy nested dict structure while sharing leaf objects."""
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for k, v in d.items():
         out[k] = _deep_copy_nested(v) if isinstance(v, dict) else v
     return out
 
 
-def _merge_nested(into: dict[str, Any], other: dict[str, Any]) -> None:
+def _merge_nested(into: dict[str, object], other: dict[str, object]) -> None:
     """Merge *other* into *into* in place, sharing leaf objects."""
     for k, v in other.items():
         if k in into and isinstance(into[k], dict) and isinstance(v, dict):
@@ -112,18 +112,18 @@ def _normalize_inner_mapping(value: Mapping[str, Leaf]) -> dict[str, Leaf]:
     """Normalize an inner collection mapping to SpectraX's nested layout."""
     inner = _mapping_to_nested_dict(value)
     is_nested = any(isinstance(v, Mapping) and v for v in inner.values())
-    return inner if is_nested else _flat_to_nested(inner)
+    return cast(dict[str, Leaf], inner if is_nested else _flat_to_nested(cast(dict[str, object], inner)))
 
 
-def _mapping_to_nested_dict(value: Mapping[Any, Any]) -> dict[Any, Any]:
+def _mapping_to_nested_dict(value: Mapping[object, object]) -> dict[object, object]:
     """Return a plain nested dict from any mapping/proxy tree."""
-    out: dict[Any, Any] = {}
+    out: dict[object, object] = {}
     for key, leaf in value.items():
         out[key] = _mapping_to_nested_dict(leaf) if isinstance(leaf, Mapping) else leaf
     return out
 
 
-def _sync_nested(state: State, collection: str, subtree: Mapping[str, Any], prefix: tuple[str, ...] = ()) -> None:
+def _sync_nested(state: State, collection: str, subtree: Mapping[str, object], prefix: tuple[str, ...] = ()) -> None:
     """Sync every leaf in ``subtree`` through ``state``'s live writers."""
     for key, value in subtree.items():
         path = (*prefix, key)
@@ -133,7 +133,7 @@ def _sync_nested(state: State, collection: str, subtree: Mapping[str, Any], pref
             state._sync_leaf(collection, path, value)
 
 
-def _map_fn_arity(fn: Callable[..., Any]) -> int:
+def _map_fn_arity(fn: Callable[..., object]) -> int:
     """Return the supported positional arity for :meth:`State.map`.
 
     ``1`` means ``fn(value)``, ``2`` means ``fn(path, value)``, and ``3``
@@ -193,13 +193,13 @@ def _map_fn_arity(fn: Callable[..., Any]) -> int:
 
 
 def _call_map_fn(
-    fn: Callable[..., Any],
+    fn: Callable[..., object],
     *,
     arity: int,
     collection: str,
     path: str,
-    value: Any,
-) -> Any:
+    value: object,
+) -> object:
     """Call a :meth:`State.map` callback using its supported signature."""
     if arity == 1:
         return fn(value)
@@ -208,27 +208,27 @@ def _call_map_fn(
     return fn(path, value, collection)
 
 
-def _map_nested_values(d: dict[str, Any], fn: Callable[..., Any]) -> dict[str, Any]:
+def _map_nested_values(d: dict[str, object], fn: Callable[..., object]) -> dict[str, object]:
     """Fast value-only mapper for ``fn(value)`` callbacks."""
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for k, v in d.items():
         out[k] = _map_nested_values(v, fn) if isinstance(v, dict) else fn(v)
     return out
 
 
 def _map_nested(
-    d: dict[str, Any],
-    fn: Callable[..., Any],
+    d: dict[str, object],
+    fn: Callable[..., object],
     *,
     collection: str,
     prefix: tuple[str, ...] = (),
     arity: int,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Return a new nested dict with *fn* applied to every leaf."""
     if arity == 1:
         return _map_nested_values(d, fn)
 
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for k, v in d.items():
         if isinstance(v, dict):
             out[k] = _map_nested(v, fn, collection=collection, prefix=(*prefix, k), arity=arity)
@@ -243,18 +243,18 @@ def _map_nested(
     return out
 
 
-class _StateDictProxy(MutableMapping[Any, Any]):
+class _StateDictProxy(MutableMapping[object, object]):
     """Mutable nested mapping view that routes writes through :class:`State`."""
 
     __slots__ = ("_collection", "_prefix", "_state")
 
-    def __init__(self, state: State, collection: str, prefix: tuple[Any, ...] = ()) -> None:
+    def __init__(self, state: State, collection: str, prefix: tuple[object, ...] = ()) -> None:
         """Initialize a proxy view rooted at ``state[collection]`` with optional ``prefix`` path."""
         self._state = state
         self._collection = collection
         self._prefix = prefix
 
-    def _target(self) -> dict[Any, Any]:
+    def _target(self) -> dict[object, object]:
         """Resolve the nested dict at ``self._prefix`` inside ``state[collection]``.
 
         Auto-creates intermediate dicts. Raises :class:`TypeError` if
@@ -262,23 +262,23 @@ class _StateDictProxy(MutableMapping[Any, Any]):
         nested mapping.
         """
         target = self._state._data.setdefault(self._collection, {})
-        traversed: list[Any] = []
+        traversed: list[object] = []
         for key in self._prefix:
             traversed.append(key)
             child = target.setdefault(key, {})
             if not isinstance(child, dict):
                 raise TypeError(f"State path {path_to_str(tuple(traversed))!r} is a leaf, not a nested mapping")
             target = child
-        return target
+        return cast(dict[object, object], target)
 
-    def __getitem__(self, key: Any) -> Any:
+    def __getitem__(self, key: object) -> object:
         """Return the value at ``prefix + (key,)``; nested dicts return a new proxy view."""
         value = self._target()[key]
         if isinstance(value, dict):
             return type(self)(self._state, self._collection, (*self._prefix, key))
         return value
 
-    def __setitem__(self, key: Any, value: Any) -> None:
+    def __setitem__(self, key: object, value: object) -> None:
         """Write ``value`` at ``prefix + (key,)``, routing through the parent ``State``.
 
         Nested mappings are deep-copied and synced (so any registered
@@ -295,12 +295,12 @@ class _StateDictProxy(MutableMapping[Any, Any]):
             return
         self._state._sync_leaf(self._collection, path, value)
 
-    def __delitem__(self, key: Any) -> None:
+    def __delitem__(self, key: object) -> None:
         """Remove ``prefix + (key,)`` from the proxied state and prune dead writers."""
         del self._target()[key]
         self._state._restrict_writers()
 
-    def __iter__(self) -> Iterator[Any]:
+    def __iter__(self) -> Iterator[object]:
         """Iterate over the keys at the proxy's current path."""
         return iter(self._target())
 
@@ -318,16 +318,16 @@ class _StateDictProxy(MutableMapping[Any, Any]):
             return self.as_dict() == _mapping_to_nested_dict(other)
         return False
 
-    def as_dict(self) -> dict[Any, Any]:
+    def as_dict(self) -> dict[object, object]:
         """Return a detached plain-dict snapshot of this view.
 
         Returns:
             A recursively copied plain ``dict`` representing the
             current contents of the proxied nested mapping.
         """
-        return _deep_copy_nested(self._target())
+        return cast(dict[object, object], _deep_copy_nested(self._target()))
 
-    def copy(self) -> dict[Any, Any]:
+    def copy(self) -> dict[object, object]:
         """Return a detached plain-dict snapshot, matching ``dict.copy`` ergonomics.
 
         Returns:
@@ -337,23 +337,23 @@ class _StateDictProxy(MutableMapping[Any, Any]):
         return self.as_dict()
 
 
-def _flat_to_nested(d: dict[str, Any]) -> dict[str, Any]:
+def _flat_to_nested(d: dict[str, object]) -> dict[str, object]:
     """Convert a dotted-path flat dict into a nested dict."""
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for path_str, value in d.items():
         _nested_set(out, str_to_path(path_str), value)
     return out
 
 
-def _nested_to_flat(d: dict[str, Any]) -> dict[str, Any]:
+def _nested_to_flat(d: dict[str, object]) -> dict[str, object]:
     """Convert a nested dict into a dotted-path flat dict."""
-    out: dict[str, Any] = {}
+    out: dict[str, object] = {}
     for path_tuple, value in _nested_items(d):
         out[path_to_str(path_tuple)] = value
     return out
 
 
-def _sort_key(k: str) -> tuple[bool, str]:
+def _sort_key(k: str) -> tuple[bool, int | str]:
     """Sort numeric-looking keys before others (so ``0`` < ``10`` < ``a``)."""
     try:
         return (True, int(k))
@@ -482,7 +482,7 @@ class State:
         live_keys = {(collection, path) for collection, path in self.paths()}
         self._set_writers({key: writer for key, writer in self._writers.items() if key in live_keys})
 
-    def __getitem__(self, collection: str) -> MutableMapping[Any, Leaf]:
+    def __getitem__(self, collection: str) -> MutableMapping[object, Leaf]:
         """Return a mutable nested view for ``collection``, creating it
         on demand if absent so downstream code may index without guards.
         """
@@ -681,7 +681,7 @@ class State:
         target._sync_leaf(collection, path_tuple, value)
         return target
 
-    def get(self, collection: str, path: str | Path, default: Any = None) -> Any:
+    def get(self, collection: str, path: str | Path, default: object = None) -> object:
         """Return the leaf at ``(collection, path)`` or ``default`` if missing.
 
         Args:
@@ -741,14 +741,14 @@ class State:
 _StateAux = tuple[tuple[str, str], ...]
 
 
-def _state_flatten(s: State) -> tuple[tuple[Any, ...], _StateAux]:
+def _state_flatten(s: State) -> tuple[tuple[object, ...], _StateAux]:
     """Direct leaf flattener for :class:`State`.
 
     Avoids materializing sorted nested dict copies on the hot path by
     emitting the leaves directly alongside a deterministic
     ``(collection, dotted_path)`` leaf specification.
     """
-    leaves: list[Any] = []
+    leaves: list[object] = []
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
         for path_tuple, v in _nested_items(inner):
@@ -759,13 +759,13 @@ def _state_flatten(s: State) -> tuple[tuple[Any, ...], _StateAux]:
 
 def _state_flatten_with_keys(
     s: State,
-) -> tuple[tuple[tuple[tuple[jax.tree_util.DictKey, ...], Any], ...], _StateAux]:  # type: ignore
+) -> tuple[tuple[tuple[tuple[jax.tree_util.DictKey, ...]], ...], _StateAux]:  # type: ignore
     """JAX pytree flattener for :class:`State` with per-leaf keypaths.
 
     Emits explicit :class:`DictKey` tuples for every leaf while sharing
     the same leaf spec as :func:`_state_flatten`.
     """
-    key_leaves: list[tuple[tuple[jax.tree_util.DictKey, ...], Any]] = []  # type: ignore
+    key_leaves: list[tuple[tuple[jax.tree_util.DictKey, ...]]] = []  # type: ignore
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
         for path_tuple, v in _nested_items(inner):
@@ -775,14 +775,14 @@ def _state_flatten_with_keys(
     return tuple(key_leaves), tuple(spec)
 
 
-def _state_unflatten(aux: _StateAux, children: tuple[Any, ...]) -> State:
+def _state_unflatten(aux: _StateAux, children: tuple[object, ...]) -> State:
     """JAX pytree unflattener for the direct-leaf format."""
     if len(aux) != len(children):
         raise ValueError(
             "State pytree leaf count mismatch during unflatten: "
             f"expected {len(aux)} leaves from the auxiliary spec, got {len(children)}."
         )
-    data: dict[str, dict[str, Any]] = {}
+    data: dict[str, dict[str, object]] = {}
     for (collection, path), leaf in zip(aux, children, strict=True):
         _nested_set(data.setdefault(collection, {}), str_to_path(path), leaf)
     return State._from_raw(data)

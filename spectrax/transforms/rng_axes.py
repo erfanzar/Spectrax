@@ -30,7 +30,6 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -184,7 +183,7 @@ def split_rngs(rngs: Rngs, *, axis_size: int, only: tuple[str, ...] | None = Non
     if axis_size <= 0:
         raise ValueError(f"axis_size must be > 0, got {axis_size}.")
     names = tuple(rngs._spx_items.keys()) if only is None else tuple(only)
-    split_map: dict[str, Any] = {}
+    split_map: dict[str, Array] = {}
     for nm in names:
         stream = rngs.stream(nm)
         split_map[nm] = split_stream_keys(stream, axis_size)

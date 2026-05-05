@@ -14,10 +14,11 @@ from __future__ import annotations
 import os
 import struct
 import time
-import typing as tp
+from typing import BinaryIO
 
 import numpy as np
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf.message import Message
 
 try:
     import google_crc32c as _google_crc32c  # type:ignore
@@ -26,9 +27,9 @@ except Exception:  # pragma: no cover - fallback is exercised when the package i
 
 from spectrax.serialization._fs import _get_fs, joinpath, mkdir
 
-from .base import ArrayLike, BaseBackend, Scalar
+from .base import ArrayLike, BaseBackend, LogValue, Scalar
 
-_ProtoCache: dict[str, tp.Any] = {}
+_ProtoCache: dict[str, type[Message]] = {}
 _CRC32C_TABLE: tuple[int, ...] | None = None
 
 
@@ -66,7 +67,7 @@ def _masked_crc(data: bytes) -> int:
     return ((crc >> 15) | (crc << 17)) + 0xA282EAD8 & 0xFFFFFFFF
 
 
-def _write_record(f: tp.BinaryIO, data: bytes) -> None:
+def _write_record(f: BinaryIO, data: bytes) -> None:
     """Write a length-prefixed, CRC-protected record to a binary file.
 
     The on-disk layout is::
@@ -87,7 +88,7 @@ def _write_record(f: tp.BinaryIO, data: bytes) -> None:
     f.write(struct.pack("<I", _masked_crc(data)))
 
 
-def _get_protos() -> dict[str, tp.Any]:
+def _get_protos() -> dict[str, type[Message]]:
     """Lazy-initialize and cache TensorBoard protobuf message classes.
 
     Uses ``google.protobuf`` dynamic message construction so no compiled
@@ -262,7 +263,7 @@ class TensorBoardBackend(BaseBackend):
         log_dir = os.fspath(log_dir)
         mkdir(log_dir, exist_ok=True)
         self._log_dir = log_dir
-        self._file: tp.BinaryIO | None = None
+        self._file: BinaryIO | None = None
         self._open()
 
     def _open(self) -> None:
@@ -294,7 +295,7 @@ class TensorBoardBackend(BaseBackend):
         _write_record(self._file, event.SerializeToString())
         self._file.flush()
 
-    def _ensure_open(self) -> tp.BinaryIO:
+    def _ensure_open(self) -> BinaryIO:
         """Return the open file handle, reopening if it was closed.
 
         Returns:
@@ -302,6 +303,7 @@ class TensorBoardBackend(BaseBackend):
         """
         if self._file is None or self._file.closed:
             self._open()
+        assert self._file is not None
         return self._file
 
     def _write(self, data: bytes) -> None:
@@ -314,7 +316,7 @@ class TensorBoardBackend(BaseBackend):
         _write_record(f, data)
         f.flush()
 
-    def _event(self, step: int, summary: tp.Any) -> bytes:
+    def _event(self, step: int, summary: Message) -> bytes:
         """Build an ``Event`` protobuf wrapping a ``Summary``.
 
         Args:
@@ -444,7 +446,7 @@ class TensorBoardBackend(BaseBackend):
         val.tensor.CopyFrom(tensor)
         self._write(self._event(step, summary))
 
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Write hyper-parameter events.
 
         Emits a plugin-scoped ``hparams/session_start_info`` event followed

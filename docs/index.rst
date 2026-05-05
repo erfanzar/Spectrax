@@ -37,6 +37,12 @@ fine-grained control, :func:`~spectrax.export` still returns the
 
       One predicate DSL for every "subset of the model" API.
 
+   .. grid-item-card:: 🧮 Optimizers
+      :link: guides/optimizers
+      :link-type: doc
+
+      Optax-backed ``Optimizer`` and ``MultiOptimizer`` over SpectraX state.
+
    .. grid-item-card:: 📡 Dynamic scope
       :link: guides/scope
       :link-type: doc
@@ -101,6 +107,7 @@ fine-grained control, :func:`~spectrax.export` still returns the
    guides/modules
    guides/transforms
    guides/selectors
+   guides/optimizers
    guides/scope
    guides/lora
    guides/fp8

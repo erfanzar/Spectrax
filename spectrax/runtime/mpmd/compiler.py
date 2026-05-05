@@ -35,7 +35,6 @@ For cross-rank compute overlap, use
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -51,7 +50,7 @@ __all__ = [
 ]
 
 
-def _stage_fn_from_cluster(cluster: ClosedJaxpr | Jaxpr) -> Callable[..., Any]:
+def _stage_fn_from_cluster(cluster: ClosedJaxpr | Jaxpr) -> Callable[..., object]:
     """Return a Python callable for one marker-clustered stage jaxpr."""
     if isinstance(cluster, ClosedJaxpr):
         return jaxpr_as_fun(cluster)
@@ -128,7 +127,7 @@ def compile_ranked_executables(
     clusters: list[ClosedJaxpr | Jaxpr],
     schedule: Schedule,
     n_stages: int,
-) -> list[Callable[..., Any]]:
+) -> list[Callable[..., object]]:
     """Compile one jitted program per physical rank from clustered sub-jaxprs.
 
     Each cluster (from :func:`cluster_jaxpr_by_markers`) represents one
@@ -171,7 +170,7 @@ def compile_ranked_executables(
     if len(clusters) != n_logical:
         raise ValueError(f"Expected {n_logical} clusters for {n_stages} stages x V={V}; got {len(clusters)}.")
 
-    stage_fns: list[Callable[..., Any]] = []
+    stage_fns: list[Callable[..., object]] = []
     for cluster in clusters:
         stage_fns.append(_stage_fn_from_cluster(cluster))
 
@@ -187,7 +186,7 @@ def compile_ranked_executables(
             else:
                 per_rank_actions[r].append(cell)
 
-    programs: list[Callable[..., Any]] = []
+    programs: list[Callable[..., object]] = []
     for r in range(n_stages):
         actions = per_rank_actions[r]
         my_logical_stages = set()
@@ -232,11 +231,11 @@ def compile_ranked_executables(
                 """
                 with jax.named_scope(f"spectrax/mpmd/compiler/rank_{rank}"):
                     num_microbatches = mb_inputs.shape[0]
-                    saved_inputs: dict[tuple[int, int], Any] = {}
-                    saved_outputs: dict[tuple[int, int], Any] = {}
-                    outgoing_acts: list[Any | None] = [None] * int(num_microbatches)
+                    saved_inputs: dict[tuple[int, int], object] = {}
+                    saved_outputs: dict[tuple[int, int], object] = {}
+                    outgoing_acts: list[object | None] = [None] * int(num_microbatches)
                     outgoing_cots = jnp.zeros_like(mb_inputs)
-                    g_params_accum: dict[int, Any] = {}
+                    g_params_accum: dict[int, object] = {}
                     loss_sum = jnp.zeros((), dtype=jnp.float32)
 
                     for action in rank_actions:
@@ -298,15 +297,15 @@ def compile_ranked_executables(
 
 def run_ranked_pipeline(
     clusters: list[ClosedJaxpr | Jaxpr],
-    params_per_stage: list[tuple[Any, ...]],
+    params_per_stage: list[tuple[object, ...]],
     schedule: Schedule,
     n_stages: int,
     microbatches: int,
-    xs: Any,
-    target_args: tuple[Any, ...],
-    loss_fn: Callable[..., Any],
-    stage_shardings: list[Any] | None = None,
-) -> tuple[Any, list[Any]]:
+    xs: object,
+    target_args: tuple[object, ...],
+    loss_fn: Callable[..., object],
+    stage_shardings: list[object] | None = None,
+) -> tuple[object, list[object]]:
     """End-to-end: cluster → compile → execute → transport → loss.
 
     Drives one training step using per-rank compiled executables with
@@ -337,7 +336,7 @@ def run_ranked_pipeline(
     stage_fns = [_stage_fn_from_cluster(cluster) for cluster in clusters]
     params_tree = tuple(tuple(params) for params in params_per_stage)
 
-    def _primary(out: Any) -> Any:
+    def _primary(out: object) -> object:
         """Pick the first element from a stage output tuple, else return as-is.
 
         Stage callables built from clusters with multiple outvars
@@ -347,7 +346,7 @@ def run_ranked_pipeline(
         """
         return out[0] if isinstance(out, (tuple, list)) else out
 
-    def _micro_loss(params: tuple[tuple[Any, ...], ...], x_mb: Any, *targets_mb: Any) -> Any:
+    def _micro_loss(params: tuple[tuple[object, ...], ...], x_mb: object, *targets_mb: object) -> object:
         """Sequentially evaluate every logical stage on one microbatch and return the loss.
 
         Used for the reference single-rank simulation that produces

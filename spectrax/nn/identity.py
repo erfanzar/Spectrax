@@ -12,9 +12,11 @@ real sub-module and a no-op.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TypeVar
 
 from ..core.module import Module
+
+T = TypeVar("T")
 
 
 class Identity(Module):
@@ -36,7 +38,7 @@ class Identity(Module):
         """
         super().__init__()
 
-    def forward(self, x: Any, **_: Any) -> Any:
+    def forward(self, x: T, **_: object) -> T:
         """Return ``x`` unmodified.
 
         Args:

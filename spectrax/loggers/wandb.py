@@ -6,11 +6,9 @@
 
 from __future__ import annotations
 
-import typing as tp
-
 import numpy as np
 
-from .base import ArrayLike, BaseBackend, Scalar
+from .base import ArrayLike, BaseBackend, LogValue, Scalar
 
 try:
     import wandb
@@ -38,7 +36,7 @@ class WandBBackend(BaseBackend):
         self,
         project: str | None = None,
         *,
-        init_kwargs: dict[str, tp.Any] | None = None,
+        init_kwargs: dict[str, object] | None = None,
     ):
         """Initialize the WandB backend.
 
@@ -97,7 +95,7 @@ class WandBBackend(BaseBackend):
         """
         wandb.log({tag: wandb.Html(text)}, step=step)
 
-    def log_hparams(self, hparams: dict[str, tp.Any]) -> None:
+    def log_hparams(self, hparams: dict[str, LogValue]) -> None:
         """Update W&B run config with hyper-parameters.
 
         Args:
@@ -105,7 +103,7 @@ class WandBBackend(BaseBackend):
         """
         wandb.config.update(hparams)
 
-    def log_summary(self, metrics: dict[str, tp.Any]) -> None:
+    def log_summary(self, metrics: dict[str, LogValue]) -> None:
         """Update the W&B run summary with metrics.
 
         Args:
@@ -118,7 +116,7 @@ class WandBBackend(BaseBackend):
         self,
         tag: str,
         columns: list[str],
-        rows: list[list[tp.Any]],
+        rows: list[list[LogValue]],
         step: int,
     ) -> None:
         """Log a W&B table.

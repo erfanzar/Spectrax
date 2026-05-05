@@ -20,12 +20,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 __all__ = ["PipelineStage", "_is_empty_state"]
 
 
-def _is_empty_state(s: Any) -> bool:
+def _is_empty_state(s: object) -> bool:
     """Detect the "no state" sentinel used by stateless stages.
 
     The pipeline runtimes accept either ``()`` or ``None`` to mean
@@ -81,6 +80,6 @@ class PipelineStage:
             sentinel handling.
     """
 
-    fn: Callable[[Any, Any, Any], tuple[Any, Any]]
-    parameters: Any
-    init_state: Any = ()
+    fn: Callable[[object, object, object], tuple[object, object]]
+    parameters: object
+    init_state: object = ()

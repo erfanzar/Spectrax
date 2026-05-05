@@ -48,7 +48,6 @@ available here.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -102,8 +101,8 @@ def compile_per_rank_fwd(
     schedule: Schedule,
     n_stages: int,
     microbatches: int,
-    fwd_fn: Callable[..., Any],
-) -> Callable[..., Any]:
+    fwd_fn: Callable[..., object],
+) -> Callable[..., object]:
     """Compile this rank's entire forward sweep into one :func:`jax.jit`.
 
     Returns a jitted callable that, in a single compiled HLO, runs
@@ -183,11 +182,11 @@ def compile_per_rank_bwd(
     schedule: Schedule,
     n_stages: int,
     microbatches: int,
-    bwd_fn: Callable[..., Any],
-    loss_and_g_y: Callable[..., Any] | None = None,
+    bwd_fn: Callable[..., object],
+    loss_and_g_y: Callable[..., object] | None = None,
     *,
     is_terminal: bool = False,
-) -> Callable[..., Any]:
+) -> Callable[..., object]:
     """Compile this rank's entire backward sweep into one :func:`jax.jit`.
 
     Returns a jitted callable that, in a single compiled HLO, runs
@@ -260,15 +259,15 @@ def run_gpipe_per_rank(
     n_stages: int,
     microbatches: int,
     schedule: GPipe,
-    fwd_fns: list[Callable[..., Any]],
-    bwd_fns: list[Callable[..., Any]],
-    loss_and_g_y: Callable[..., Any],
-    stage_params: list[Any],
-    stage_rest: list[Any],
-    stage_shardings: list[Any],
+    fwd_fns: list[Callable[..., object]],
+    bwd_fns: list[Callable[..., object]],
+    loss_and_g_y: Callable[..., object],
+    stage_params: list[object],
+    stage_rest: list[object],
+    stage_shardings: list[object],
     xs: jax.Array,
     target_args: tuple[jax.Array, ...],
-) -> tuple[jax.Array, tuple[Any, ...]]:
+) -> tuple[jax.Array, tuple[object, ...]]:
     """Execute a GPipe training step with 2n per-rank compiled programs.
 
     Drives one forward-sweep jit and one backward-sweep jit per rank.
@@ -332,7 +331,7 @@ def run_gpipe_per_rank(
         mb_curr = mb_out
 
     zero_cots = jnp.zeros_like(xs)
-    grads: list[Any] = [None] * n_stages
+    grads: list[object] = [None] * n_stages
     loss_sum = jnp.zeros((), dtype=jnp.float32)
     mb_cots = zero_cots
 

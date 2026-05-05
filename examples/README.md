@@ -5,13 +5,13 @@ single-Module forward passes to multi-device MPMD pipeline training.
 
 | folder                                                 | topic                                                                                                               |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| [`01_basics/`](01_basics/)                             | Defining `spx.Module`, training loops, `export`/`bind`, state manipulation, optimizers.                             |
+| [`01_basics/`](01_basics/)                             | Defining `spx.Module`, training loops, `export`/`bind`, state manipulation, single and multi optimizers.            |
 | [`02_implementation_guide/`](02_implementation_guide/) | Full model implementations — Llama 3, Qwen 2, GPT-2, ViT, custom transformer block.                                 |
 | [`03_transformations/`](03_transformations/)           | `spx.jit`, `spx.grad`/`value_and_grad`, `spx.vmap`, `spx.remat` (function + class-aware), `spx.scan` / `fori_loop`. |
 | [`04_surgery/`](04_surgery/)                           | Selectors (`find`, `iter_*`, `of_type`, `path_*`), LoRA injection, FP8 cast, parameter freezing, module swapping.   |
 | [`05_shardings/`](05_shardings/)                       | FSDP, tensor-parallel, FSDP+TP hybrid, logical axis rules, `with_sharding_constraint_by_name`.                      |
-| [`06_spmd_scheduled/`](06_spmd_scheduled/)             | Pipeline runtime (`mpmd_call`) with GPipe, Std1F1B, ZeroBubbleH1, InterleavedH1 (virtual stages).                   |
-| [`07_mpmd/`](07_mpmd/)                                 | Real MPMD pipeline via `spx.run` — train, forward, decode, 3-D mesh composition.                                    |
+| [`06_spmd_scheduled/`](06_spmd_scheduled/)             | SPMD pipeline runtime with GPipe, Std1F1B, ZeroBubbleH1, InterleavedH1 (virtual stages).                            |
+| [`07_mpmd/`](07_mpmd/)                                 | Real MPMD pipeline via `spx.run` / `sxjit` — train, forward, decode, stage regions, stage-local meshes.             |
 
 Shared model implementations live in [`models/`](models/):
 
@@ -22,6 +22,7 @@ Shared model implementations live in [`models/`](models/):
 
 ```bash
 python -m examples.01_basics.02_training_loop
+python -m examples.01_basics.06_multi_optimizer_lora
 python -m examples.02_implementation_guide.01_llama3
 python -m examples.07_mpmd.01_train_homogeneous
 ```

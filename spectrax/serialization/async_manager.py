@@ -106,6 +106,44 @@ def _is_none(x):
     return x is None
 
 
+def _checkpoint_metadata_extras(root: str) -> dict:
+    """Best-effort extras fallback for checkpoints without structure JSON."""
+    path = _fs.joinpath(root, "checkpoint_metadata.json")
+    if not _fs.exists(path):
+        return {}
+    try:
+        metadata = json.loads(_fs.read_text(path))
+    except Exception:
+        return {}
+    custom = metadata.get("custom_metadata", {})
+    return custom if isinstance(custom, dict) else {}
+
+
+def _key_from_relpath(rel_path: str) -> str:
+    """Convert a TensorStore relative path to a dotted checkpoint key."""
+    return rel_path.replace("/", ".").replace("\\", ".")
+
+
+def _strip_prefix_from_key(key: str, prefix: str) -> str:
+    """Remove the checkpoint prefix from a dotted key when present."""
+    prefix_dot = f"{prefix}."
+    return key[len(prefix_dot) :] if key.startswith(prefix_dot) else key
+
+
+def _insert_nested(result: dict, key: str, value: object) -> None:
+    """Insert ``value`` into ``result`` at a dotted key path."""
+    parts = [part for part in key.split(".") if part]
+    if not parts:
+        raise ValueError("Cannot insert a checkpoint leaf with an empty key.")
+    current = result
+    for part in parts[:-1]:
+        child = current.setdefault(part, {})
+        if not isinstance(child, dict):
+            raise ValueError(f"Checkpoint key collision while reconstructing {key!r}.")
+        current = child
+    current[parts[-1]] = value
+
+
 @dataclass
 class CheckpointMetadata:
     """Enhanced metadata for checkpoints with versioning and validation.
@@ -244,7 +282,9 @@ class AsyncCheckpointManager:
         arr_mask = [_is_array_like(x) for x in leaves]
         array_keys = [k for k, m in zip(leaf_keys_full, arr_mask, strict=False) if m]
         nonarray_indices = [i for i, m in enumerate(arr_mask) if not m]
-        nonarray_payload = {str(i): base64.b64encode(pickle.dumps(leaves[i])).decode("utf-8") for i in nonarray_indices}
+        nonarray_payload = {
+            str(i): base64.b64encode(pickle.dumps(leaves[i])).decode("utf-8") for i in nonarray_indices
+        }
 
         backend = "tensorstore"
         array_relpaths: list[str] = []
@@ -269,7 +309,7 @@ class AsyncCheckpointManager:
         if not arrays_info:
             raise ValueError(f"No arrays recorded in index for prefix={prefix!r}")
 
-        relpaths_from_index = [info["path"] for info in arrays_info]
+        relpaths_from_index = [str(info["path"]) for info in arrays_info]
         keys_from_index = [".".join(p.split("/")) for p in relpaths_from_index]
         if set(keys_from_index) != set(array_keys):
             missing = set(array_keys) - set(keys_from_index)
@@ -287,7 +327,7 @@ class AsyncCheckpointManager:
                 f"Structure mismatch: arr_mask expects {sum(arr_mask)} arrays, but index provided {len(array_relpaths)}."
             )
 
-        structure = {
+        structure: dict[str, object] = {
             "format": "pytree-structure",
             "version": __version__,
             "backend": backend,
@@ -322,11 +362,17 @@ class AsyncCheckpointManager:
         strict_shapes: bool = True,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         chunk_size: int | None = None,
+        can_skip_structure: bool = False,
     ) -> tuple[PyTree, dict]:
         """Load a PyTree previously saved by :meth:`save_pytree`.
 
-        Reads the ``pytree_structure.json`` file written during save to
+        Reads the ``{prefix}_structure.json`` file written during save to
         reconstruct the exact treedef, then deserializes arrays via TensorStore.
+        If that structure file is missing and *can_skip_structure* is ``True``,
+        this falls back to an array-only nested-dict reconstruction from
+        ``tensorstore_index.json``. That compatibility path cannot recover
+        non-array leaves without a *template*, but it keeps index-only model
+        checkpoints loadable.
 
         Args:
             path: Checkpoint directory (local or remote URL).
@@ -348,6 +394,10 @@ class AsyncCheckpointManager:
                 invoked after each array is loaded.
             chunk_size: If set, arrays are loaded in batches of this size to
                 reduce peak memory. Defaults to ``None`` (load all at once).
+            can_skip_structure: If ``True``, allow loading from
+                ``tensorstore_index.json`` when ``{prefix}_structure.json`` is
+                absent. Defaults to ``False`` so exact treedef preservation
+                remains the normal checkpoint contract.
 
         Returns:
             A 2-tuple ``(pytree, metadata)`` where *pytree* has the exact same
@@ -358,7 +408,8 @@ class AsyncCheckpointManager:
         Raises:
             ValueError: If *prefix* is empty, or if the saved prefix does not
                 match the requested prefix, or if any arrays are missing.
-            FileNotFoundError: If ``pytree_structure.json`` or any array
+            FileNotFoundError: If both ``{prefix}_structure.json`` and
+                ``tensorstore_index.json`` are missing, or if any array
                 subdirectories are missing.
         """
         if not prefix or not isinstance(prefix, str):
@@ -370,7 +421,23 @@ class AsyncCheckpointManager:
         root = str(path)
         struct_path = _structure_path(root, prefix)
         if not _fs.exists(struct_path):
-            raise FileNotFoundError(f"Missing pytree_structure.json in {root}")
+            if not can_skip_structure:
+                raise FileNotFoundError(
+                    f"Missing {os.path.basename(struct_path)} in {root}. "
+                    "Pass can_skip_structure=True to reconstruct arrays from tensorstore_index.json."
+                )
+            return self._load_pytree_from_index(
+                root,
+                mesh,
+                prefix=prefix,
+                shardings=shardings,
+                sharding_rules=sharding_rules,
+                dtype=dtype,
+                template=template,
+                strict_shapes=strict_shapes,
+                callback=callback,
+                chunk_size=chunk_size,
+            )
 
         struct = json.loads(_fs.read_text(struct_path))
         if struct.get("prefix") != prefix:
@@ -391,7 +458,7 @@ class AsyncCheckpointManager:
         array_keys: list[str] = struct["array_keys"]
         metadata = struct.get("extras", {})
 
-        def default_sharding():
+        def default_sharding() -> NamedSharding:
             """Return a fully-replicated sharding on the given mesh."""
             return NamedSharding(mesh=mesh, spec=PartitionSpec())
 
@@ -527,3 +594,155 @@ class AsyncCheckpointManager:
 
         pytree = jax.tree_util.tree_unflatten(tpl_treedef, tpl_leaves_full)
         return pytree, metadata
+
+    def _load_pytree_from_index(
+        self,
+        root: str,
+        mesh: Mesh,
+        *,
+        prefix: str,
+        shardings: dict[str, tp.Callable] | None = None,
+        sharding_rules: tp.Sequence[tuple[str, NamedSharding]] | None = None,
+        dtype: jnp.dtype | None = None,
+        template: PyTree | None = None,
+        strict_shapes: bool = True,
+        callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
+        chunk_size: int | None = None,
+    ) -> tuple[PyTree, dict]:
+        """Load an array-only PyTree from ``tensorstore_index.json``.
+
+        This compatibility path is used for hosted checkpoints that include the
+        TensorStore leaf index but not SpectraX's exact treedef sidecar. It
+        reconstructs a nested dictionary by stripping the requested checkpoint
+        prefix from each indexed array path. Non-array leaves are only preserved
+        when a caller provides them via *template*.
+        """
+        index_path = _fs.joinpath(root, "tensorstore_index.json")
+        if not _fs.exists(index_path):
+            raise FileNotFoundError(
+                f"Missing {os.path.basename(_structure_path(root, prefix))} and tensorstore_index.json in {root}"
+            )
+
+        index_data = json.loads(_fs.read_text(index_path))
+        if index_data.get("format") != "tensorstore":
+            raise ValueError(f"Unsupported tensorstore index format: {index_data.get('format')!r}")
+
+        if "prefixes" in index_data:
+            prefixes = index_data["prefixes"]
+            if prefix not in prefixes:
+                raise ValueError(f"Prefix {prefix!r} not found in tensorstore_index.json. Available: {sorted(prefixes)}")
+            arrays_info = prefixes[prefix]
+        else:
+            arrays_info = index_data.get("arrays", [])
+
+        if not arrays_info:
+            raise ValueError(f"No arrays recorded in tensorstore_index.json for prefix={prefix!r}.")
+
+        logger.warning(
+            "Missing %s; reconstructing prefix=%r from tensorstore_index.json. "
+            "This fallback preserves arrays but cannot recover non-array leaves without a template.",
+            os.path.basename(_structure_path(root, prefix)),
+            prefix,
+        )
+
+        relpaths: list[str] = [info["path"] for info in arrays_info]
+        array_keys = [_key_from_relpath(relpath) for relpath in relpaths]
+        result_keys = [_strip_prefix_from_key(key, prefix) for key in array_keys]
+        abs_paths = [_fs.joinpath(root, relpath) for relpath in relpaths]
+
+        missing = [p for p in abs_paths if not _fs.exists(_fs.joinpath(p, ".zarray"))]
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} arrays missing (example: {missing[0]}).")
+
+        def default_sharding():
+            """Return a fully-replicated sharding on the given mesh."""
+            return NamedSharding(mesh=mesh, spec=PartitionSpec())
+
+        if sharding_rules is not None:
+            import re as _re
+
+            apply_shardings = []
+            for key in array_keys:
+                found = None
+                for pattern, sharding in sharding_rules:
+                    if _re.search(pattern, key.replace(".", "/")):
+                        found = sharding
+                        break
+                apply_shardings.append(found if found is not None else default_sharding())
+        else:
+            apply_shardings = [
+                shardings.get(key, default_sharding()) if shardings else default_sharding() for key in array_keys
+            ]
+
+        array_leaves = []
+        if chunk_size is None or chunk_size <= 0:
+            array_leaves = self.global_manager.deserialize_with_paths(shardings=apply_shardings, paths=abs_paths)
+            self.global_manager.wait_until_finished()
+            if dtype is not None:
+                array_leaves = [jnp.asarray(x, dtype=dtype) for x in array_leaves]
+            if callback is not None:
+                array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
+        else:
+            for start in range(0, len(abs_paths), chunk_size):
+                end = min(start + chunk_size, len(abs_paths))
+                chunk_arrays = self.global_manager.deserialize_with_paths(
+                    shardings=apply_shardings[start:end],
+                    paths=abs_paths[start:end],
+                )
+                self.global_manager.wait_until_finished()
+                if dtype is not None:
+                    chunk_arrays = [jnp.asarray(x, dtype=dtype) for x in chunk_arrays]
+                if callback is not None:
+                    chunk_arrays = [
+                        callback(arr, key) for arr, key in zip(chunk_arrays, array_keys[start:end], strict=False)
+                    ]
+                array_leaves.extend(chunk_arrays)
+
+        if len(array_leaves) != len(array_keys):
+            raise ValueError(
+                f"Loaded {len(array_leaves)} arrays but tensorstore_index.json records {len(array_keys)} arrays."
+            )
+
+        metadata = _checkpoint_metadata_extras(root)
+        saved_arrays_by_key = {key: value for key, value in zip(result_keys, array_leaves, strict=False)}
+
+        if template is None:
+            result: dict[str, object] = {}
+            for key, value in saved_arrays_by_key.items():
+                _insert_nested(result, key, value)
+            return result, metadata
+
+        tpl_leaves, tpl_treedef = jax.tree_util.tree_flatten(template, is_leaf=_is_none)
+        tpl_leaf_keys_tree = leaf_key_paths(template, prefix=None, is_leaf=_is_none)
+        tpl_leaf_keys_full: list[str] = jax.tree_util.tree_leaves(tpl_leaf_keys_tree, is_leaf=_is_none)
+        tpl_arr_mask = [_is_array_like(x) for x in tpl_leaves]
+
+        def _coerce_or_fallback(loaded, expected, key):
+            """Coerce a loaded array to match *expected* shape, or raise/fall back."""
+            if not (_is_array_like(loaded) and _is_array_like(expected)):
+                return loaded
+            if loaded.shape == expected.shape:
+                return loaded
+            if not strict_shapes and (loaded.ndim == expected.ndim + 1) and (loaded.shape[1:] == expected.shape):
+                return loaded[0]
+            if not strict_shapes and np.prod(loaded.shape) == np.prod(expected.shape):
+                return jnp.reshape(loaded, expected.shape)
+            if strict_shapes:
+                raise ValueError(f"Array shape mismatch for key '{key}': got {loaded.shape}, expected {expected.shape}.")
+            return expected
+
+        tpl_leaves_full = [None] * len(tpl_leaf_keys_full)
+        for i, key in enumerate(tpl_leaf_keys_full):
+            if tpl_arr_mask[i]:
+                expected = tpl_leaves[i]
+                loaded = saved_arrays_by_key.get(key)
+                if loaded is None:
+                    if strict_shapes:
+                        raise KeyError(f"Missing array for key '{key}' in checkpoint.")
+                    tpl_leaves_full[i] = expected
+                else:
+                    tpl_leaves_full[i] = _coerce_or_fallback(loaded, expected, key)
+            else:
+                tpl_leaves_full[i] = tpl_leaves[i]
+
+        return jax.tree_util.tree_unflatten(tpl_treedef, tpl_leaves_full), metadata

@@ -322,6 +322,7 @@ class Checkpointer:
         template: PyTree | None = None,
         strict_shapes: bool = True,
         chunk_size: int | None = None,
+        can_skip_structure: bool = False,
     ) -> tuple[PyTree, MetadataDict]:
         """Load a treedef-preserving PyTree saved under a specific prefix.
 
@@ -342,6 +343,9 @@ class Checkpointer:
             template: Optional template PyTree for shape coercion.
             strict_shapes: Whether to enforce exact shape matches.
             chunk_size: Optional batch size for array loading.
+            can_skip_structure: If ``True``, allow loading array-only
+                TensorStore checkpoints from ``tensorstore_index.json`` when
+                the exact ``{prefix}_structure.json`` sidecar is absent.
 
         Returns:
             Tuple of ``(pytree, metadata)``.
@@ -386,6 +390,7 @@ class Checkpointer:
             template=template,
             callback=callback,
             chunk_size=chunk_size,
+            can_skip_structure=can_skip_structure,
         )
 
         if not load_treedef:

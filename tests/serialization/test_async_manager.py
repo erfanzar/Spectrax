@@ -101,10 +101,125 @@ class TestAsyncCheckpointManager:
             mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="optimizer")
 
     def test_load_pytree_missing_structure_raises(self, tmp_checkpoint_dir, mesh):
-        """Loading from a directory without pytree_structure.json raises."""
+        """Loading without structure is strict unless can_skip_structure=True."""
         mgr = AsyncCheckpointManager()
-        with pytest.raises(FileNotFoundError, match="Missing pytree_structure"):
+        mgr.save_pytree({"a": jnp.ones(2)}, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+        (Path(tmp_checkpoint_dir) / "model_structure.json").unlink()
+
+        with pytest.raises(FileNotFoundError, match="can_skip_structure"):
             mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model")
+
+    def test_load_pytree_missing_structure_and_index_raises(self, tmp_checkpoint_dir, mesh):
+        """Index fallback still requires tensorstore_index.json."""
+        mgr = AsyncCheckpointManager()
+        with pytest.raises(FileNotFoundError, match="tensorstore_index"):
+            mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="model", can_skip_structure=True)
+
+    def test_load_pytree_missing_structure_uses_tensorstore_index(self, tmp_checkpoint_dir, mesh):
+        """Index-only checkpoints reconstruct array trees when structure JSON is absent."""
+        tree = {"model": {"layers": {"0": {"w": jnp.arange(6).reshape(2, 3), "b": jnp.ones(3)}}}}
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        (Path(tmp_checkpoint_dir) / "model_structure.json").unlink()
+
+        seen_keys = []
+
+        def remember_key(arr, key):
+            """Record callback keys and return arrays unchanged."""
+            seen_keys.append(key)
+            return arr
+
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            callback=remember_key,
+            can_skip_structure=True,
+        )
+
+        assert jnp.allclose(loaded["model"]["layers"]["0"]["w"], tree["model"]["layers"]["0"]["w"])
+        assert jnp.allclose(loaded["model"]["layers"]["0"]["b"], tree["model"]["layers"]["0"]["b"])
+        assert "model.model.layers.0.w" in seen_keys
+
+    def test_can_skip_structure_with_structure_preserves_exact_tree(self, tmp_checkpoint_dir, mesh):
+        """can_skip_structure=True is a no-op when the structure sidecar exists."""
+        tree = {"arr": jnp.arange(4), "none": None, "name": "tx", "step": 5}
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="tx")
+
+        loaded, meta = mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="tx", can_skip_structure=True)
+
+        assert jnp.allclose(loaded["arr"], tree["arr"])
+        assert loaded["none"] is None
+        assert loaded["name"] == "tx"
+        assert loaded["step"] == 5
+        assert isinstance(meta, dict)
+
+    def test_load_pytree_missing_structure_chunked_dtype_callback(self, tmp_checkpoint_dir, mesh):
+        """Index fallback supports chunked loads, dtype casts, and callbacks."""
+        tree = {
+            "model": {
+                "a": jnp.arange(4, dtype=jnp.float32),
+                "b": jnp.ones((2, 2), dtype=jnp.float32),
+                "c": jnp.full((1,), 3.0, dtype=jnp.float32),
+            }
+        }
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+        (Path(tmp_checkpoint_dir) / "model_structure.json").unlink()
+
+        seen_keys = []
+
+        def add_one(arr, key):
+            """Record fallback keys and add one after dtype conversion."""
+            seen_keys.append(key)
+            return arr + jnp.asarray(1, dtype=arr.dtype)
+
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            dtype=jnp.bfloat16,
+            chunk_size=1,
+            callback=add_one,
+            can_skip_structure=True,
+        )
+
+        assert set(seen_keys) == {"model.model.a", "model.model.b", "model.model.c"}
+        assert loaded["model"]["a"].dtype == jnp.bfloat16
+        assert loaded["model"]["b"].dtype == jnp.bfloat16
+        assert jnp.allclose(loaded["model"]["a"], tree["model"]["a"].astype(jnp.bfloat16) + 1)
+        assert jnp.allclose(loaded["model"]["b"], tree["model"]["b"].astype(jnp.bfloat16) + 1)
+        assert jnp.allclose(loaded["model"]["c"], tree["model"]["c"].astype(jnp.bfloat16) + 1)
+
+    def test_load_pytree_missing_structure_uses_template(self, tmp_checkpoint_dir, mesh):
+        """Index-only checkpoints can load into a caller-provided template."""
+        tree = {"model": {"w": jnp.arange(4, dtype=jnp.float32)}, "step": 7}
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        (Path(tmp_checkpoint_dir) / "model_structure.json").unlink()
+
+        template = {"model": {"w": jnp.zeros(4, dtype=jnp.float32)}, "step": 99}
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            template=template,
+            can_skip_structure=True,
+        )
+
+        assert jnp.allclose(loaded["model"]["w"], tree["model"]["w"])
+        assert loaded["step"] == 99
+
+    def test_load_pytree_missing_structure_missing_prefix_raises(self, tmp_checkpoint_dir, mesh):
+        """Index fallback still validates the requested prefix."""
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree({"w": jnp.ones(2)}, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        with pytest.raises(ValueError, match="Prefix 'optimizer' not found"):
+            mgr.load_pytree(tmp_checkpoint_dir, mesh, prefix="optimizer", can_skip_structure=True)
 
     def test_structure_file_written(self, tmp_checkpoint_dir, mesh):
         """save_pytree writes pytree_structure.json and checkpoint_metadata.json."""

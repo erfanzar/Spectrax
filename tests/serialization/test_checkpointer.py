@@ -78,6 +78,74 @@ class TestCheckpointer:
         assert "layer0.bias" in loaded
         assert jnp.allclose(loaded["layer0.weight"], tree["layer0"]["weight"])
 
+    def test_can_skip_structure_passes_to_manager(self, tmp_checkpoint_dir, mesh):
+        """can_skip_structure enables high-level index-only TensorStore loads."""
+        cp = Checkpointer(
+            base_path=tmp_checkpoint_dir,
+            save_interval=None,
+            step_policies=[CheckpointInterval(every=10)],
+        )
+        tree = {"layer0": {"weight": jnp.ones((2, 2)), "bias": jnp.zeros(2)}}
+        cp.save_pytree(tree, prefix="model", step=10, mesh=mesh)
+
+        run_path = Path(tmp_checkpoint_dir) / "run-10"
+        (run_path / "model_structure.json").unlink()
+
+        with pytest.raises(FileNotFoundError, match="can_skip_structure"):
+            cp.load_pytree(mesh, prefix="model", path=str(run_path), discover_latest=False)
+
+        loaded, _ = cp.load_pytree(
+            mesh,
+            prefix="model",
+            path=str(run_path),
+            discover_latest=False,
+            load_treedef=False,
+            can_skip_structure=True,
+        )
+        assert "layer0.weight" in loaded
+        assert jnp.allclose(loaded["layer0.weight"], tree["layer0"]["weight"])
+
+    def test_can_skip_structure_preserves_nested_tree_when_load_treedef_true(self, tmp_checkpoint_dir, mesh):
+        """High-level index fallback can return a nested reconstructed tree."""
+        cp = Checkpointer(
+            base_path=tmp_checkpoint_dir,
+            save_interval=None,
+            step_policies=[CheckpointInterval(every=10)],
+        )
+        tree = {"layer0": {"weight": jnp.ones((2, 2)), "bias": jnp.zeros(2)}}
+        cp.save_pytree(tree, prefix="model", step=10, mesh=mesh)
+
+        run_path = Path(tmp_checkpoint_dir) / "run-10"
+        (run_path / "model_structure.json").unlink()
+
+        loaded, _ = cp.load_pytree(
+            mesh,
+            prefix="model",
+            path=str(run_path),
+            discover_latest=False,
+            can_skip_structure=True,
+        )
+
+        assert jnp.allclose(loaded["layer0"]["weight"], tree["layer0"]["weight"])
+        assert jnp.allclose(loaded["layer0"]["bias"], tree["layer0"]["bias"])
+
+    def test_can_skip_structure_noop_with_structure_present(self, tmp_checkpoint_dir, mesh):
+        """High-level can_skip_structure keeps exact treedef when sidecar exists."""
+        cp = Checkpointer(
+            base_path=tmp_checkpoint_dir,
+            save_interval=None,
+            step_policies=[CheckpointInterval(every=10)],
+        )
+        tree = {"tx": {"w": jnp.arange(3)}, "step": 10, "name": "checkpoint"}
+        cp.save_pytree(tree, prefix="tx", step=10, mesh=mesh)
+
+        loaded, meta = cp.load_pytree(mesh, prefix="tx", discover_latest=True, can_skip_structure=True)
+
+        assert jnp.allclose(loaded["tx"]["w"], tree["tx"]["w"])
+        assert loaded["step"] == 10
+        assert loaded["name"] == "checkpoint"
+        assert meta.get("step") == 10
+
     def test_temporary_checkpoint_metadata(self, tmp_checkpoint_dir, mesh):
         """Temporary checkpoints write is_temporary=true in metadata."""
         cp = Checkpointer(

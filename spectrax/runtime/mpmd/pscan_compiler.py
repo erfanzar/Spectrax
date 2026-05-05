@@ -219,7 +219,7 @@ def _rebase_concrete_mesh(orig_mesh: Any, target_stage_mesh: Mesh) -> Any:
                 return orig_mesh
         flat = target_devices.reshape(-1)
         new_shape = tuple[int, ...](int(orig_shape[n]) for n in orig_axis_names)
-        new_devices = flat.reshape(new_shape) if new_shape else flat
+        new_devices = flat.reshape(new_shape)
 
     return Mesh(new_devices, orig_axis_names, axis_types=orig_mesh.axis_types)
 

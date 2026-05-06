@@ -78,7 +78,11 @@ class StateAxes:
         return self.axes.get(collection, default)
 
     def __iter__(self) -> Iterator[tuple[str, int | str | None]]:
-        """Iterate ``(collection, axis_spec)`` pairs in insertion order."""
+        """Iterate ``(collection, axis_spec)`` pairs in insertion order.
+
+        Returns:
+            Iterator over the contained values.
+        """
         return iter(self.axes.items())
 
 

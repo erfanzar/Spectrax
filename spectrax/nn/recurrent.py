@@ -10,12 +10,12 @@ they compose cleanly with :func:`jax.lax.scan`. Each cell exposes an
 zero-valued carry for a given batch shape.
 
 Wrappers
-    :class:`RNN` scans any :class:`RNNCellBase` across a time axis
-    (sequence-second by default, or sequence-first via
-    ``time_major=True``) with optional reversal and final-carry
-    return. :class:`Bidirectional` pairs a forward and a
-    reverse-configured :class:`RNN` and merges their outputs by
-    concatenation, sum, product, or average.
+:class:`RNN` scans any :class:`RNNCellBase` across a time axis
+(sequence-second by default, or sequence-first via
+``time_major=True``) with optional reversal and final-carry
+return. :class:`Bidirectional` pairs a forward and a
+reverse-configured :class:`RNN` and merges their outputs by
+concatenation, sum, product, or average.
 
 All weight matrices use the convention
 ``(in, out)`` with logical axis names ``("in", "out")``; biases use

@@ -202,6 +202,13 @@ def remat(
         :func:`jax.checkpoint`. After the checkpointed call returns,
         captured mutations are written back to the live module via
         :func:`~spectrax.transforms.split_merge.apply_mutations`.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         refs, stripped_args, stripped_kwargs = locate_and_strip(args, kwargs)
 
@@ -239,6 +246,14 @@ def remat(
                 out before ``jax.checkpoint`` saw them) at call time, then
                 routes through either the readonly or read/write body
                 helper depending on the wrapper's mode.
+
+                Args:
+                    states: States value consumed by this operation.
+                    stripped_args_: Stripped args  value consumed by this operation.
+                    stripped_kwargs_: Stripped kwargs  value consumed by this operation.
+
+                Returns:
+                    Result described by this helper.
                 """
                 merged_kwargs = {**stripped_kwargs_, **_static}
                 if readonly:
@@ -355,6 +370,13 @@ def _remat_module_class(
             :func:`~spectrax.transforms.split_merge.locate_and_strip`
             can discover the module instance and thread its
             declared-mutable collections through :func:`jax.checkpoint`.
+
+            Args:
+                *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
             """
             return cached_remat(self, *args, **kwargs)
 

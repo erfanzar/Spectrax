@@ -98,6 +98,12 @@ def _decode_component(c: str) -> PathComponent:
     Components prefixed with ``'#'`` are treated as quoted strings. Any
     all-digit component is decoded as ``int``. Everything else is a
     plain string.
+
+    Args:
+        c: C value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if c.startswith("#"):
         return c[1:]

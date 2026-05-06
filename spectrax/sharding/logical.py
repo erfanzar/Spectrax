@@ -34,6 +34,9 @@ def _get_stack() -> list[dict[str, str | None]]:
     grows with each :func:`logical_axis_rules` ``with`` and shrinks on
     exit; per-thread storage means worker threads do not see each
     other's frames.
+
+    Returns:
+        Return the thread-local stack of axis-rule mappings.
     """
     s = getattr(_STACK, "stack", None)
     if s is None:

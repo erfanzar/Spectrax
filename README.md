@@ -665,14 +665,6 @@ pytest tests/test_conformance.py
 
 ---
 
-## Status
-
-`v0.1.0` — alpha. API may still move; pin the version if you depend
-on behavioural stability. See [CHANGELOG.md](CHANGELOG.md) for the
-release log.
-
----
-
 ## License
 
 This project is licensed under AGPL-3.0-or-later.

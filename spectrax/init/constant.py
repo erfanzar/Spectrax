@@ -30,7 +30,16 @@ def constant(value: float | int) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Return ``jnp.full(shape, value, dtype)``; the PRNG key is ignored."""
+        """Return ``jnp.full(shape, value, dtype)``; the PRNG key is ignored.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Return ``jnp.full(shape, value, dtype)``; the PRNG key is ignored.
+        """
         del key
         return jnp.full(shape, value, dtype=dtype)
 

@@ -72,6 +72,10 @@ def _patch_removed_jax_config_flags() -> None:
         Returns ``None`` (without calling the underlying ``update``)
         when ``name`` is a known-removed flag; otherwise delegates to
         the original ``jax.config.update`` and returns its result.
+
+        Args:
+            name: Name used for lookup, logging, or registration.
+            value: Value consumed by the helper.
         """
         if name in removed_flags:
             return None

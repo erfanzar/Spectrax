@@ -85,6 +85,12 @@ class Std1F1B(Schedule):
         **data-dependency correct** — a property the naive
         construction violates when stage 0's BWD fires before stage 1
         has produced the corresponding cotangent.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         n, m = n_stages, self.microbatches
         if m < n:

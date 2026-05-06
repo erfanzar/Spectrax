@@ -210,6 +210,12 @@ def cond(
         carry+invariant and verifies that the invariant didn't change
         (if it had, the user's ``mutable=`` declaration was
         incomplete, which would corrupt cross-branch state).
+
+        Args:
+            branch: Branch value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
 
         def wrapped(c: State, ops: tuple[object, ...]) -> tuple[object, State]:
@@ -220,6 +226,13 @@ def cond(
             :func:`_run_branch`, partition the resulting state, verify
             the invariant did not change, and return the new carry plus
             the branch output.
+
+            Args:
+                c: C value consumed by this operation.
+                ops: Ops value consumed by this operation.
+
+            Returns:
+                Result described by this helper.
             """
             full = c.overlay(invariant)
             y, new_state = _run_branch(gdef, full, branch, ops)
@@ -313,6 +326,12 @@ def switch(
         state, run the branch, re-partition, verify that the invariant
         survived. Per-branch closures capture the branch by default
         argument so the loop variable doesn't leak between branches.
+
+        Args:
+            branch: Branch value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
 
         def wrapped(c: State, ops: tuple[object, ...]) -> tuple[object, State]:
@@ -322,6 +341,13 @@ def switch(
             to the body inside :func:`cond`, but a default-argument
             capture pins the per-branch closure so the loop variable
             does not leak between branch wrappers.
+
+            Args:
+                c: C value consumed by this operation.
+                ops: Ops value consumed by this operation.
+
+            Returns:
+                Result described by this helper.
             """
             full = c.overlay(invariant)
             y, new_state = _run_branch(gdef, full, branch, ops)
@@ -421,6 +447,12 @@ def while_loop(
         module, and calls the user's ``cond_fn`` inside the
         inside-transform thread-local. Returns whatever boolean-shaped
         scalar the user produced.
+
+        Args:
+            loop_carry: Loop carry value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
@@ -439,6 +471,12 @@ def while_loop(
         the resulting state, partition into new carry+invariant, verify
         the invariant did not drift, and return the new
         ``(state_carry, user_carry)`` tuple.
+
+        Args:
+            loop_carry: Loop carry value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
@@ -545,6 +583,13 @@ def fori_loop(
             user_carry)`` with the inside-transform flag set, and
             asserts that the entire state survived unchanged before
             returning the new user carry.
+
+            Args:
+                i: I value consumed by this operation.
+                user_carry: User carry value consumed by this operation.
+
+            Returns:
+                Result described by this helper.
             """
             m = bind(gdef, state)
             if modulelist_caches:
@@ -571,6 +616,13 @@ def fori_loop(
         re-partitions the resulting state into a new carry plus
         invariant. Verifies the invariant did not drift before
         returning the new ``(state_carry, user_carry)`` tuple.
+
+        Args:
+            i: I value consumed by this operation.
+            loop_carry: Loop carry value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         c_state, uc = loop_carry
         full = c_state.overlay(invariant)
@@ -666,6 +718,13 @@ def remat_scan(
         inside-transform thread-local, re-exports the resulting state,
         partitions it into a new carry plus invariant, and verifies
         the invariant did not drift.
+
+        Args:
+            c: C value consumed by this operation.
+            x: Input value consumed by the operation.
+
+        Returns:
+            Result described by this helper.
         """
         full = c.overlay(invariant)
         m = bind(gdef, full)

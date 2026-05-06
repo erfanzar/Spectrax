@@ -69,12 +69,18 @@ class DualPipeV(Schedule):
         ``2 * n_stages`` *logical* stages, then fold each logical
         stage onto its physical rank using the V mapping::
 
-            logical l  ->  (phys, virt) = (l, 0)              if l < n
-                       ->  (2n - 1 - l, 1)                    if l >= n
+                    logical l  ->  (phys, virt) = (l, 0)              if l < n
+                               ->  (2n - 1 - l, 1)                    if l >= n
 
-        When two virtual stages on the same physical rank want to run
-        at the same time step, we extend the grid with an extra row
-        to serialize them (mirrors :class:`InterleavedH1`).
+                When two virtual stages on the same physical rank want to run
+                at the same time step, we extend the grid with an extra row
+                to serialize them (mirrors :class:`InterleavedH1`).
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         n = n_stages
         m = self.microbatches
@@ -103,7 +109,11 @@ class DualPipeV(Schedule):
         return grid
 
     def virtual_stages_per_rank(self) -> int:
-        """Always ``2`` for the V-shape topology (forward and reverse virtuals)."""
+        """Always ``2`` for the V-shape topology (forward and reverse virtuals).
+
+        Returns:
+            Result described by this helper.
+        """
         return 2
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:

@@ -54,7 +54,16 @@ def orthogonal(gain: float = 1.0) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Materialize an orthogonal (or, for low rank, scaled-normal) weight of ``shape``."""
+        """Materialize an orthogonal (or, for low rank, scaled-normal) weight of ``shape``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         if len(shape) < 2:
             return jax.random.normal(key, shape, dtype=dtype) * gain
         flat: tuple[int, int] = (shape[0], math.prod(shape[1:]))

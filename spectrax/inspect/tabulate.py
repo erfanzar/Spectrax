@@ -210,6 +210,13 @@ def hlo_cost(module: Module, *example_args: object, **example_kwargs: object) ->
             to lower; calling ``module`` directly inside ``jit`` would
             also work but the closure makes the lowering boundary
             explicit.
+
+            Args:
+                *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
             """
             return module(*args, **kwargs)
 

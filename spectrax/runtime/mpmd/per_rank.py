@@ -228,7 +228,16 @@ def compile_per_rank_bwd(
 
     @jax.jit
     def bwd_step(params, rest, mb_saved_inputs, mb_saved_outputs, mb_incoming_cots, *mb_targets):
-        """Run every BWD for this rank back-to-back (terminal: loss + g_y)."""
+        """Run every BWD for this rank back-to-back (terminal: loss + g_y).
+
+        Args:
+            params: Parameter mapping or primitive parameter dictionary.
+            rest: Rest value consumed by this operation.
+            mb_saved_inputs: Mb saved inputs value consumed by this operation.
+            mb_saved_outputs: Mb saved outputs value consumed by this operation.
+            mb_incoming_cots: Mb incoming cots value consumed by this operation.
+            *mb_targets: Additional positional arguments forwarded to the wrapped callable or backend.
+        """
         with jax.named_scope(f"spectrax/mpmd/per_rank/backward_rank_{rank}"):
             mb_outgoing_cots = jnp.zeros_like(mb_saved_inputs)
             g_params = jax.tree.map(jnp.zeros_like, params)

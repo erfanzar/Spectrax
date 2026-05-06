@@ -80,7 +80,11 @@ class InterleavedH1(Schedule):
             )
 
     def virtual_stages_per_rank(self) -> int:
-        """Return :attr:`virtual_stages` — overrides the flat-schedule default."""
+        """Return :attr:`virtual_stages` — overrides the flat-schedule default.
+
+        Returns:
+            Return :attr:`virtual_stages` — overrides the flat-schedule default.
+        """
         return self.virtual_stages
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
@@ -195,6 +199,12 @@ class InterleavedH1(Schedule):
         step (shouldn't happen given 1F1B's construction on
         ``n_logical``, but handled defensively), we emit the current
         row and serialize the loser into a fresh row.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         return _build_physical_virtual_1f1b(
             n_stages=n_stages,
@@ -262,7 +272,11 @@ class InterleavedGPipe(Schedule):
             )
 
     def virtual_stages_per_rank(self) -> int:
-        """Return :attr:`virtual_stages`."""
+        """Return :attr:`virtual_stages`.
+
+        Returns:
+            Return :attr:`virtual_stages`.
+        """
         return self.virtual_stages
 
     def logical_at(self, rank: int, virt: int, n_stages: int) -> int:
@@ -335,6 +349,12 @@ class InterleavedGPipe(Schedule):
         Same logical->physical mapping as :class:`InterleavedH1`, but
         the underlying per-logical-stage schedule is :class:`GPipe`
         (all fwds, then all bwds) instead of 1F1B.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         n = n_stages
         v = self.virtual_stages
@@ -413,6 +433,12 @@ class Interleaved1F1BPlusOne(InterleavedH1):
         base :class:`InterleavedH1` schedule to preserve total action
         counts. If ``microbatches < 1`` or the base grid is empty we
         fall through to the base unchanged.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         base = super().build(n_stages)
         if self.microbatches < 1 or not base:

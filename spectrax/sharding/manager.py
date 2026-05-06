@@ -410,6 +410,12 @@ class PartitionAxis:
         Runtime-registered axes shadow built-in ones with the same
         name. Returns ``None`` if the axis is not known at all (the
         caller is expected to treat this as an unknown-axis error).
+
+        Args:
+            semantic_axis: Semantic axis value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         if semantic_axis in cls._REGISTERED_SEMANTIC_MAP:
             return cls._REGISTERED_SEMANTIC_MAP[semantic_axis]
@@ -423,6 +429,12 @@ class PartitionAxis:
         is unregistered or has no explicit generation override (in
         which case :meth:`resolve_axis` falls back to the standard
         rule, possibly via the ``decode_*`` field).
+
+        Args:
+            semantic_axis: Semantic axis value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         return cls._REGISTERED_GENERATION_MAP.get(semantic_axis, ct.NOT_GIVEN)
 
@@ -499,6 +511,10 @@ class PartitionAxis:
 
             Otherwise keep the user-provided value. Idempotent within
             a single ``__post_init__`` call.
+
+            Args:
+                name: Name used for lookup, logging, or registration.
+                default_logic: Default logic value consumed by this operation.
             """
             current_value = getattr(self, name)
             if current_value is ct.NOT_GIVEN:
@@ -507,7 +523,14 @@ class PartitionAxis:
                 resolved_values[name] = current_value
 
         def get_resolved(name: str) -> ct.AxisType:
-            """Return the just-resolved value for ``name`` (or the live attr)."""
+            """Return the just-resolved value for ``name`` (or the live attr).
+
+            Args:
+                name: Name used for lookup, logging, or registration.
+
+            Returns:
+                Return the just-resolved value for ``name`` (or the live attr).
+            """
             return resolved_values.get(name, getattr(self, name))
 
         resolve_field("batch_axis", lambda: (self.fully_sharded_data_parallel_axis, self.data_parallel_axis))
@@ -679,6 +702,9 @@ class PartitionAxis:
         comparing two ``PartitionAxis`` instances by value. Includes
         every field — both role and per-tensor-axis — but not the
         class-level registry.
+
+        Returns:
+            Return a plain ``dict`` of every dataclass field.
         """
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
 
@@ -728,7 +754,11 @@ class PartitionManager:
         _LAST_PARTITION_MANAGER = self
 
     def __enter__(self) -> PartitionManager:
-        """Push ``self`` onto the active-manager :class:`contextvars.ContextVar`."""
+        """Push ``self`` onto the active-manager :class:`contextvars.ContextVar`.
+
+        Returns:
+            Result described by this helper.
+        """
         global _LAST_PARTITION_MANAGER
         token = _CURRENT_PARTITION_MANAGER.set(self)
         object.__setattr__(self, "_context_token", token)
@@ -741,7 +771,16 @@ class PartitionManager:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
-        """Restore the previous active manager. Always re-raises (returns ``False``)."""
+        """Restore the previous active manager. Always re-raises (returns ``False``).
+
+        Args:
+            exc_type: Exc type value consumed by this operation.
+            exc_val: Exc val value consumed by this operation.
+            exc_tb: Exc tb value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         token = getattr(self, "_context_token", None)
         if token is not None:
             _CURRENT_PARTITION_MANAGER.reset(token)
@@ -854,11 +893,19 @@ class PartitionManager:
         return tp.cast(Array, with_sharding_constraint(x, spec))
 
     def __str__(self) -> str:
-        """Return a short, hash-stable string repr (the manager is opaque)."""
+        """Return a short, hash-stable string repr (the manager is opaque).
+
+        Returns:
+            Return a short, hash-stable string repr (the manager is opaque).
+        """
         return "PartitionManager(...)"
 
     def __repr__(self) -> str:
-        """Identical to :meth:`__str__` — the manager is intentionally opaque."""
+        """Identical to :meth:`__str__` — the manager is intentionally opaque.
+
+        Returns:
+            Result described by this helper.
+        """
         return "PartitionManager(...)"
 
     __hash__ = hash_fn
@@ -870,6 +917,9 @@ def get_current_partition_manager() -> PartitionManager | None:
     Reads from the :class:`contextvars.ContextVar` set by
     ``with PartitionManager(...):``. Use this in layer code that
     needs the *active* manager (the one for the enclosing ``with``).
+
+    Returns:
+        Return the manager currently active on this thread, or ``None``.
     """
     return _CURRENT_PARTITION_MANAGER.get()
 
@@ -879,6 +929,9 @@ def get_partition_manager() -> PartitionManager | None:
 
     Falls back when no ``with`` block is active. Useful for scripts
     that build a single manager at startup and never re-enter it.
+
+    Returns:
+        Return the most-recently-instantiated manager process-wide, or ``None``.
     """
     return _LAST_PARTITION_MANAGER
 

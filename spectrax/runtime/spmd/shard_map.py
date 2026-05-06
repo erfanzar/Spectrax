@@ -193,17 +193,20 @@ def make_scheduled_body(
     """Build a :func:`jax.shard_map` body that executes ``schedule``.
 
     Args:
-        schedule: Flat or virtual-stage :class:`Schedule`.
-        n_stages: Physical pipeline rank count.
-        microbatches: ``M``.
-        pp_axis: Manual pipeline-parallel mesh axis name.
-        fwd_fn: ``(params, x) -> y`` per microbatch.
-        bwd_fn: ``(params, x, g_y) -> (g_params, g_x)`` per microbatch.
-        loss_and_g_y: ``(y, *targets) -> (loss, g_y)`` terminal rank.
-        mode: Only ``"train"`` supported.
-        checkpoint_policy: If truthy, wrap fwd/bwd in ``jax.checkpoint``.
-        use_scan: Use ``lax.scan`` (compact HLO, scales to 8B+) or
-            Python-unrolled (small-scale only). Default ``False``.
+            schedule: Flat or virtual-stage :class:`Schedule`.
+            n_stages: Physical pipeline rank count.
+            microbatches: ``M``.
+            pp_axis: Manual pipeline-parallel mesh axis name.
+            fwd_fn: ``(params, x) -> y`` per microbatch.
+            bwd_fn: ``(params, x, g_y) -> (g_params, g_x)`` per microbatch.
+            loss_and_g_y: ``(y, *targets) -> (loss, g_y)`` terminal rank.
+            mode: Only ``"train"`` supported.
+            checkpoint_policy: If truthy, wrap fwd/bwd in ``jax.checkpoint``.
+            use_scan: Use ``lax.scan`` (compact HLO, scales to 8B+) or
+                Python-unrolled (small-scale only). Default ``False``.
+
+    Returns:
+        Result described by this helper.
     """
     if mode != "train":
         raise NotImplementedError(f"make_scheduled_body only supports mode='train'; got {mode}.")
@@ -232,7 +235,12 @@ def make_scheduled_body(
 
             @jax.checkpoint
             def _ckpt(p, xi):
-                """Inner checkpoint boundary marking ``_raw_fwd`` for rematerialisation."""
+                """Inner checkpoint boundary marking ``_raw_fwd`` for rematerialisation.
+
+                Args:
+                    p: P value consumed by this operation.
+                    xi: Xi value consumed by this operation.
+                """
                 return _raw_fwd(p, xi)
 
             return _ckpt(params, x)
@@ -251,7 +259,13 @@ def make_scheduled_body(
 
             @jax.checkpoint
             def _ckpt(p, xi, g):
-                """Inner checkpoint boundary for ``_raw_bwd`` under higher-order autodiff."""
+                """Inner checkpoint boundary for ``_raw_bwd`` under higher-order autodiff.
+
+                Args:
+                    p: P value consumed by this operation.
+                    xi: Xi value consumed by this operation.
+                    g: G value consumed by this operation.
+                """
                 return _raw_bwd(p, xi, g)
 
             return _ckpt(params, x, g_y)
@@ -746,15 +760,34 @@ def _make_unrolled_body(
         loss_acc = jnp.zeros((), dtype=jnp.float32)
 
         def si_get(arr, v, mb_idx):
-            """Read ``arr[v, mb_idx]`` (or ``arr[mb_idx]`` when ``V == 1``)."""
+            """Read ``arr[v, mb_idx]`` (or ``arr[mb_idx]`` when ``V == 1``).
+
+            Args:
+                arr: Arr value consumed by this operation.
+                v: V value consumed by this operation.
+                mb_idx: Mb idx value consumed by this operation.
+            """
             return arr[mb_idx] if V == 1 else arr[v, mb_idx]
 
         def si_set(arr, v, mb_idx, val):
-            """Functional write of ``val`` into ``arr[v, mb_idx]`` (or ``arr[mb_idx]``)."""
+            """Functional write of ``val`` into ``arr[v, mb_idx]`` (or ``arr[mb_idx]``).
+
+            Args:
+                arr: Arr value consumed by this operation.
+                v: V value consumed by this operation.
+                mb_idx: Mb idx value consumed by this operation.
+                val: Val value consumed by this operation.
+            """
             return arr.at[mb_idx].set(val) if V == 1 else arr.at[v, mb_idx].set(val)
 
         def g_add(acc, v, upd):
-            """Accumulate ``upd`` into the grad accumulator at virt ``v``."""
+            """Accumulate ``upd`` into the grad accumulator at virt ``v``.
+
+            Args:
+                acc: Acc value consumed by this operation.
+                v: V value consumed by this operation.
+                upd: Upd value consumed by this operation.
+            """
             if V == 1:
                 return jax.tree.map(lambda a, b: a + b, acc, upd)
             return jax.tree.map(lambda a, b: a.at[v].add(b), acc, upd)
@@ -773,11 +806,20 @@ def _make_unrolled_body(
                     x_in_source = xs[mb] if logical == 0 else si_get(incoming_fwd, v, mb)
 
                     def _fwd_branch(x_, _p=p_v):
-                        """Active-rank forward: ``fwd_fn(params, x)``."""
+                        """Active-rank forward: ``fwd_fn(params, x)``.
+
+                        Args:
+                            x_: X  value consumed by this operation.
+                            _p:  p value consumed by this operation.
+                        """
                         return fwd_fn(_p, x_)
 
                     def _fwd_skip(x_):
-                        """Inactive-rank forward: produce zeros so all ranks have a valid out value."""
+                        """Inactive-rank forward: produce zeros so all ranks have a valid out value.
+
+                        Args:
+                            x_: X  value consumed by this operation.
+                        """
                         return jnp.zeros_like(x_)
 
                     y = jax.lax.cond(is_my, _fwd_branch, _fwd_skip, x_in_source)
@@ -797,7 +839,13 @@ def _make_unrolled_body(
                     if logical == n_logical - 1:
 
                         def _loss_branch(_so=saved_outputs, _v=v, _mb=mb):
-                            """Active terminal-rank branch: pull saved output, return ``(loss, g_y)``."""
+                            """Active terminal-rank branch: pull saved output, return ``(loss, g_y)``.
+
+                            Args:
+                                _so:  so value consumed by this operation.
+                                _v:  v value consumed by this operation.
+                                _mb:  mb value consumed by this operation.
+                            """
                             y_out = si_get(_so, _v, _mb)
                             loss_mb, g_y_mb = loss_and_g_y(y_out, *(t_arr[_mb] for t_arr in targets))
                             return loss_mb.astype(jnp.float32), g_y_mb
@@ -815,12 +863,22 @@ def _make_unrolled_body(
                     x_saved = si_get(saved_inputs, v, mb)
 
                     def _bwd_branch(args, _p=p_v):
-                        """Active-rank backward: ``bwd_fn(params, x_saved, g_y) -> (g_p, g_x)``."""
+                        """Active-rank backward: ``bwd_fn(params, x_saved, g_y) -> (g_p, g_x)``.
+
+                        Args:
+                            args: Positional arguments forwarded to the wrapped callable.
+                            _p:  p value consumed by this operation.
+                        """
                         x_, g_ = args
                         return bwd_fn(_p, x_, g_)
 
                     def _bwd_skip(args, _p=p_v):
-                        """Inactive-rank backward: zero param-grads and zero input-grad."""
+                        """Inactive-rank backward: zero param-grads and zero input-grad.
+
+                        Args:
+                            args: Positional arguments forwarded to the wrapped callable.
+                            _p:  p value consumed by this operation.
+                        """
                         x_, _g = args
                         return (jax.tree.map(jnp.zeros_like, _p), jnp.zeros_like(x_))
 

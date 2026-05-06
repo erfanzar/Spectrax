@@ -58,6 +58,12 @@ def _freeze_static(x: object) -> object:
     Dicts become sorted-tuple-of-pairs, lists become tuples,
     :class:`Static` markers are preserved (with their value frozen
     through as well). Everything else is returned unchanged.
+
+    Args:
+        x: Input value consumed by the operation.
+
+    Returns:
+        Result described by this helper.
     """
     if isinstance(x, dict):
         return tuple(sorted((k, _freeze_static(v)) for k, v in x.items()))
@@ -93,7 +99,11 @@ class ModuleNode:
     opaque: tuple[tuple[str], ...] = ()
 
     def __hash__(self) -> int:
-        """Structural hash across all fields."""
+        """Structural hash across all fields.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash((self.class_name, self.static_fields, self.children, self.container_kind, self.opaque))
 
 
@@ -113,7 +123,11 @@ class VarNode:
     metadata: tuple[tuple[str], ...]
 
     def __hash__(self) -> int:
-        """Structural hash across all fields."""
+        """Structural hash across all fields.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash((self.class_name, self.collection, self.metadata))
 
 
@@ -158,6 +172,9 @@ class GraphDef:
         dispatch hot path looks up a per-call cache keyed by
         ``hash(gdef)``; caching the scalar skips the recursive tuple
         walk across the entire node list on every step.
+
+        Returns:
+            Result described by this helper.
         """
         cached = self.__dict__.get("_hash")
         if cached is not None:
@@ -175,7 +192,14 @@ class GraphDef:
         return h
 
     def __eq__(self, other: object) -> bool:
-        """Structural equality."""
+        """Structural equality.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if not isinstance(other, GraphDef):
             return NotImplemented
         return (
@@ -210,6 +234,12 @@ def _container_kind(m: Module) -> str:
     Consults the ``_spx_container_kind`` class attribute, which
     subclasses override to declare themselves a specific container kind
     ("list", "dict", "sequential", or the default "module").
+
+    Args:
+        m: M value consumed by this operation.
+
+    Returns:
+        Return the :attr:`ModuleNode.container_kind` string for ``m``.
     """
     return getattr(type(m), "_spx_container_kind", "module")
 
@@ -219,6 +249,12 @@ def _metadata_tuple(v: Variable) -> tuple[tuple[str], ...]:
 
     Non-hashable metadata values are dropped silently so that the
     resulting :class:`VarNode` remains hashable.
+
+    Args:
+        v: V value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     out: list[tuple[str]] = []
     for k in sorted(v.metadata):
@@ -231,8 +267,17 @@ def _metadata_tuple(v: Variable) -> tuple[tuple[str], ...]:
     return tuple(out)
 
 
-def _leaf_sort_key(entry: tuple[str, str, Variable]) -> tuple[tuple[bool, int | str], tuple[tuple[bool, int | str], ...]]:
-    """Return the same deterministic order used by :class:`State` flattening."""
+def _leaf_sort_key(
+    entry: tuple[str, str, Variable],
+) -> tuple[tuple[bool, int | str], tuple[tuple[bool, int | str], ...]]:
+    """Return the same deterministic order used by :class:`State` flattening.
+
+    Args:
+        entry: Entry value consumed by this operation.
+
+    Returns:
+        Return the same deterministic order used by :class:`State` flattening.
+    """
     kind, path, _var = entry
     return _sort_key(kind), tuple(_sort_key(part) for part in str_to_path(path))
 
@@ -242,7 +287,16 @@ def _build_export_cache(
     gdef: GraphDef,
     var_entries_tuple: tuple[tuple[str, str, Variable], ...],
 ) -> tuple[object, ...]:
-    """Build the cached export metadata shared by :func:`export` and :func:`bind`."""
+    """Build the cached export metadata shared by :func:`export` and :func:`bind`.
+
+    Args:
+        epoch: Epoch value consumed by this operation.
+        gdef: Gdef value consumed by this operation.
+        var_entries_tuple: Var entries tuple value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     sorted_var_entries = tuple(sorted(var_entries_tuple, key=_leaf_sort_key))
     path_sorted_var_entries = tuple(sorted(var_entries_tuple, key=lambda entry: entry[1]))
     vars_by_path = {(kind, path): v for kind, path, v in var_entries_tuple}
@@ -308,10 +362,18 @@ def export(module: Module) -> tuple[GraphDef, State]:
         each path in the state is paired with the writer for its
         original :class:`Variable`, so :func:`bind` can push the new
         value back without re-walking the tree.
+
+        Args:
+            var: Var value consumed by this operation.
         """
 
         def writer(new_value: object, _var: Variable = var) -> None:
-            """Write ``new_value`` into the captured ``Variable``."""
+            """Write ``new_value`` into the captured ``Variable``.
+
+            Args:
+                new_value: New value value consumed by this operation.
+                _var:  var value consumed by this operation.
+            """
             _var.value = new_value
 
         return writer
@@ -321,6 +383,12 @@ def export(module: Module) -> tuple[GraphDef, State]:
 
         *value* may be a raw array or a :class:`~spectrax.Variable`; in the
         latter case ``._raw_get()`` is called to extract the stored array.
+
+        Args:
+            entries: Entries value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         out: dict[str, object] = {}
         for path_str, value in entries:
@@ -352,7 +420,15 @@ def export(module: Module) -> tuple[GraphDef, State]:
     var_entries: list[tuple[str, str, Variable]] = []
 
     def walk(obj: Module | Variable, path: Path) -> int:
-        """Recursive traversal: register ``obj``, descend, return node index."""
+        """Recursive traversal: register ``obj``, descend, return node index.
+
+        Args:
+            obj: Object inspected or transformed by the helper.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if isinstance(obj, Module):
             obj_id = id(obj)
             if obj_id in in_progress:
@@ -479,7 +555,14 @@ def bind(graphdef: GraphDef, state: State) -> Module:
     built_modules: dict[int, Module] = {}
 
     def build_module(node_idx: int) -> Module:
-        """Reconstruct the module at ``node_idx``, memoized for shared subtrees."""
+        """Reconstruct the module at ``node_idx``, memoized for shared subtrees.
+
+        Args:
+            node_idx: Node idx value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if node_idx in built_modules:
             return built_modules[node_idx]
         node = graphdef.nodes[node_idx]
@@ -618,12 +701,22 @@ def _collect_variables_by_ref(module: Module) -> dict[int, Variable]:
     live ``ref_id``.
 
     Ignores duplicate reaches of the same variable.
+
+    Args:
+        module: SpectraX module instance operated on by the helper.
+
+    Returns:
+        Result described by this helper.
     """
     out: dict[int, Variable] = {}
     seen: set[int] = set()
 
     def walk(obj: Module | Variable) -> None:
-        """Recursive traversal helper."""
+        """Recursive traversal helper.
+
+        Args:
+            obj: Object inspected or transformed by the helper.
+        """
         if isinstance(obj, Module):
             mid = id(obj)
             if mid in seen:
@@ -662,7 +755,12 @@ def live_variables(module: Module) -> list[tuple[str, Variable]]:
     seen_vars: set[int] = set()
 
     def walk(obj: Module | Variable, path: Path) -> None:
-        """Walk the live module tree assigning first-seen canonical paths."""
+        """Walk the live module tree assigning first-seen canonical paths.
+
+        Args:
+            obj: Object inspected or transformed by the helper.
+            path: Logical or filesystem path used by the operation.
+        """
         if isinstance(obj, Module):
             mid = id(obj)
             if mid in seen_mods:
@@ -773,6 +871,9 @@ def find(
 def _check_static_field_value(v: object) -> None:
     """Raise :class:`GraphStructureError` if ``v`` is not a permissible
     static field value (static scalar or :class:`Opaque`).
+
+    Args:
+        v: V value consumed by this operation.
     """
     if not is_static_scalar(v) and not isinstance(v, Opaque):
         raise GraphStructureError(f"Static field has non-hashable value: {type(v).__name__}")
@@ -826,7 +927,12 @@ def iter_modules(
     out: list[tuple[str, Module]] = []
 
     def walk(m: Module, path: Path) -> None:
-        """Recursive helper: memoize by ``id`` and descend into child modules."""
+        """Recursive helper: memoize by ``id`` and descend into child modules.
+
+        Args:
+            m: M value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+        """
         mid = id(m)
         if mid in seen:
             return
@@ -889,7 +995,15 @@ def pop(module: Module, selector: object) -> State:
     to_delete: list[tuple[Module, str | int, bool]] = []
 
     def find_parents(m: Module, var: Variable) -> tuple[Module, str | int, bool] | None:
-        """Return ``(owner, attr_name)`` of ``var`` in ``m``'s subtree, or None."""
+        """Return ``(owner, attr_name)`` of ``var`` in ``m``'s subtree, or None.
+
+        Args:
+            m: M value consumed by this operation.
+            var: Var value consumed by this operation.
+
+        Returns:
+            Return ``(owner, attr_name)`` of ``var`` in ``m``'s subtree, or None.
+        """
         if not hasattr(m, "_spx_graph_children"):
             return None
         is_container_item = _container_kind(m) != "module"

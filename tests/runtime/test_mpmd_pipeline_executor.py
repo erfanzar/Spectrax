@@ -20,6 +20,23 @@ class _FakeSubmesh:
         return False
 
 
+class _RecordingSubmesh(_FakeSubmesh):
+    def __init__(self):
+        super().__init__()
+        self.active = 0
+        self.enter_count = 0
+
+    def __enter__(self):
+        super().__enter__()
+        self.active += 1
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.active -= 1
+        return super().__exit__(exc_type, exc, tb)
+
+
 def _fake_sxjit(stage0_delay: float = 0.0, stage1_delay: float = 0.0):
     sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     submesh = _FakeSubmesh()
@@ -58,6 +75,45 @@ def _fake_sxjit(stage0_delay: float = 0.0, stage1_delay: float = 0.0):
 
     fn._mpmd_prepare = prepare
     return fn
+
+
+def _mesh_asserting_sxjit():
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    submesh0 = _RecordingSubmesh()
+    submesh1 = _RecordingSubmesh()
+
+    def stage0(x):
+        assert submesh0.active > 0
+        return (x + 1,)
+
+    def stage1(x):
+        assert submesh1.active > 0
+        return (x * 2,)
+
+    state = {
+        "compiled": [
+            (stage0, submesh0, sharding, None, [("orig", 0)]),
+            (stage1, submesh1, sharding, None, [("stage", 0, 0)]),
+        ],
+        "placed": {},
+        "dynamic": {0},
+        "explicit_in_sh": {},
+        "fn_outvar_map": [(1, 0)],
+        "mpmd_mesh": None,
+        "out_shardings": None,
+        "result_treedef": None,
+    }
+
+    def fn(x):
+        return (x + 1) * 2
+
+    def prepare(*args, **kwargs):
+        del kwargs
+        assert len(args) == 1
+        return state
+
+    fn._mpmd_prepare = prepare
+    return fn, submesh0, submesh1
 
 
 def _fake_stateful_sxjit(stage0_delay: float = 0.0, stage1_delay: float = 0.0):
@@ -177,4 +233,30 @@ def test_mpmd_pipeline_executor_default_inline_wavefront_preserves_order():
     assert got == [2, 4, 6, 8]
     assert executor.last_stats.stage_launches == 8
     assert executor.last_stats.microbatches == 4
+    executor.shutdown()
+
+
+def test_mpmd_pipeline_executor_enters_stage_submesh_for_every_launch():
+    executor = MpmdPipelineExecutor()
+    fn, submesh0, submesh1 = _mesh_asserting_sxjit()
+
+    out = executor.dispatch(fn, jnp.array([1, 2, 3], dtype=jnp.int32))
+
+    np.testing.assert_array_equal(np.asarray(out), np.array([4, 6, 8], dtype=np.int32))
+    assert submesh0.enter_count == 1
+    assert submesh1.enter_count == 1
+    executor.shutdown()
+
+
+def test_mpmd_pipeline_executor_workers_enter_stage_submesh_for_every_launch():
+    executor = MpmdPipelineExecutor(use_workers=True)
+    fn, submesh0, submesh1 = _mesh_asserting_sxjit()
+    batches = [(jnp.array([i], dtype=jnp.int32),) for i in range(4)]
+
+    outs = executor.dispatch_many(fn, batches)
+
+    got = [int(np.asarray(out)[0]) for out in outs]
+    assert got == [2, 4, 6, 8]
+    assert submesh0.enter_count == 4
+    assert submesh1.enter_count == 4
     executor.shutdown()

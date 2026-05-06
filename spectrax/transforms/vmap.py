@@ -163,6 +163,13 @@ def vmap(
         call returns, declared-mutable updates are written back to the
         live modules via
         :func:`~spectrax.transforms.split_merge.apply_mutations`.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         if kwargs:
             refs, stripped_args, stripped_kwargs = locate_and_strip(args, kwargs)

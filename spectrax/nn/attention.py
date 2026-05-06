@@ -385,6 +385,20 @@ class CausalSelfAttention(Module):
 
         All keyword arguments are forwarded unchanged. See
         :meth:`MultiheadAttention.__init__` for their meaning.
+
+        Args:
+            embed_dim: Embed dim value consumed by this operation.
+            num_heads: Num heads value consumed by this operation.
+            dropout: Dropout value consumed by this operation.
+            use_bias: Use bias value consumed by this operation.
+            rngs: Random-number generator collection used to initialize or run the module.
+            dtype: Array dtype requested for the produced value.
+            param_dtype: Param dtype value consumed by this operation.
+            qkv_sharding: Qkv sharding value consumed by this operation.
+            out_sharding: Out sharding value consumed by this operation.
+            qkv_bias_sharding: Qkv bias sharding value consumed by this operation.
+            out_bias_sharding: Out bias sharding value consumed by this operation.
+            cache_sharding: Cache sharding value consumed by this operation.
         """
         super().__init__()
         self.attn = MultiheadAttention(

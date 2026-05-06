@@ -31,7 +31,16 @@ def uniform(scale: float = 1.0) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Draw ``jax.random.uniform(key, shape, minval=-scale, maxval=scale)``."""
+        """Draw ``jax.random.uniform(key, shape, minval=-scale, maxval=scale)``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         return jax.random.uniform(key, shape, dtype=dtype, minval=-scale, maxval=scale)
 
     return init

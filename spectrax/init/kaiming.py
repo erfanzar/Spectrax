@@ -76,7 +76,16 @@ def kaiming_uniform(nonlinearity: str = "relu", mode: str = "fan_in") -> Initial
     gain = _gain(nonlinearity)
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Uniformly sample scaled by the Kaiming bound."""
+        """Uniformly sample scaled by the Kaiming bound.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         fan_in, fan_out = _fan_in_fan_out(shape)
         fan = fan_in if mode == "fan_in" else fan_out
         bound = gain * math.sqrt(3.0 / max(fan, 1))
@@ -105,7 +114,16 @@ def kaiming_normal(nonlinearity: str = "relu", mode: str = "fan_in") -> Initiali
     gain = _gain(nonlinearity)
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Normal sample scaled by the Kaiming std."""
+        """Normal sample scaled by the Kaiming std.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         fan_in, fan_out = _fan_in_fan_out(shape)
         fan = fan_in if mode == "fan_in" else fan_out
         std = gain / math.sqrt(max(fan, 1))

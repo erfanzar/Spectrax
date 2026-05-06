@@ -249,7 +249,11 @@ class _HashableSchedule:
     __slots__ = ("schedule",)
 
     def __init__(self, schedule: object) -> None:
-        """Store ``schedule`` unchanged; comparisons and hashes go by ``id``."""
+        """Store ``schedule`` unchanged; comparisons and hashes go by ``id``.
+
+        Args:
+            schedule: Pipeline schedule object controlling forward/backward execution order.
+        """
         self.schedule = schedule
 
     def __hash__(self) -> int:
@@ -260,15 +264,29 @@ class _HashableSchedule:
         schedule instances with the same field values still collide
         only if they happen to live at the same Python ``id`` (which
         would require GC reuse).
+
+        Returns:
+            Result described by this helper.
         """
         return id(self.schedule)
 
     def __eq__(self, other: object) -> bool:
-        """Two wrappers are equal iff they hold the same schedule instance."""
+        """Two wrappers are equal iff they hold the same schedule instance.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return isinstance(other, _HashableSchedule) and self.schedule is other.schedule
 
     def __repr__(self) -> str:
-        """Pass through the underlying schedule's repr for readability."""
+        """Pass through the underlying schedule's repr for readability.
+
+        Returns:
+            Result described by this helper.
+        """
         return f"_HashableSchedule({self.schedule!r})"
 
 
@@ -284,19 +302,38 @@ class _HashableOps:
     __slots__ = ("ops",)
 
     def __init__(self, ops: tuple) -> None:
-        """Store the ops tuple; equality follows the contained operation values."""
+        """Store the ops tuple; equality follows the contained operation values.
+
+        Args:
+            ops: Ops value consumed by this operation.
+        """
         self.ops = ops
 
     def __hash__(self) -> int:
-        """Hash by operation values so equivalent op tuples share cache entries."""
+        """Hash by operation values so equivalent op tuples share cache entries.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash(self.ops)
 
     def __eq__(self, other: object) -> bool:
-        """Two wrappers are equal iff their operation tuples are equal."""
+        """Two wrappers are equal iff their operation tuples are equal.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return isinstance(other, _HashableOps) and self.ops == other.ops
 
     def __repr__(self) -> str:
-        """Render the wrapper as ``_HashableOps(<ops repr>)`` for debugging."""
+        """Render the wrapper as ``_HashableOps(<ops repr>)`` for debugging.
+
+        Returns:
+            Result described by this helper.
+        """
         return f"_HashableOps({self.ops!r})"
 
 
@@ -321,6 +358,19 @@ def _pscan_impl(
     fallback is used for debugging / single-device smoke tests.
 
     ``args`` layout: ``(*consts, *init_state)``.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        fn_jaxpr: Fn jaxpr value consumed by this operation.
+        loss_jaxpr: Loss jaxpr value consumed by this operation.
+        body_mode: Body mode value consumed by this operation.
+        grad_tree: Grad tree value consumed by this operation.
+        ops: Ops value consumed by this operation.
+        n_mubatches: N mubatches value consumed by this operation.
+        n_consts: N consts value consumed by this operation.
+        schedule: Pipeline schedule object controlling forward/backward execution order.
+        n_outs: N outs value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del body_mode, grad_tree, loss_jaxpr, schedule, n_outs, fn_jaxpr, ops
     consts = list(args[:n_consts])
@@ -346,18 +396,46 @@ def _pscan_abstract(
     schedule,
     n_outs,
 ):
-    """Abstract eval: output avals are the body's outvars (loop state)."""
+    """Abstract eval: output avals are the body's outvars (loop state).
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        fn_jaxpr: Fn jaxpr value consumed by this operation.
+        loss_jaxpr: Loss jaxpr value consumed by this operation.
+        body_mode: Body mode value consumed by this operation.
+        grad_tree: Grad tree value consumed by this operation.
+        ops: Ops value consumed by this operation.
+        n_mubatches: N mubatches value consumed by this operation.
+        n_consts: N consts value consumed by this operation.
+        schedule: Pipeline schedule object controlling forward/backward execution order.
+        n_outs: N outs value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del args, body_mode, fn_jaxpr, grad_tree, loss_jaxpr, ops, n_mubatches, n_consts, schedule, n_outs
     return [v.aval for v in jaxpr.jaxpr.outvars]
 
 
 def _unwrap_schedule(schedule: object) -> object:
-    """Return the underlying schedule object from a :class:`_HashableSchedule` wrapper."""
+    """Return the underlying schedule object from a :class:`_HashableSchedule` wrapper.
+
+    Args:
+        schedule: Pipeline schedule object controlling forward/backward execution order.
+
+    Returns:
+        Return the underlying schedule object from a :class:`_HashableSchedule` wrapper.
+    """
     return schedule.schedule if isinstance(schedule, _HashableSchedule) else schedule
 
 
 def _unwrap_ops(ops: object) -> tuple:
-    """Return the underlying ops tuple from a :class:`_HashableOps` wrapper."""
+    """Return the underlying ops tuple from a :class:`_HashableOps` wrapper.
+
+    Args:
+        ops: Ops value consumed by this operation.
+
+    Returns:
+        Return the underlying ops tuple from a :class:`_HashableOps` wrapper.
+    """
     return ops.ops if isinstance(ops, _HashableOps) else tuple(ops)
 
 
@@ -380,7 +458,21 @@ def _pscan_lowering(
     When ``sxjit`` doesn't intercept the ``pscan_p`` equation (e.g.
     the user called ``jax.jit`` on a ``treduce``-containing function
     directly), we fall back to an unrolled loop in HLO. Not optimal
-    for pipeline parallelism but numerically correct.
+        for pipeline parallelism but numerically correct.
+
+    Args:
+        ctx: Ctx value consumed by this operation.
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        fn_jaxpr: Fn jaxpr value consumed by this operation.
+        loss_jaxpr: Loss jaxpr value consumed by this operation.
+        body_mode: Body mode value consumed by this operation.
+        grad_tree: Grad tree value consumed by this operation.
+        ops: Ops value consumed by this operation.
+        n_mubatches: N mubatches value consumed by this operation.
+        n_consts: N consts value consumed by this operation.
+        schedule: Pipeline schedule object controlling forward/backward execution order.
+        n_outs: N outs value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del body_mode, ctx, args, fn_jaxpr, grad_tree, jaxpr, loss_jaxpr, ops, n_mubatches, n_consts, schedule, n_outs
     raise NotImplementedError(
@@ -394,7 +486,14 @@ mlir.register_lowering(pscan_p, _pscan_lowering)
 
 
 def _is_scalar_aval(aval: object) -> bool:
-    """Return ``True`` iff ``aval`` is a rank-0 array-like abstract value."""
+    """Return ``True`` iff ``aval`` is a rank-0 array-like abstract value.
+
+    Args:
+        aval: Aval value consumed by this operation.
+
+    Returns:
+        Return ``True`` iff ``aval`` is a rank-0 array-like abstract value.
+    """
     return hasattr(aval, "shape") and tuple(aval.shape) == ()
 
 
@@ -407,7 +506,14 @@ def _prune_closed_jaxpr_to_outputs(
     Constvars and invars are preserved so the resulting closed jaxpr keeps the
     same call signature as the original body trace. This lets the compiled MPMD
     path reuse the same resolved consts while dropping dead reverse-pass eqns
-    from pre-differentiated bodies.
+        from pre-differentiated bodies.
+
+    Args:
+        closed_jaxpr: Closed JAXPR being inspected, rewritten, split, or executed.
+        keep_outvars: Keep outvars value consumed by this operation.
+
+    Returns:
+        Return ``closed_jaxpr`` pruned to the dataflow needed for ``keep_outvars``.
     """
     needed: set[int] = {id(v) for v in keep_outvars}
     kept_rev: list[object] = []
@@ -438,8 +544,15 @@ def _probe_body(
 
     Supported conventions:
 
-    * scalar loss: ``fun(i) -> scalar``
-    * pre-differentiated: ``fun(i) -> (scalar, grads_pytree)``
+        * scalar loss: ``fun(i) -> scalar``
+        * pre-differentiated: ``fun(i) -> (scalar, grads_pytree)``
+
+    Args:
+        fun: Fun value consumed by this operation.
+        probe_idx: Probe idx value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     out_shape = jax.eval_shape(fun, probe_idx)
     fn_jaxpr = jax.make_jaxpr(fun)(probe_idx)
@@ -501,7 +614,14 @@ def treduce(
     length = flat_leaves[0].shape[axis]
 
     def wrap(i: jax.Array) -> object:
-        """Select the ``i``-th microbatch from ``xs`` and call ``fun``."""
+        """Select the ``i``-th microbatch from ``xs`` and call ``fun``.
+
+        Args:
+            i: I value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         mb = jax.tree.map(lambda arr: jax.lax.dynamic_index_in_dim(arr, i, axis=axis, keepdims=False), xs)
         return fun(mb)
 
@@ -562,7 +682,11 @@ def treduce_i(
     init_state = [op.state(aval) for op, aval in zip(ops, out_avals, strict=True)]
 
     def body_wrapped(*args):
-        """Call ``fun(i)`` and fold each output into the running accumulator via ``ops``."""
+        """Call ``fun(i)`` and fold each output into the running accumulator via ``ops``.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+        """
         i = args[0]
         state = list(args[1:])
         outs = list(jax.tree.leaves(fun(i)))

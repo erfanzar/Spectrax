@@ -72,13 +72,24 @@ _ref_lock = threading.Lock()
 
 
 def _fresh_ref_id() -> int:
-    """Allocate a fresh process-unique ``ref_id`` (thread-safe)."""
+    """Allocate a fresh process-unique ``ref_id`` (thread-safe).
+
+    Returns:
+        Result described by this helper.
+    """
     with _ref_lock:
         return next(_REF_COUNTER)
 
 
 def _maybe_stamped_sharding(value: object) -> Sharding | None:
-    """Return any initializer-stamped sharding metadata on ``value``."""
+    """Return any initializer-stamped sharding metadata on ``value``.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return any initializer-stamped sharding metadata on ``value``.
+    """
     stamped = getattr(value, "_spx_sharding", None)
     return normalize_sharding(stamped) if stamped is not None else None
 
@@ -90,6 +101,12 @@ def _existing_value_sharding(value: object) -> object | None:
     ``find_progenitors`` over the entire jaxpr, which is O(jaxpr-size)
     per call and O(N^2) when initializing many variables inside one
     ``jax.eval_shape`` (e.g. lazy model construction). Skip them.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return the concrete sharding already carried by ``value``, if any.
     """
     if isinstance(value, jax.core.Tracer):
         return None
@@ -109,12 +126,19 @@ def _set_write_hook(hook: Callable[[Variable], bool] | None) -> None:
 
     Used by the transforms module to redirect writes into the traced
     state carried across the transform boundary.
+
+    Args:
+        hook: Hook value consumed by this operation.
     """
     _WRITE_HOOK.hook = hook
 
 
 def _get_write_hook() -> Callable[[Variable], bool] | None:
-    """Return the currently-installed write hook, or ``None``."""
+    """Return the currently-installed write hook, or ``None``.
+
+    Returns:
+        Return the currently-installed write hook, or ``None``.
+    """
     return getattr(_WRITE_HOOK, "hook", None)
 
 
@@ -127,12 +151,19 @@ def _set_read_hook(hook: Callable[[Variable]] | None) -> None:
     The hook signature is ``hook(var) -> object`` and its return value is
     used in place of the underlying ``_value``. Passing ``None`` restores
     the default eager read behavior.
+
+    Args:
+        hook: Hook value consumed by this operation.
     """
     _READ_HOOK.hook = hook
 
 
 def _get_read_hook() -> Callable[[Variable]] | None:
-    """Return the currently-installed read hook, or ``None``."""
+    """Return the currently-installed read hook, or ``None``.
+
+    Returns:
+        Return the currently-installed read hook, or ``None``.
+    """
     return getattr(_READ_HOOK, "hook", None)
 
 
@@ -187,6 +218,9 @@ def _get_init_placement_hook() -> InitPlacementHook | None:
     :func:`variable_init_placement`. Used by deferred-variable
     materialization to decide where to place a freshly initialized
     leaf (e.g. on a specific stage's sub-mesh).
+
+    Returns:
+        Return the innermost active :class:`InitPlacementHook`, or ``None``.
     """
     stack = getattr(_INIT_PLACEMENT_HOOKS, "stack", ())
     return stack[-1] if stack else None
@@ -294,6 +328,9 @@ class Variable:
 
         If a thread-local read hook is installed it is consulted first;
         otherwise the raw underlying value is returned.
+
+        Returns:
+            Result described by this helper.
         """
         read_hook = _get_read_hook()
         if read_hook is not None:
@@ -327,6 +364,9 @@ class Variable:
 
         Used by the graph / transform machinery that must not be
         redirected by its own hooks.
+
+        Returns:
+            Return the underlying value, bypassing any installed hooks.
         """
         return self._value
 
@@ -335,6 +375,9 @@ class Variable:
 
         Used by the graph / transform machinery to apply a state patch
         back to a live module after a transform.
+
+        Args:
+            new: New value consumed by this operation.
         """
         self._value = new
 
@@ -361,19 +404,31 @@ class Variable:
 
     @property
     def sharding(self) -> Sharding | None:
-        """Return the :class:`Sharding` from :attr:`metadata` or ``None``."""
+        """Return the :class:`Sharding` from :attr:`metadata` or ``None``.
+
+        Returns:
+            Return the :class:`Sharding` from :attr:`metadata` or ``None``.
+        """
         s = self.metadata.get("sharding")
         return normalize_sharding(s) if s is not None else None
 
     @property
     def axis_names(self) -> AxisNames | None:
-        """Return the logical axis names from :attr:`metadata` or ``None``."""
+        """Return the logical axis names from :attr:`metadata` or ``None``.
+
+        Returns:
+            Return the logical axis names from :attr:`metadata` or ``None``.
+        """
         names = self.metadata.get("axis_names")
         return tuple(names) if names is not None else None
 
     @property
     def stage_assignment(self) -> tuple[int, int] | None:
-        """Return the logical ``(current, total)`` stage hint, if any."""
+        """Return the logical ``(current, total)`` stage hint, if any.
+
+        Returns:
+            Return the logical ``(current, total)`` stage hint, if any.
+        """
         return metadata_stage_assignment(self.metadata)
 
     @property
@@ -383,13 +438,20 @@ class Variable:
         This is the construction-time ``current`` value from
         ``assign_stage(total=..., current=...)``. Use
         :meth:`resolved_stage_index` to map it onto a concrete MPMD mesh.
+
+        Returns:
+            Return the variable's logical stage index within :attr:`stage_count`.
         """
         assignment = self.stage_assignment
         return assignment[0] if assignment is not None else None
 
     @property
     def stage_count(self) -> int | None:
-        """Return the logical number of stage slots the variable was tagged in."""
+        """Return the logical number of stage slots the variable was tagged in.
+
+        Returns:
+            Return the logical number of stage slots the variable was tagged in.
+        """
         assignment = self.stage_assignment
         return assignment[1] if assignment is not None else None
 
@@ -482,6 +544,13 @@ class Variable:
 
         The NumPy 2 ``copy`` keyword is accepted and ignored; copy
         semantics are delegated to :func:`jax.numpy.asarray`.
+
+        Args:
+            dtype: Array dtype requested for the produced value.
+            copy: Copy value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         del copy
         v = self.value
@@ -496,27 +565,46 @@ class Variable:
         registration handles that.  This method is only invoked on concrete
         values (or tracers inside a jitted function) and makes Variables
         transparently array-like in eager code.
+
+        Returns:
+            Result described by this helper.
         """
         return self.value
 
     @property
     def shape(self) -> tuple[int, ...]:
-        """Shape of the stored array."""
+        """Shape of the stored array.
+
+        Returns:
+            Result described by this helper.
+        """
         return tuple(self.value.shape)
 
     @property
     def dtype(self) -> object:
-        """Dtype of the stored array."""
+        """Dtype of the stored array.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value.dtype
 
     @property
     def ndim(self) -> int:
-        """Rank (number of dimensions) of the stored array."""
+        """Rank (number of dimensions) of the stored array.
+
+        Returns:
+            Result described by this helper.
+        """
         return int(self.value.ndim)
 
     @property
     def size(self) -> int:
-        """Total number of elements in the stored array."""
+        """Total number of elements in the stored array.
+
+        Returns:
+            Result described by this helper.
+        """
         return int(self.value.size)
 
     def astype(self, dtype: DType) -> Array:
@@ -536,6 +624,12 @@ class Variable:
         This lets array methods (``transpose``, ``reshape``, ``swapaxes``,
         ``flatten``, ``ravel``, …) and properties (``T``, ``device``, …)
         work transparently without explicitly unwrapping ``.value``.
+
+        Args:
+            name: Name used for lookup, logging, or registration.
+
+        Returns:
+            Result described by this helper.
         """
         if name.startswith("_"):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
@@ -543,105 +637,254 @@ class Variable:
 
     @staticmethod
     def _v(other: object) -> object:
-        """Unwrap a :class:`Variable` (or pass through) for arithmetic ops."""
+        """Unwrap a :class:`Variable` (or pass through) for arithmetic ops.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return other.value if isinstance(other, Variable) else other
 
     def __pos__(self) -> Array:
-        """Unary ``+``."""
+        """Unary ``+``.
+
+        Returns:
+            Result described by this helper.
+        """
         return +self.value
 
     def __neg__(self) -> Array:
-        """Unary ``-``."""
+        """Unary ``-``.
+
+        Returns:
+            Result described by this helper.
+        """
         return -self.value
 
     def __abs__(self) -> Array:
-        """``abs(var)``."""
+        """``abs(var)``.
+
+        Returns:
+            Result described by this helper.
+        """
         return abs(self.value)
 
     def __add__(self, o: object) -> Array:
-        """``var + o``."""
+        """``var + o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value + self._v(o)
 
     def __radd__(self, o: object) -> Array:
-        """``o + var``."""
+        """``o + var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) + self.value
 
     def __sub__(self, o: object) -> Array:
-        """``var - o``."""
+        """``var - o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value - self._v(o)
 
     def __rsub__(self, o: object) -> Array:
-        """``o - var``."""
+        """``o - var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) - self.value
 
     def __mul__(self, o: object) -> Array:
-        """``var * o``."""
+        """``var * o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value * self._v(o)
 
     def __rmul__(self, o: object) -> Array:
-        """``o * var``."""
+        """``o * var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) * self.value
 
     def __truediv__(self, o: object) -> Array:
-        """``var / o``."""
+        """``var / o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value / self._v(o)
 
     def __rtruediv__(self, o: object) -> Array:
-        """``o / var``."""
+        """``o / var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) / self.value
 
     def __floordiv__(self, o: object) -> Array:
-        """``var // o``."""
+        """``var // o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value // self._v(o)
 
     def __mod__(self, o: object) -> Array:
-        """``var % o``."""
+        """``var % o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value % self._v(o)
 
     def __pow__(self, o: object) -> Array:
-        """``var ** o``."""
+        """``var ** o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value ** self._v(o)
 
     def __rpow__(self, o: object) -> Array:
-        """``o ** var``."""
+        """``o ** var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) ** self.value
 
     def __matmul__(self, o: object) -> Array:
-        """``var @ o``."""
+        """``var @ o``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.value @ self._v(o)
 
     def __rmatmul__(self, o: object) -> Array:
-        """``o @ var``."""
+        """``o @ var``.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._v(o) @ self.value
 
     def __getitem__(self, idx: object) -> Array:
-        """``var[idx]`` — indexes into the stored array."""
+        """``var[idx]`` — indexes into the stored array.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
+        """
         return self.value[idx]
 
     def __eq__(self, o: object) -> bool:
         """Identity-based equality: two Variables compare equal iff their
         ``ref_id`` matches. This keeps :class:`Variable` hashable and
         usable as a dict key.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         if isinstance(o, Variable):
             return self.ref_id == o.ref_id
         return NotImplemented
 
     def __ne__(self, o: object) -> bool:
-        """Inverse of :meth:`__eq__`."""
+        """Inverse of :meth:`__eq__`.
+
+        Args:
+            o: O value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         r = self.__eq__(o)
         return r if r is NotImplemented else not r
 
     def __hash__(self) -> int:
-        """Hash derived from :attr:`ref_id`."""
+        """Hash derived from :attr:`ref_id`.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash(("spectrax.Variable", self.ref_id))
 
     def __bool__(self) -> bool:
-        """``bool(var)`` — delegates to the stored array's truth value."""
+        """``bool(var)`` — delegates to the stored array's truth value.
+
+        Returns:
+            Result described by this helper.
+        """
         return bool(self.value)
 
     def __repr__(self) -> str:
-        """Compact diagnostic repr with class, kind, shape, dtype, ref id."""
+        """Compact diagnostic repr with class, kind, shape, dtype, ref id.
+
+        Returns:
+            Result described by this helper.
+        """
         try:
             shape = tuple(self.value.shape)
             dtype = self.value.dtype
@@ -831,7 +1074,11 @@ class DeferredParameter(Parameter):
 
     @property
     def is_materialized(self) -> bool:
-        """Whether this deferred parameter has been materialized."""
+        """Whether this deferred parameter has been materialized.
+
+        Returns:
+            Result described by this helper.
+        """
         return getattr(self, "_deferred_materialized", False)
 
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
@@ -887,6 +1134,9 @@ class DeferredParameter(Parameter):
         The placeholder lets shape-inference forward passes run before
         the real init has happened. Reading before
         :meth:`resolve_shape` raises :class:`RuntimeError`.
+
+        Returns:
+            Return the materialized array; until materialized, return a zero placeholder.
         """
         if self.is_materialized:
             return super().value
@@ -959,7 +1209,11 @@ class DeferredBuffer(Buffer):
 
     @property
     def is_materialized(self) -> bool:
-        """Whether this deferred buffer has been materialized."""
+        """Whether this deferred buffer has been materialized.
+
+        Returns:
+            Result described by this helper.
+        """
         return getattr(self, "_deferred_materialized", False)
 
     def resolve_shape(self, shape: tuple[int, ...]) -> None:
@@ -1003,7 +1257,11 @@ class DeferredBuffer(Buffer):
 
     @property
     def value(self) -> Array:
-        """Return the materialized array; before materialization, return a zero placeholder."""
+        """Return the materialized array; before materialization, return a zero placeholder.
+
+        Returns:
+            Return the materialized array; before materialization, return a zero placeholder.
+        """
         if self.is_materialized:
             return super().value
         if getattr(self, "_deferred_resolved_shape", None) is None:
@@ -1109,6 +1367,13 @@ def _coerce_value(value: ArrayLike, dtype: DType | None) -> object:
     walks the entire growing jaxpr (``find_progenitors``) — paying
     O(jaxpr-size) per call, O(N^2) when initializing many variables
     inside a single ``jax.eval_shape`` (e.g. lazy model construction).
+
+    Args:
+        value: Value consumed by the helper.
+        dtype: Array dtype requested for the produced value.
+
+    Returns:
+        Result described by this helper.
     """
     if isinstance(value, jax.Array):
         return value.astype(dtype) if dtype is not None else value
@@ -1122,6 +1387,12 @@ def _as_array(value: ArrayLike) -> object:
 
     Pass-through on values that are already traced or unrecognized so
     that abstract tracers flow untouched through layer construction.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Result described by this helper.
     """
     if isinstance(value, np.ndarray | jnp.ndarray | int | float | complex | bool | list | tuple):
         return jnp.asarray(value)
@@ -1129,7 +1400,14 @@ def _as_array(value: ArrayLike) -> object:
 
 
 def _deferred_aux(v: Variable) -> dict[str, object] | None:
-    """Capture DeferredParameter/DeferredBuffer private state for pytree round-trips."""
+    """Capture DeferredParameter/DeferredBuffer private state for pytree round-trips.
+
+    Args:
+        v: V value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if not isinstance(v, DeferredParameter | DeferredBuffer):
         return None
     return {
@@ -1143,7 +1421,12 @@ def _deferred_aux(v: Variable) -> dict[str, object] | None:
 
 
 def _restore_deferred_aux(v: Variable, deferred: dict[str, object] | None) -> None:
-    """Restore DeferredParameter/DeferredBuffer private state captured in aux."""
+    """Restore DeferredParameter/DeferredBuffer private state captured in aux.
+
+    Args:
+        v: V value consumed by this operation.
+        deferred: Deferred value consumed by this operation.
+    """
     if deferred is None:
         return
     object.__setattr__(v, "_deferred_shape_spec", deferred["shape_spec"])
@@ -1158,7 +1441,14 @@ _VariableAux = tuple[type[Variable], str, dict[str, object], int, dict[str, obje
 
 
 def _variable_flatten(v: Variable) -> tuple[list[object], _VariableAux]:
-    """Flatten a Variable to its value leaf."""
+    """Flatten a Variable to its value leaf.
+
+    Args:
+        v: V value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     return ([v.value], (type(v), v.kind, dict(v.metadata), v.ref_id, _deferred_aux(v)))
 
 
@@ -1170,6 +1460,13 @@ def _variable_unflatten(aux: _VariableAux, children: list[object]) -> Variable:
     Metadata, ``ref_id``, and deferred-variable private state are also
     restored so standalone variable pytree round-trips do not corrupt
     sharding/stage metadata or lazy parameter state.
+
+    Args:
+        aux: Aux value consumed by this operation.
+        children: Children value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     cls, kind, metadata, ref_id, deferred = aux
     obj = object.__new__(cls)
@@ -1185,7 +1482,14 @@ def _variable_unflatten(aux: _VariableAux, children: list[object]) -> Variable:
 def _variable_flatten_with_keys(
     v: Variable,
 ) -> tuple[list[tuple[jax.tree_util.KeyEntry, Array]], _VariableAux]:
-    """Keyed flatten for :func:`jax.tree_util.register_pytree_with_keys`."""
+    """Keyed flatten for :func:`jax.tree_util.register_pytree_with_keys`.
+
+    Args:
+        v: V value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     return (
         [(jax.tree_util.GetAttrKey("value"), v.value)],
         (type(v), v.kind, dict(v.metadata), v.ref_id, _deferred_aux(v)),
@@ -1202,7 +1506,11 @@ for _var_cls in (Variable, Parameter, Buffer, DeferredParameter, DeferredBuffer)
 
 
 def _auto_register_init_subclass(cls, **kwargs: object) -> None:
-    """Hook that PyTree-registers every new Variable subclass."""
+    """Hook that PyTree-registers every new Variable subclass.
+
+    Args:
+        **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+    """
     super(Variable, cls).__init_subclass__(**kwargs)
     if cls not in (Variable, Parameter, Buffer, DeferredParameter, DeferredBuffer):
         jax.tree_util.register_pytree_with_keys(

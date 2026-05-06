@@ -37,21 +37,40 @@ class Static(Generic[T]):
     __slots__ = ("value",)
 
     def __init__(self, value: T) -> None:
-        """Wrap ``value`` as a static marker."""
+        """Wrap ``value`` as a static marker.
+
+        Args:
+            value: Value consumed by the helper.
+        """
         self.value = value
 
     def __repr__(self) -> str:
-        """Return ``Static(<repr of value>)``."""
+        """Return ``Static(<repr of value>)``.
+
+        Returns:
+            Return ``Static(<repr of value>)``.
+        """
         return f"Static({self.value!r})"
 
     def __eq__(self, other: object) -> bool:
-        """Structural equality: two markers are equal iff their values are."""
+        """Structural equality: two markers are equal iff their values are.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if isinstance(other, Static):
             return self.value == other.value
         return NotImplemented
 
     def __hash__(self) -> int:
-        """Hash derived from the wrapped value."""
+        """Hash derived from the wrapped value.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash(("spectrax.Static", self.value))
 
 

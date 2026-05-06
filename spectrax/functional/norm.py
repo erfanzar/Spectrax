@@ -102,5 +102,11 @@ def _rsqrt(x: Array) -> Array:
     Implemented as ``1.0 / jnp.sqrt(x)`` rather than via
     :func:`jax.lax.rsqrt` so the autodiff path matches NumPy semantics
     on every backend; XLA still fuses the divide and sqrt on accelerators.
+
+    Args:
+        x: Input value consumed by the operation.
+
+    Returns:
+        Result described by this helper.
     """
     return 1.0 / jnp.sqrt(x)

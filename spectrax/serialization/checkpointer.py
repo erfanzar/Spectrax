@@ -323,6 +323,14 @@ class Checkpointer:
         strict_shapes: bool = True,
         chunk_size: int | None = None,
         can_skip_structure: bool = False,
+        concurrent_gb: int = 32,
+        tensorstore_io_concurrency: int | None = None,
+        tensorstore_copy_concurrency: int | None = None,
+        tensorstore_cache_gb: int | None = None,
+        tensorstore_assume_metadata: bool = False,
+        tensorstore_metadata_workers: int | None = None,
+        show_progress: bool = False,
+        progress_every: int = 10,
     ) -> tuple[PyTree, MetadataDict]:
         """Load a treedef-preserving PyTree saved under a specific prefix.
 
@@ -346,6 +354,18 @@ class Checkpointer:
             can_skip_structure: If ``True``, allow loading array-only
                 TensorStore checkpoints from ``tensorstore_index.json`` when
                 the exact ``{prefix}_structure.json`` sidecar is absent.
+            concurrent_gb: In-flight TensorStore read budget in GiB.
+            tensorstore_io_concurrency: Optional TensorStore file I/O
+                concurrency limit.
+            tensorstore_copy_concurrency: Optional TensorStore data-copy
+                concurrency limit.
+            tensorstore_cache_gb: Optional TensorStore cache-pool size in GiB.
+            tensorstore_assume_metadata: If ``True``, use index shape/dtype
+                metadata to speed TensorStore opens.
+            tensorstore_metadata_workers: Worker count for parallel zarr
+                metadata checks when metadata is not assumed.
+            show_progress: Whether process 0 should render load progress.
+            progress_every: Refresh progress every N loaded tensors.
 
         Returns:
             Tuple of ``(pytree, metadata)``.
@@ -391,6 +411,14 @@ class Checkpointer:
             callback=callback,
             chunk_size=chunk_size,
             can_skip_structure=can_skip_structure,
+            concurrent_gb=concurrent_gb,
+            tensorstore_io_concurrency=tensorstore_io_concurrency,
+            tensorstore_copy_concurrency=tensorstore_copy_concurrency,
+            tensorstore_cache_gb=tensorstore_cache_gb,
+            tensorstore_assume_metadata=tensorstore_assume_metadata,
+            tensorstore_metadata_workers=tensorstore_metadata_workers,
+            show_progress=show_progress,
+            progress_every=progress_every,
         )
 
         if not load_treedef:

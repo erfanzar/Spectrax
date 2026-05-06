@@ -56,6 +56,12 @@ def _enter(values: dict[str, object]) -> Iterator[None]:
     The implementation detail behind :func:`scope`. Uses
     :mod:`contextvars` so the stack is per-task (asyncio-safe) and
     inherited by JAX-traced function bodies.
+
+    Args:
+        values: Values consumed by the helper.
+
+    Returns:
+        Result described by this helper.
     """
     token = _STACK.set((*_STACK.get(), values))
     try:
@@ -147,6 +153,12 @@ def _is_array_like(v: object) -> bool:
     values get folded into the compile cache key. The discriminator is
     deliberately permissive — anything with a ``shape`` attribute is
     array-like.
+
+    Args:
+        v: V value consumed by this operation.
+
+    Returns:
+        Return ``True`` iff ``v`` should be treated as a traced value.
     """
     return hasattr(v, "shape") or hasattr(v, "dtype")
 

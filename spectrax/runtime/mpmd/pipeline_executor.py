@@ -94,7 +94,15 @@ class _MpmdPreparedCallable(tp.Protocol):
     """
 
     def __call__(self, *args: PyTree, **kwargs: PyTree) -> PyTree:
-        """Execute the wrapped function with normal ``sxjit`` semantics."""
+        """Execute the wrapped function with normal ``sxjit`` semantics.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result of invoking the wrapped callable or module.
+        """
         ...
 
     def _mpmd_prepare(self, *args: PyTree) -> _MpmdState:
@@ -105,6 +113,12 @@ class _MpmdPreparedCallable(tp.Protocol):
         output shardings, pre-placed static leaves, and the original result
         treedef. The executor treats this state as immutable for a stable shape
         bucket so repeated decode calls can reuse it.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Return the prepared forward-only MPMD state for ``args``.
         """
         ...
 
@@ -291,7 +305,8 @@ class _StageWorker:
             if task.future.set_running_or_notify_cancel():
                 try:
                     with jax.named_scope(f"spectrax/mpmd/pipeline/worker/stage_{self.rank}"):
-                        out = task.stage_jit(*task.invars)
+                        with task.submesh:
+                            out = task.stage_jit(*task.invars)
                     task.future.set_result(out)
                 except BaseException as exc:
                     task.future.set_exception(exc)
@@ -335,7 +350,11 @@ class MpmdPipelineExecutor:
 
     @property
     def last_stats(self) -> MpmdPipelineDispatchStats:
-        """Return telemetry from the most recent ``dispatch``/``dispatch_many`` call."""
+        """Return telemetry from the most recent ``dispatch``/``dispatch_many`` call.
+
+        Returns:
+            Return telemetry from the most recent ``dispatch``/``dispatch_many`` call.
+        """
         return self._last_stats
 
     def shutdown(self) -> None:
@@ -362,6 +381,13 @@ class MpmdPipelineExecutor:
         do not need wavefront overlap. It still uses the same stage input
         assembly and result reconstruction path, which makes it useful for
         validating pipeline executor correctness against direct ``sxjit`` calls.
+
+        Args:
+            sxjit_fn: Sxjit fn value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         outputs = self.dispatch_many(sxjit_fn, (args,))
         return outputs[0]
@@ -526,7 +552,8 @@ class MpmdPipelineExecutor:
 
                 t_execute_stage = time.time()
                 with jax.named_scope(f"spectrax/mpmd/pipeline/single/stage_{stage_idx}/execute"):
-                    cluster_outputs[stage_idx] = stage_jit(*invars)
+                    with _submesh:
+                        cluster_outputs[stage_idx] = stage_jit(*invars)
                 stage_execute_elapsed = time.time() - t_execute_stage
                 stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
 
@@ -644,7 +671,8 @@ class MpmdPipelineExecutor:
                     )
                 else:
                     with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/execute"):
-                        cluster_outputs[mb_idx][stage_idx] = stage_jit(*invars)
+                        with submesh:
+                            cluster_outputs[mb_idx][stage_idx] = stage_jit(*invars)
                 stage_execute_elapsed = time.time() - t_execute_stage
                 stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
                 stage_submit_elapsed = time.time() - t_submit
@@ -693,6 +721,14 @@ class MpmdPipelineExecutor:
         input ``I`` with output position ``O`` from stage ``S`` of microbatch
         ``N - 1``. This preserves stage-local cache ownership and avoids routing
         one stage's KV state through another stage.
+
+        Args:
+            carry_input_output_map: Carry input output map value consumed by this operation.
+            num_stages: Num stages value consumed by this operation.
+            num_flat_args: Num flat args value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         if not carry_input_output_map:
             return {}
@@ -756,6 +792,15 @@ class MpmdPipelineExecutor:
         runtime-static ones. It also precomputes stage input assembly plans from
         the prepared ``sxjit`` state so decode steps avoid repeatedly scanning
         full invar maps.
+
+        Args:
+            state: SpectraX state tree or transform state passed into the operation.
+            args: Positional arguments forwarded to the wrapped callable.
+            flat_args: Flat args value consumed by this operation.
+            runtime_static_argnums: Runtime static argnums value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         offsets: list[int] = []
         counts: list[int] = []
@@ -799,6 +844,14 @@ class MpmdPipelineExecutor:
         placement, this helper folds them into the plan template. Later decode
         steps only iterate over truly changing slots: KV/cache leaves, metadata,
         and inter-stage activations.
+
+        Args:
+            plan: Plan value consumed by this operation.
+            invars: Invars value consumed by this operation.
+            runtime_static_flat_indices: Runtime static flat indices value consumed by this operation.
+
+        Returns:
+            Return an invar plan with stable dynamic slots pre-filled.
         """
         template = list(plan.template)
         dynamic_slots: list[tuple[int, int]] = []
@@ -855,13 +908,21 @@ class MpmdPipelineExecutor:
 
         EasyDeL passes graph definitions and weight pytrees through the same
         Python call signature for every decode step, but those values are static
-        for a compiled bucket. Reusing their flattened leaves avoids repeatedly
+                for a compiled bucket. Reusing their flattened leaves avoids repeatedly
         walking very large graph/state pytrees on the host.
 
         The method still verifies leaf counts for non-static arguments. A count
         mismatch means the caller changed the bucket shape or argument treedef
         while reusing the same prepare-cache key, which would make Spectrax's
         flat-leaf routing maps invalid.
+
+        Args:
+            entry: Entry value consumed by this operation.
+            args: Positional arguments forwarded to the wrapped callable.
+            runtime_static_argnums: Runtime static argnums value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         static_argnums = self._normalize_runtime_static_argnums(runtime_static_argnums, len(args))
         flat_args = list(entry.flat_args_template)
@@ -934,6 +995,23 @@ class MpmdPipelineExecutor:
         Runtime-static cache information is passed through to the runtime helper
         so graph/weight-like dynamic leaves are placed once per stage and reused
         across decode steps in the same bucket.
+
+        Args:
+            call: Call value consumed by this operation.
+            stage_idx: Stage idx value consumed by this operation.
+            invar_map: Invar map value consumed by this operation.
+            invar_plan: Invar plan value consumed by this operation.
+            my_sh: My sh value consumed by this operation.
+            rank_devices: Rank devices value consumed by this operation.
+            rank_submeshes: Rank submeshes value consumed by this operation.
+            mpmd_mesh: Mpmd mesh value consumed by this operation.
+            prev_outputs: Prev outputs value consumed by this operation.
+            all_cluster_outputs: All cluster outputs value consumed by this operation.
+            runtime_static_flat_indices: Runtime static flat indices value consumed by this operation.
+            runtime_static_cache: Runtime static cache value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         state = call.state
         if invar_plan is not None:
@@ -976,6 +1054,12 @@ class MpmdPipelineExecutor:
         positional input should come from. This method turns those maps into
         compact templates with holes for only dynamic arguments and inter-stage
         transfers, shaving Python branching out of hot decode dispatch.
+
+        Args:
+            state: SpectraX state tree or transform state passed into the operation.
+
+        Returns:
+            Result described by this helper.
         """
         compiled: list[_CompiledStage] = state["compiled"]
         return tuple(
@@ -1029,6 +1113,14 @@ class MpmdPipelineExecutor:
 
         Returning ``None`` is allowed for host-only/unit-test fakes where the
         transfer helper never needs to resolve a real marker edge sharding.
+
+        Args:
+            state: SpectraX state tree or transform state passed into the operation.
+            rank_submeshes: Rank submeshes value consumed by this operation.
+            sxjit_fn: Sxjit fn value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         mpmd_mesh = state.get("mpmd_mesh")
         if mpmd_mesh is not None:
@@ -1057,6 +1149,9 @@ class MpmdPipelineExecutor:
         worker is named and logically associated with one rank. Rebuilding also
         clears the prepare cache through ``shutdown`` so a caller cannot
         accidentally reuse state prepared for a different physical pipeline.
+
+        Args:
+            worker_count: Worker count value consumed by this operation.
         """
         if self._worker_count == worker_count and len(self._workers) == worker_count:
             return

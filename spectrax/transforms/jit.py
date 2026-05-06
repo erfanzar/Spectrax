@@ -324,13 +324,13 @@ def jit(
         Two-level cache:
 
         1. Identity cache (``_id_cache``) keyed by the Python ``id``
-           tuple of the input modules plus the current global graph
-           epoch. Hot path: same model instance + no structural change
-           returns the cached jitted callable in O(1) without ever
-           touching the graph-def hash.
+            tuple of the input modules plus the current global graph
+        epoch. Hot path: same model instance + no structural change
+        returns the cached jitted callable in O(1) without ever
+        touching the graph-def hash.
         2. Structural cache (``_compile_cache``) keyed by the full
-           graph-def tuple. Handles model swaps, reloads, and distinct
-           instances with identical structure.
+            graph-def tuple. Handles model swaps, reloads, and distinct
+        instances with identical structure.
 
         A kwargs-empty fast path uses :func:`locate_and_strip_fast`
         which does a single pass over ``args`` and skips the kwargs
@@ -345,6 +345,13 @@ def jit(
         no-scope hot path above is completely unaffected — a single
         :class:`~contextvars.ContextVar` read (~50 ns) decides which
         path to take.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         ctx_stack = _ctx_stack_get()
         if ctx_stack:
@@ -454,6 +461,14 @@ def jit(
         :func:`make_pure_ctx` so deep ``spx.scope.get(...)`` calls
         inside the traced body resolve to tracers rather than the
         constants captured at the trace-time snapshot.
+
+        Args:
+            ctx_stack: Ctx stack value consumed by this operation.
+            args: Positional arguments forwarded to the wrapped callable.
+            kwargs: Keyword arguments forwarded to the wrapped callable.
+
+        Returns:
+            Result described by this helper.
         """
         snap: dict[str, object] = {}
         for frame in ctx_stack:
@@ -488,6 +503,13 @@ def jit(
         :func:`~spectrax.transforms.split_merge.apply_mutations`) are
         skipped — lowering is purely about preparing the compiled
         artifact.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         ctx_stack = _ctx_stack_get()
         if ctx_stack:
@@ -568,6 +590,12 @@ def _is_mpmd_mesh(mesh: object) -> bool:
     Treats either an explicit ``is_mpmd`` boolean attribute or the
     structural duck-typing trio (``mpmd_dim``, ``submesh``,
     ``sub_sharding``) as evidence of an MPMD mesh.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return whether ``mesh`` is an MPMD mesh requiring the ``sxjit`` runtime.
     """
     return bool(getattr(mesh, "is_mpmd", False)) or (
         hasattr(mesh, "mpmd_dim") and hasattr(mesh, "submesh") and hasattr(mesh, "sub_sharding")
@@ -575,14 +603,28 @@ def _is_mpmd_mesh(mesh: object) -> bool:
 
 
 def _normalize_argnums_for_sxjit(argnums: int | Sequence[int] | None) -> int | tuple[int, ...] | None:
-    """Coerce ``argnums`` into the ``None``/``int``/``tuple`` shape ``sxjit`` accepts."""
+    """Coerce ``argnums`` into the ``None``/``int``/``tuple`` shape ``sxjit`` accepts.
+
+    Args:
+        argnums: Argnums value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if argnums is None or isinstance(argnums, int):
         return argnums
     return tuple(argnums)
 
 
 def _normalize_argnames_for_sxjit(argnames: str | Iterable[str] | None) -> str | tuple[str, ...] | None:
-    """Coerce ``argnames`` into the ``None``/``str``/``tuple`` shape ``sxjit`` accepts."""
+    """Coerce ``argnames`` into the ``None``/``str``/``tuple`` shape ``sxjit`` accepts.
+
+    Args:
+        argnames: Argnames value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if argnames is None or isinstance(argnames, str):
         return argnames
     return tuple(argnames)
@@ -605,6 +647,15 @@ def _raise_if_unsupported_mpmd_jit_options(
     ``keep_unused``, ``device``, ``backend``, ``inline``,
     ``compiler_options``) have no MPMD analog. Bundling all rejected
     options into a single error makes the message actionable.
+
+    Args:
+        mutable: Mutable value consumed by this operation.
+        donate_argnames: Donate argnames value consumed by this operation.
+        keep_unused: Keep unused value consumed by this operation.
+        device: Device value consumed by this operation.
+        backend: Backend value consumed by this operation.
+        inline: Inline value consumed by this operation.
+        compiler_options: Compiler options value consumed by this operation.
     """
     unsupported: list[str] = []
     if resolve_mutable(mutable) is not None:

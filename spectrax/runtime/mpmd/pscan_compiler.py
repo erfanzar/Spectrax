@@ -46,7 +46,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import compilation_cache as _jax_compilation_cache
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Var
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from ...core.graph import export, live_variables
 from ...core.module import Module
@@ -79,6 +79,12 @@ def has_pscan(jaxpr: Jaxpr) -> list[JaxprEqn]:
     """Return ``pscan_p`` equations found at the top level of ``jaxpr``.
 
     Shallow scan only — does not recurse into nested jaxprs.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+
+    Returns:
+        Return ``pscan_p`` equations found at the top level of ``jaxpr``.
     """
     return [e for e in jaxpr.eqns if e.primitive is pscan_p]
 
@@ -172,6 +178,24 @@ class _ScopedPersistentCacheJit:
         return getattr(self._jitted, name)
 
 
+def _project_partition_spec(spec: object, keep_axes: set[str]) -> object:
+    """Drop partition axes that do not exist on the target stage mesh."""
+    if not isinstance(spec, PartitionSpec):
+        return spec
+
+    def project_entry(entry: object) -> object:
+        if entry is None:
+            return None
+        if isinstance(entry, str):
+            return entry if entry in keep_axes else None
+        if isinstance(entry, tuple):
+            kept = tuple(axis for axis in entry if isinstance(axis, str) and axis in keep_axes)
+            return kept or None
+        return entry
+
+    return PartitionSpec(*(project_entry(entry) for entry in tuple(spec)))
+
+
 def _rebase_concrete_mesh(orig_mesh: object, target_stage_mesh: Mesh) -> object:
     """Place ``orig_mesh``'s axis layout onto ``target_stage_mesh``'s devices.
 
@@ -191,14 +215,23 @@ def _rebase_concrete_mesh(orig_mesh: object, target_stage_mesh: Mesh) -> object:
     If ``orig_mesh`` lists axes not present in ``target_stage_mesh`` (or the
     sizes do not multiply out to the target's device count), we leave the
     mesh untouched — a wrong rebase is worse than the conservative no-op.
+
+    Args:
+        orig_mesh: Orig mesh value consumed by this operation.
+        target_stage_mesh: Target stage mesh value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if not isinstance(orig_mesh, Mesh):
         return orig_mesh
-    target_axis_names = tuple(target_stage_mesh.axis_names)
     target_shape = dict(target_stage_mesh.shape)
     target_devices = target_stage_mesh.devices
-    orig_axis_names = tuple(orig_mesh.axis_names)
+    target_axis_names = tuple(target_stage_mesh.axis_names)
+    orig_axis_names = tuple(axis for axis in orig_mesh.axis_names if axis in target_shape)
     orig_shape = dict(orig_mesh.shape)
+    if not orig_axis_names:
+        return orig_mesh
 
     expected_total = 1
     for n in orig_axis_names:
@@ -206,22 +239,24 @@ def _rebase_concrete_mesh(orig_mesh: object, target_stage_mesh: Mesh) -> object:
     if expected_total != int(target_devices.size):
         return orig_mesh
 
-    if orig_axis_names == target_axis_names and orig_shape == target_shape:
+    if orig_axis_names == target_axis_names and all(
+        orig_shape.get(axis) == target_shape.get(axis) for axis in orig_axis_names
+    ):
         new_devices = target_devices
     else:
-        # Validate: every orig axis either appears in target with the same size,
-        # or target has an extra axis that we drop (only safe if it's size 1).
+        # Validate: every kept orig axis appears in target with the same size.
+        # Axes such as the pipeline dimension are intentionally dropped when
+        # entering a physical stage mesh.
         for n in orig_axis_names:
             if n in target_shape and target_shape[n] != orig_shape[n]:
-                return orig_mesh
-        for n in target_axis_names:
-            if n not in orig_shape and target_shape[n] != 1:
                 return orig_mesh
         flat = target_devices.reshape(-1)
         new_shape = tuple[int, ...](int(orig_shape[n]) for n in orig_axis_names)
         new_devices = flat.reshape(new_shape)
 
-    return Mesh(new_devices, orig_axis_names, axis_types=orig_mesh.axis_types)
+    orig_axis_type_map = dict(zip(tuple(orig_mesh.axis_names), tuple(orig_mesh.axis_types), strict=False))
+    axis_types = tuple(orig_axis_type_map[axis] for axis in orig_axis_names)
+    return Mesh(new_devices, orig_axis_names, axis_types=axis_types)
 
 
 def _rebase_named_sharding(sharding: NamedSharding, target_stage_mesh: Mesh) -> NamedSharding:
@@ -229,6 +264,13 @@ def _rebase_named_sharding(sharding: NamedSharding, target_stage_mesh: Mesh) -> 
 
     Abstract-mesh shardings are returned unchanged: they carry no devices
     and JAX 0.10 forbids replacing them with concrete meshes inside avals.
+
+    Args:
+        sharding: JAX sharding object describing how an array is placed.
+        target_stage_mesh: Target stage mesh value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if not isinstance(sharding, NamedSharding):
         return sharding
@@ -237,7 +279,8 @@ def _rebase_named_sharding(sharding: NamedSharding, target_stage_mesh: Mesh) -> 
     new_mesh = _rebase_concrete_mesh(sharding.mesh, target_stage_mesh)
     if new_mesh is sharding.mesh:
         return sharding
-    rebased = NamedSharding(new_mesh, sharding.spec)
+    keep_axes = set(getattr(new_mesh, "axis_names", ()))
+    rebased = NamedSharding(new_mesh, _project_partition_spec(sharding.spec, keep_axes))
     memory_kind = getattr(sharding, "memory_kind", None)
     if memory_kind is not None:
         try:
@@ -264,9 +307,17 @@ def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: object) -> Jaxpr:
     ``shard_map`` bodies. ``AbstractMesh``-backed shardings (the form JAX 0.10
     uses for aval shardings) are left alone — they describe structure, not
     placement.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Result described by this helper.
     """
     if not isinstance(stage_mesh, Mesh):
         return jaxpr
+    keep_axes = set(stage_mesh.axis_names)
 
     def rebase_value(value: object) -> object:
         if isinstance(value, ClosedJaxpr):
@@ -277,6 +328,12 @@ def _rebase_jaxpr_mesh_params(jaxpr: Jaxpr, stage_mesh: object) -> Jaxpr:
             return _rebase_concrete_mesh(value, stage_mesh)
         if isinstance(value, NamedSharding):
             return _rebase_named_sharding(value, stage_mesh)
+        if isinstance(value, PartitionSpec):
+            return _project_partition_spec(value, keep_axes)
+        if isinstance(value, frozenset):
+            return frozenset(item for item in value if not isinstance(item, str) or item in keep_axes)
+        if isinstance(value, set):
+            return {item for item in value if not isinstance(item, str) or item in keep_axes}
         if type(value) is tuple:
             return tuple[object, ...](rebase_value(item) for item in value)
         if type(value) is list:
@@ -346,6 +403,12 @@ def _collect_used_constvars(cluster: Jaxpr) -> list[Var]:
 
     Order preserved by first use so downstream filtering matches the
     variable ordering inside the cluster's eqns.
+
+    Args:
+        cluster: Cluster value consumed by this operation.
+
+    Returns:
+        Return constvars of ``cluster`` referenced by any of its equations.
     """
     cv_set = {id(v): v for v in cluster.constvars}
     seen: set[int] = set()
@@ -359,7 +422,15 @@ def _collect_used_constvars(cluster: Jaxpr) -> list[Var]:
 
 
 def _filtered_cluster(cluster: Jaxpr, used_constvars: list[Var]) -> Jaxpr:
-    """Return a copy of ``cluster`` whose ``constvars`` are restricted to ``used_constvars``."""
+    """Return a copy of ``cluster`` whose ``constvars`` are restricted to ``used_constvars``.
+
+    Args:
+        cluster: Cluster value consumed by this operation.
+        used_constvars: Used constvars value consumed by this operation.
+
+    Returns:
+        Return a copy of ``cluster`` whose ``constvars`` are restricted to ``used_constvars``.
+    """
     return Jaxpr(
         constvars=used_constvars,
         invars=list(cluster.invars),
@@ -388,6 +459,19 @@ def _place_cluster_consts(
     sharding metadata, that leaf's stage-local NamedSharding wins;
     otherwise we fall back to a replicated sharding on the stage's
     sub-mesh.
+
+    Args:
+        used_vars: Used vars value consumed by this operation.
+        all_constvars: All constvars value consumed by this operation.
+        concrete_consts: Concrete consts value consumed by this operation.
+        const_flat_arg_indices: Const flat arg indices value consumed by this operation.
+        leaf_shardings: Leaf shardings value consumed by this operation.
+        leaf_stage_owners: Leaf stage owners value consumed by this operation.
+        fallback_sharding: Fallback sharding value consumed by this operation.
+        expected_rank: Expected rank value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     const_idx_by_id = {id(v): i for i, v in enumerate(all_constvars)}
     placed: list[object] = []
@@ -424,6 +508,12 @@ def _stage_compile_tag(stage_mesh: object) -> int:
 
     We derive the tag from the smallest device id in the stage mesh,
     which is unique per pipeline rank and stable across re-builds.
+
+    Args:
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return a per-rank tag that distinguishes stage compiles in the XLA cache.
     """
     if not isinstance(stage_mesh, Mesh):
         return 0
@@ -439,6 +529,12 @@ def _mesh_fingerprint(mesh: Mesh) -> tuple[object, ...]:
     identical. Folding the concrete device placement into the generated Python
     function name gives the persistent cache a distinct module prefix for each
     real stage/expert layout.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return a stable fingerprint for a concrete mesh embedded in a stage jaxpr.
     """
     devices = tuple(
         (
@@ -455,7 +551,12 @@ def _mesh_fingerprint(mesh: Mesh) -> tuple[object, ...]:
 
 
 def _collect_mesh_fingerprints(value: object, out: list[tuple[object, ...]]) -> None:
-    """Append fingerprints for every concrete mesh reachable from ``value``."""
+    """Append fingerprints for every concrete mesh reachable from ``value``.
+
+    Args:
+        value: Value consumed by the helper.
+        out: Output value from an earlier call or transform.
+    """
     if isinstance(value, ClosedJaxpr):
         _collect_mesh_fingerprints(value.jaxpr, out)
         return
@@ -480,7 +581,15 @@ def _collect_mesh_fingerprints(value: object, out: list[tuple[object, ...]]) -> 
 
 
 def _stage_jit_name_suffix(cluster_jaxpr: Jaxpr, stage_mesh: object) -> str:
-    """Build a cache-visible suffix for one concrete MPMD stage executable."""
+    """Build a cache-visible suffix for one concrete MPMD stage executable.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Result described by this helper.
+    """
     parts: list[tuple[object, ...]] = []
     if isinstance(stage_mesh, Mesh):
         parts.append(("stage", _mesh_fingerprint(stage_mesh)))
@@ -499,6 +608,12 @@ def _scope_stage_persistent_cache(jitted: Callable[..., object]) -> Callable[...
     barrier metadata on a later process run. Scope the persistent-cache guard
     to these stage executables instead of changing global EasyDeL/eJKernel
     caching behavior.
+
+    Args:
+        jitted: Jitted value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     return _ScopedPersistentCacheJit(jitted)
 
@@ -513,6 +628,14 @@ def _make_fwd_jit(
     Consts are passed as an explicit first argument (not closure-captured)
     so the dispatcher can route placed constants uniformly and so the
     backward VJP can differentiate w.r.t. them.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        donate_argnums: Donate argnums value consumed by this operation.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return ``@jax.jit`` callable ``(consts, *invars) -> outvars`` for a non-terminal cluster.
     """
 
     if stage_mesh is not None:
@@ -538,7 +661,9 @@ def _make_fwd_jit(
     fwd.__qualname__ = f"{fwd.__qualname__}_{cache_tag}"
     fwd.__name__ = f"{fwd.__name__}_{cache_tag}"
     if donate_argnums:
-        return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums)))
+        return cast(
+            Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums))
+        )
     return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd)))
 
 
@@ -555,6 +680,16 @@ def _make_bwd_jit(
     Used by BWD / BWD_I / BWD_W schedule phases. XLA DCEs unused
     outputs so BWD_I (discards ``g_consts``) and BWD_W (discards
     ``g_invars``) each take ~half the cost of a full BWD.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        n_invars: N invars value consumed by this operation.
+        donate_argnums: Donate argnums value consumed by this operation.
+        out_shardings: Output shardings supplied to the compiled function.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return ``@jax.jit`` VJP callable for a non-terminal cluster.
     """
 
     if stage_mesh is not None:
@@ -583,7 +718,15 @@ def _make_bwd_jit(
             cotangents = invars_and_cotangents[n_invars:]
 
             def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-                """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument."""
+                """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument.
+
+                Args:
+                    c: C value consumed by this operation.
+                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
@@ -601,7 +744,9 @@ def _make_bwd_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd.__qualname__ = f"{bwd.__qualname__}_{cache_tag}"
     bwd.__name__ = f"{bwd.__name__}_{cache_tag}"
-    return cast(Callable[..., tuple[object, tuple[object, ...]]], _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs)))
+    return cast(
+        Callable[..., tuple[object, tuple[object, ...]]], _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs))
+    )
 
 
 def _make_bwd_i_jit(
@@ -617,6 +762,16 @@ def _make_bwd_i_jit(
     ZeroBubble-style schedules send activation cotangents upstream as
     soon as input grads are ready while deferring the costlier
     weight-grad computation into pipeline bubble slots.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        n_invars: N invars value consumed by this operation.
+        donate_argnums: Donate argnums value consumed by this operation.
+        out_shardings: Output shardings supplied to the compiled function.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return a ``@jax.jit`` VJP callable that yields only input cotangents.
     """
 
     if stage_mesh is not None:
@@ -642,7 +797,15 @@ def _make_bwd_i_jit(
             cotangents = invars_and_cotangents[n_invars:]
 
             def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
+                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`.
+
+                Args:
+                    c: C value consumed by this operation.
+                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
@@ -668,7 +831,18 @@ def _make_bwd_w_jit(
     out_shardings: object | None = None,
     stage_mesh: object | None = None,
 ) -> Callable[..., object]:
-    """Return ``@jax.jit`` VJP callable for weight/const gradients only."""
+    """Return ``@jax.jit`` VJP callable for weight/const gradients only.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        n_invars: N invars value consumed by this operation.
+        donate_argnums: Donate argnums value consumed by this operation.
+        out_shardings: Output shardings supplied to the compiled function.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return ``@jax.jit`` VJP callable for weight/const gradients only.
+    """
 
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
@@ -694,7 +868,15 @@ def _make_bwd_w_jit(
             cotangents = invars_and_cotangents[n_invars:]
 
             def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`."""
+                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`.
+
+                Args:
+                    c: C value consumed by this operation.
+                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_weight/pure_forward"):
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
@@ -727,6 +909,16 @@ def _make_terminal_jit(
     The terminal cluster produces exactly one scalar output (the loss).
     :func:`jax.value_and_grad` supplies the initial cotangent of
     ``1.0`` automatically so we don't have to thread it from outside.
+
+    Args:
+        cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        n_invars: N invars value consumed by this operation.
+        donate_argnums: Donate argnums value consumed by this operation.
+        out_shardings: Output shardings supplied to the compiled function.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Return ``@jax.jit`` ``value_and_grad`` callable for the terminal cluster.
     """
 
     if stage_mesh is not None:
@@ -754,7 +946,15 @@ def _make_terminal_jit(
         with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward"):
 
             def pure(c: tuple[object, ...], *xs: object) -> object:
-                """Scalar-loss evaluator, asserts a single cluster output."""
+                """Scalar-loss evaluator, asserts a single cluster output.
+
+                Args:
+                    c: C value consumed by this operation.
+                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 with jax.named_scope("spectrax/mpmd/schedule/terminal_loss_backward/pure_forward"):
                     outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
                     if len(outs) != 1:
@@ -786,7 +986,16 @@ def _build_logical_locs(
     n: int,
     v: int,
 ) -> tuple[tuple[tuple[int, int], ...], dict[tuple[int, int], int], tuple[int, int]]:
-    """Build ``logical <-> (rank, virt)`` maps and validate the schedule chain."""
+    """Build ``logical <-> (rank, virt)`` maps and validate the schedule chain.
+
+    Args:
+        schedule: Pipeline schedule object controlling forward/backward execution order.
+        n: N value consumed by this operation.
+        v: V value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     n_logical = n * v
     locs: list[tuple[int, int] | None] = [None] * n_logical
     logical_for_loc: dict[tuple[int, int], int] = {}
@@ -893,7 +1102,14 @@ def _resolve_concrete_consts(
 
 
 def _arg_leaf_ranges(args: tuple[object, ...]) -> list[tuple[int, int]]:
-    """Return flat-leaf ``[start, end)`` ranges for each positional argument."""
+    """Return flat-leaf ``[start, end)`` ranges for each positional argument.
+
+    Args:
+        args: Positional arguments forwarded to the wrapped callable.
+
+    Returns:
+        Return flat-leaf ``[start, end)`` ranges for each positional argument.
+    """
     ranges: list[tuple[int, int]] = []
     start = 0
     for arg in args:
@@ -915,6 +1131,15 @@ def _infer_outer_leaf_shardings(
     captured Module's logical-axis annotations against *its own*
     stage-local sub-mesh, so a TP annotation lands on that rank's TP
     devices rather than on the global mesh.
+
+    Args:
+        outer_args: Outer args value consumed by this operation.
+        outer_flat_args: Outer flat args value consumed by this operation.
+        n: N value consumed by this operation.
+        rank_submeshes: Rank submeshes value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     leaf_shardings: list[dict[int, object]] = [{} for _ in range(n)]
     leaf_stage_owners: dict[int, int] = {}
@@ -965,7 +1190,18 @@ def _build_grad_metadata(
     n_body_consts: int,
     probed_grad_tree: object | None,
 ) -> tuple[object, tuple[int, ...], tuple[object, ...]]:
-    """Identify the captured module arg and map its grad leaves to body const indices."""
+    """Identify the captured module arg and map its grad leaves to body const indices.
+
+    Args:
+        outer_args: Outer args value consumed by this operation.
+        outer_jaxpr: Outer jaxpr value consumed by this operation.
+        pscan_eqn: Pscan eqn value consumed by this operation.
+        n_body_consts: N body consts value consumed by this operation.
+        probed_grad_tree: Probed grad tree value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     module_arg_indices = [i for i, arg in enumerate(outer_args) if isinstance(arg, Module)]
     if len(module_arg_indices) != 1:
         raise ValueError(
@@ -1028,7 +1264,15 @@ def _build_invar_sources(
     body_jaxpr: Jaxpr,
     clusters: list[Jaxpr],
 ) -> list[list[tuple[str, int, int]]]:
-    """Map each cluster input to either a body invar or a prior cluster output."""
+    """Map each cluster input to either a body invar or a prior cluster output.
+
+    Args:
+        body_jaxpr: Body jaxpr value consumed by this operation.
+        clusters: Clusters value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     alias_by_id = {
         id(outvar): invar
         for eqn in body_jaxpr.eqns
@@ -1045,6 +1289,12 @@ def _build_invar_sources(
         purpose of mapping cluster invars back to the body's invars
         we want to skip past them. The ``seen`` set guards against
         cycles.
+
+        Args:
+            var: Var value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         cur = var
         seen: set[int] = set()
@@ -1198,7 +1448,14 @@ def _edge_transfer_target(value: object, plan: PscanPlan, producer_logical: int,
     dst_mesh = plan.rank_submeshes[dst_rank]
 
     def leaf_target(leaf: object) -> object:
-        """Per-leaf NamedSharding on ``dst_mesh`` derived from the edge spec."""
+        """Per-leaf NamedSharding on ``dst_mesh`` derived from the edge spec.
+
+        Args:
+            leaf: Leaf value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if not hasattr(leaf, "shape"):
             return plan.stage_shardings[dst_rank]
         spec = sanitize_partition_spec_for_mesh_and_shape(
@@ -1261,7 +1518,15 @@ def _materialize_cotangents(
 
 
 def _cast_cotangent_like(cotangent: object, primal: object) -> object:
-    """Cast a cotangent to its primal output dtype before moving devices."""
+    """Cast a cotangent to its primal output dtype before moving devices.
+
+    Args:
+        cotangent: Cotangent supplied to a pullback or transpose rule.
+        primal: Primal value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if getattr(cotangent, "dtype", None) == jax.dtypes.float0:
         return cotangent
     cot_dtype = getattr(cotangent, "dtype", None)
@@ -1272,7 +1537,15 @@ def _cast_cotangent_like(cotangent: object, primal: object) -> object:
 
 
 def _add_grad(a: object, b: object) -> object:
-    """Add gradient leaves while preserving JAX ``float0`` sentinels."""
+    """Add gradient leaves while preserving JAX ``float0`` sentinels.
+
+    Args:
+        a: Positional arguments forwarded to the wrapped callable.
+        b: B value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if getattr(a, "dtype", None) == jax.dtypes.float0:
         return b
     if getattr(b, "dtype", None) == jax.dtypes.float0:
@@ -1285,7 +1558,16 @@ def _project_upstream_cotangents(
     src_outs: tuple[object, ...],
     src_to_dst: list[tuple[int, ...]],
 ) -> tuple[object, ...]:
-    """Expand downstream input cotangents to the full upstream output tuple."""
+    """Expand downstream input cotangents to the full upstream output tuple.
+
+    Args:
+        g_invars: G invars value consumed by this operation.
+        src_outs: Src outs value consumed by this operation.
+        src_to_dst: Src to dst value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     full: list[object] = []
     for out_idx, dst_indices in enumerate(src_to_dst):
         if not dst_indices:
@@ -1336,7 +1618,15 @@ def _accumulate_const_grads(
 
 
 def _sum_rank_grads(grad_accums: list[list[object | None] | None], output_sharding: object) -> object | None:
-    """Move per-rank const grads to one sharding and sum them leafwise."""
+    """Move per-rank const grads to one sharding and sum them leafwise.
+
+    Args:
+        grad_accums: Grad accums value consumed by this operation.
+        output_sharding: Output sharding value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     total = None
     for grads in grad_accums:
         if grads is None:
@@ -1352,7 +1642,15 @@ def _sum_rank_grads(grad_accums: list[list[object | None] | None], output_shardi
 
 
 def _pack_grad_tree(plan: PscanPlan, total_const_grads: object | None) -> object:
-    """Unflatten selected const grads into the final model-shaped grad pytree."""
+    """Unflatten selected const grads into the final model-shaped grad pytree.
+
+    Args:
+        plan: Plan value consumed by this operation.
+        total_const_grads: Total const grads value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     total_const_grads = () if total_const_grads is None else tuple(total_const_grads)
     grad_leaves: list[object] = []
     for leaf_idx, const_idx in enumerate(plan.grad_const_indices):
@@ -1381,13 +1679,16 @@ def build_pscan_plan(
     locations, and compiles forward / backward / terminal jits.
 
     Args:
-        outer_jaxpr: The full outer ``ClosedJaxpr``.
-        outer_flat_args: Concrete values for ``outer_jaxpr.jaxpr.invars``.
-        pscan_eqn: The target ``pscan_p`` equation.
-        mpmd_mesh: MPMD mesh; ``mpmd_dim`` must equal the number of
-            physical pipeline ranks.
-        stage_shardings: Per-rank replicated shardings.
-        rank_submeshes: Per-rank sub-meshes.
+            outer_jaxpr: The full outer ``ClosedJaxpr``.
+            outer_flat_args: Concrete values for ``outer_jaxpr.jaxpr.invars``.
+            pscan_eqn: The target ``pscan_p`` equation.
+            mpmd_mesh: MPMD mesh; ``mpmd_dim`` must equal the number of
+                physical pipeline ranks.
+            stage_shardings: Per-rank replicated shardings.
+            rank_submeshes: Per-rank sub-meshes.
+
+    Returns:
+        Result described by this helper.
     """
     eqn_params = _eqn_params(pscan_eqn)
     loss_closed: jax.core.ClosedJaxpr = eqn_params["loss_jaxpr"]
@@ -1529,6 +1830,9 @@ def _iter_actions(row: list[object]):
     A grid cell may be a plain ``Action``, ``None``, or a fused fwd+bwd
     pair. We do not perform downstream fusion here — each component
     action dispatches separately.
+
+    Args:
+        row: Row value consumed by this operation.
     """
     for rank, cell in enumerate(row):
         if cell is None:
@@ -1550,6 +1854,12 @@ def dispatch_pscan(plan: PscanPlan) -> list[object]:
     Returns ``[losses, grads]`` where ``losses`` is the concatenated
     per-microbatch loss buffer and ``grads`` matches the captured
     model's param pytree.
+
+    Args:
+        plan: Plan value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     n = plan.n
     ops = plan.ops

@@ -589,6 +589,13 @@ def _ones_scale(shape: tuple[int, ...], dtype: DType) -> Array:
     A scale of ``1`` means "no rescaling applied" and is safe even when
     the first call sees values far from fp8's representable range —
     :func:`compute_scale` picks a real value on the first update.
+
+    Args:
+        shape: Array shape requested by the initializer or helper.
+        dtype: Array dtype requested for the produced value.
+
+    Returns:
+        Return ``jnp.ones(shape, dtype)`` — the canonical initial scale factor.
     """
     return jnp.ones(shape, dtype=dtype)
 

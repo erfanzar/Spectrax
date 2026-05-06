@@ -206,23 +206,53 @@ class LazyLogger:
                 self._logger.log(level, message, *args, **kwargs)
 
     def debug_once(self, message: str, *args: object, **kwargs: object) -> None:
-        """Log a ``DEBUG`` message once (deduplicated)."""
+        """Log a ``DEBUG`` message once (deduplicated).
+
+        Args:
+            message: Message value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+        """
         self._log_once(logging.DEBUG, message, *args, **kwargs)
 
     def info_once(self, message: str, *args: object, **kwargs: object) -> None:
-        """Log an ``INFO`` message once (deduplicated)."""
+        """Log an ``INFO`` message once (deduplicated).
+
+        Args:
+            message: Message value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+        """
         self._log_once(logging.INFO, message, *args, **kwargs)
 
     def warn_once(self, message: str, *args: object, **kwargs: object) -> None:
-        """Log a ``WARNING`` message once (deduplicated)."""
+        """Log a ``WARNING`` message once (deduplicated).
+
+        Args:
+            message: Message value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+        """
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
     def warning_once(self, message: str, *args: object, **kwargs: object) -> None:
-        """Alias for :meth:`warn_once`."""
+        """Alias for :meth:`warn_once`.
+
+        Args:
+            message: Message value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+        """
         self._log_once(logging.WARNING, message, *args, **kwargs)
 
     def error_once(self, message: str, *args: object, **kwargs: object) -> None:
-        """Log an ``ERROR`` message once (deduplicated)."""
+        """Log an ``ERROR`` message once (deduplicated).
+
+        Args:
+            message: Message value consumed by this operation.
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+        """
         self._log_once(logging.ERROR, message, *args, **kwargs)
 
     def clear_once_cache(self) -> None:
@@ -251,7 +281,15 @@ class LazyLogger:
 
             @wraps(getattr(logging.Logger, method_name))
             def wrapped_log_method(*args: object, **kwargs: object) -> object:
-                """Delegate to the underlying logger method."""
+                """Delegate to the underlying logger method.
+
+                Args:
+                    *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                    **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 self._ensure_initialized()
                 return getattr(self._logger, method_name)(*args, **kwargs)
 
@@ -264,7 +302,15 @@ class LazyLogger:
 
                 @wraps(getattr(logging.Logger, method_name))
                 def wrapped_log_method(*args: object, **kwargs: object) -> object:
-                    """Delegate to the named level method of the underlying logger."""
+                    """Delegate to the named level method of the underlying logger.
+
+                    Args:
+                        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                        **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+                    Returns:
+                        Result described by this helper.
+                    """
                     self._ensure_initialized()
                     return getattr(self._logger, method_name)(*args, **kwargs)
 
@@ -272,7 +318,15 @@ class LazyLogger:
 
             @wraps(logging.Logger.log)
             def wrapped_log_method(*args: object, **kwargs: object) -> object:
-                """Log at the dynamically-resolved level."""
+                """Log at the dynamically-resolved level.
+
+                Args:
+                    *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                    **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 self._ensure_initialized()
                 return self._logger.log(level, *args, **kwargs)
 
@@ -424,7 +478,13 @@ class ProgressLogger:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context-manager exit — auto-completes if no exception was raised."""
+        """Context-manager exit — auto-completes if no exception was raised.
+
+        Args:
+            exc_type: Exc type value consumed by this operation.
+            exc_val: Exc val value consumed by this operation.
+            exc_tb: Exc tb value consumed by this operation.
+        """
         if exc_type is None:
             self.complete()
         return False

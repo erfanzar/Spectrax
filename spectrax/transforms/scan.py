@@ -96,6 +96,13 @@ def associative_scan(
         any structural mutation (adding/removing a child module) is
         caught, and per-variable identity snapshots are checked
         afterward to guarantee no value-level write slipped through.
+
+        Args:
+            a: Positional arguments forwarded to the wrapped callable.
+            b: B value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         m = bind(gdef, state)
         epoch_before = _graph_epoch()
@@ -192,6 +199,13 @@ def scan(
         (per-leaf identity); any difference indicates the caller's
         ``mutable=`` selector did not cover a collection that ``fn``
         actually wrote to.
+
+        Args:
+            carry: Loop or scan carry value.
+            x: Input value consumed by the operation.
+
+        Returns:
+            Result described by this helper.
         """
         full = carry.overlay(invariant)
         m = bind(gdef, full)

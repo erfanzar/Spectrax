@@ -275,23 +275,56 @@ class Selector:
         return replace(self, variable_where=(*self.variable_where, pred))
 
     def __or__(self, other: Selector) -> Selector:
-        """Build a union selector matching either operand."""
+        """Build a union selector matching either operand.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return Selector(subselectors=(self, other), combinator="or")
 
     def __and__(self, other: Selector) -> Selector:
-        """Build an intersection selector matching both operands."""
+        """Build an intersection selector matching both operands.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return Selector(subselectors=(self, other), combinator="and")
 
     def __sub__(self, other: Selector) -> Selector:
-        """Set-difference selector: ``a - b`` == ``a & ~b``."""
+        """Set-difference selector: ``a - b`` == ``a & ~b``.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return self & ~other
 
     def __invert__(self) -> Selector:
-        """Build a selector whose variable match is inverted."""
+        """Build a selector whose variable match is inverted.
+
+        Returns:
+            Result described by this helper.
+        """
         return replace(self, invert=not self.invert)
 
     def _matches_module(self, m: Module, path: str) -> bool:
-        """Return ``True`` iff ``m`` matches this selector's module filter."""
+        """Return ``True`` iff ``m`` matches this selector's module filter.
+
+        Args:
+            m: M value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Return ``True`` iff ``m`` matches this selector's module filter.
+        """
         if self.subselectors:
             if self.combinator == "and":
                 return all(s._matches_module(m, path) for s in self.subselectors)
@@ -311,7 +344,15 @@ class Selector:
         return True
 
     def _matches_variable(self, v: Variable, path: str) -> bool:
-        """Return ``True`` iff ``v`` matches this selector's variable filter."""
+        """Return ``True`` iff ``v`` matches this selector's variable filter.
+
+        Args:
+            v: V value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Return ``True`` iff ``v`` matches this selector's variable filter.
+        """
         if self.subselectors:
             if self.combinator == "and":
                 base = all(s._matches_variable(v, path) for s in self.subselectors)
@@ -406,7 +447,13 @@ class Selector:
         seen_var_refs: set[int] = set()
 
         def walk(obj: Module | Variable, path: Path, ancestor_matches: bool) -> None:
-            """Recursive traversal helper carrying the "ancestor matched" flag."""
+            """Recursive traversal helper carrying the "ancestor matched" flag.
+
+            Args:
+                obj: Object inspected or transformed by the helper.
+                path: Logical or filesystem path used by the operation.
+                ancestor_matches: Ancestor matches value consumed by this operation.
+            """
             if isinstance(obj, Module):
                 path_str = path_to_str(path)
                 m_match = ancestor_matches or self._matches_module(obj, path_str)
@@ -546,7 +593,15 @@ def as_selector(x: SelectorSugar) -> Selector:
 
 
 def _never(_v: Variable, _p: str) -> bool:
-    """Predicate that always returns ``False`` — used by ``as_selector(None)``."""
+    """Predicate that always returns ``False`` — used by ``as_selector(None)``.
+
+    Args:
+        _v:  v value consumed by this operation.
+        _p:  p value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     return False
 
 
@@ -646,7 +701,15 @@ def path_contains(substring: str) -> Selector:
     """
 
     def pred(_v: Variable, path: str) -> bool:
-        """Match when ``substring`` appears inside ``path``."""
+        """Match when ``substring`` appears inside ``path``.
+
+        Args:
+            _v:  v value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return substring in path
 
     return select().where_variable(pred)
@@ -664,7 +727,15 @@ def path_endswith(suffix: str) -> Selector:
     """
 
     def pred(_v: Variable, path: str) -> bool:
-        """Match when ``path`` ends with ``suffix``."""
+        """Match when ``path`` ends with ``suffix``.
+
+        Args:
+            _v:  v value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return path.endswith(suffix)
 
     return select().where_variable(pred)
@@ -682,7 +753,15 @@ def path_startswith(prefix: str) -> Selector:
     """
 
     def pred(_v: Variable, path: str) -> bool:
-        """Match when ``path`` starts with ``prefix``."""
+        """Match when ``path`` starts with ``prefix``.
+
+        Args:
+            _v:  v value consumed by this operation.
+            path: Logical or filesystem path used by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return path.startswith(prefix)
 
     return select().where_variable(pred)
@@ -693,6 +772,13 @@ def _glob_match(pattern: str, path: str) -> bool:
 
     Segments are separated by ``'.'``. ``*`` matches exactly one segment;
     ``**`` matches any number of segments (including zero).
+
+    Args:
+        pattern: Pattern value consumed by this operation.
+        path: Logical or filesystem path used by the operation.
+
+    Returns:
+        Return ``True`` iff ``path`` matches the dotted glob ``pattern``.
     """
     if pattern == path:
         return True
@@ -702,7 +788,15 @@ def _glob_match(pattern: str, path: str) -> bool:
 
 
 def _glob_rec(pat: list[str], path: list[str]) -> bool:
-    """Recursive glob matcher used by :func:`_glob_match`."""
+    """Recursive glob matcher used by :func:`_glob_match`.
+
+    Args:
+        pat: Pat value consumed by this operation.
+        path: Logical or filesystem path used by the operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if not pat:
         return not path
     head = pat[0]

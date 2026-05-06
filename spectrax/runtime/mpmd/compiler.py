@@ -51,7 +51,14 @@ __all__ = [
 
 
 def _stage_fn_from_cluster(cluster: ClosedJaxpr | Jaxpr) -> Callable[..., object]:
-    """Return a Python callable for one marker-clustered stage jaxpr."""
+    """Return a Python callable for one marker-clustered stage jaxpr.
+
+    Args:
+        cluster: Cluster value consumed by this operation.
+
+    Returns:
+        Return a Python callable for one marker-clustered stage jaxpr.
+    """
     if isinstance(cluster, ClosedJaxpr):
         return jaxpr_as_fun(cluster)
     closed = ClosedJaxpr(cluster, [])
@@ -228,6 +235,12 @@ def compile_ranked_executables(
 
                 Returns ``(per_stage_grads, outgoing_activations,
                 outgoing_cotangents, loss_sum)``.
+
+                Args:
+                    all_stage_params: All stage params value consumed by this operation.
+                    mb_inputs: Mb inputs value consumed by this operation.
+                    mb_cotangents: Mb cotangents value consumed by this operation.
+                    *mb_targets: Additional positional arguments forwarded to the wrapped callable or backend.
                 """
                 with jax.named_scope(f"spectrax/mpmd/compiler/rank_{rank}"):
                     num_microbatches = mb_inputs.shape[0]
@@ -262,7 +275,13 @@ def compile_ranked_executables(
                                 params = tuple(all_stage_params[logical])
 
                                 def _stage_primary(*p_and_x, _fn=sfn, _n=len(params)):
-                                    """Return the stage's primary activation as a function of ``(params, x)``."""
+                                    """Return the stage's primary activation as a function of ``(params, x)``.
+
+                                    Args:
+                                        _fn:  fn value consumed by this operation.
+                                        _n:  n value consumed by this operation.
+                                        *p_and_x: Additional positional arguments forwarded to the wrapped callable or backend.
+                                    """
                                     p = p_and_x[:_n]
                                     x = p_and_x[_n]
                                     out = _fn(*p, x)
@@ -340,9 +359,15 @@ def run_ranked_pipeline(
         """Pick the first element from a stage output tuple, else return as-is.
 
         Stage callables built from clusters with multiple outvars
-        return tuples; single-output stages return the array directly.
+                return tuples; single-output stages return the array directly.
         This helper normalises both cases for the sequential loss
         accumulator.
+
+        Args:
+            out: Output value from an earlier call or transform.
+
+        Returns:
+            Result described by this helper.
         """
         return out[0] if isinstance(out, (tuple, list)) else out
 
@@ -354,6 +379,14 @@ def run_ranked_pipeline(
         stage's primary activation feeds the next stage's input, and
         ``loss_fn`` consumes the final activation against the
         microbatch targets.
+
+        Args:
+            params: Parameter mapping or primitive parameter dictionary.
+            x_mb: X mb value consumed by this operation.
+            *targets_mb: Additional positional arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         h = x_mb
         for logical, fn in enumerate(stage_fns):

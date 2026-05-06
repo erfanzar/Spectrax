@@ -93,7 +93,13 @@ class ConsoleBackend(BaseBackend):
         self._print("scalar", tag, _fmt_number(float(value)), step)
 
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
-        """Histograms are intentionally skipped in console output."""
+        """Histograms are intentionally skipped in console output.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            values: Values consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
@@ -136,7 +142,14 @@ class ConsoleBackend(BaseBackend):
             print(f"  {bold}{k}{reset} = {v}", file=sys.stdout, flush=True)
 
     def log_table(self, tag: str, columns: list[str], rows: list[list[LogValue]], step: int) -> None:
-        """Tables are intentionally skipped in console output."""
+        """Tables are intentionally skipped in console output.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            columns: Columns value consumed by this operation.
+            rows: Rows value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def flush(self) -> None:

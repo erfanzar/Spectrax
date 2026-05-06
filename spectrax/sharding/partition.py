@@ -131,7 +131,16 @@ def with_partitioning(
     sharding = normalize_sharding(axis_names)
 
     def wrapped(key: object, shape: tuple[int, ...], dtype: object) -> Array:
-        """Run the wrapped initializer and stamp its output with sharding metadata."""
+        """Run the wrapped initializer and stamp its output with sharding metadata.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         arr = init(key, shape, dtype)
         try:
             object.__setattr__(arr, "_spx_sharding", sharding)
@@ -149,6 +158,9 @@ def _iter_variables(module: Module):
     A thin wrapper over :class:`~spectrax.core.selector.select` so the
     spec-extraction helpers can iterate variables without importing the
     selector module at every call site.
+
+    Args:
+        module: SpectraX module instance operated on by the helper.
     """
     yield from select().apply(module)
 
@@ -194,6 +206,12 @@ def _resolve_named_sharding_mesh(mesh: "Mesh | SpxMesh | MpMdMesh") -> tuple["Me
     Unwraps :class:`SpxMesh` / :class:`MpMdMesh` into the underlying
     :class:`jax.sharding.Mesh` plus, when applicable, the MPMD view.
     Plain :class:`Mesh` inputs return ``(mesh, None)``.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return ``(base_mesh, mpmd_mesh_or_none)`` for sharding resolution.
     """
     from ..runtime.types.mesh import MpMdMesh
 
@@ -211,6 +229,12 @@ def to_jax_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> "Mesh | None":
     ``jax.sharding.Mesh``. SpectraX APIs prefer ``SpxMesh`` because it
     carries MPMD metadata, so boundary code should call this helper
     instead of touching ``.jax_mesh`` manually.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the underlying JAX mesh for SpectraX mesh wrappers.
     """
     from ..runtime.types.mesh import MpMdMesh
 
@@ -229,6 +253,9 @@ def _physical_mesh_or_none() -> "Mesh | None":
     Reads ``jax.interpreters.pxla.thread_resources.env.physical_mesh``
     and converts the empty-mesh sentinel into a plain ``None`` so
     callers can do a simple null check.
+
+    Returns:
+        Return the JAX physical mesh from thread-local pxla state, or ``None``.
     """
     mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
     if getattr(mesh, "empty", False):
@@ -243,6 +270,12 @@ def get_incontext_mesh(raise_error: bool = True) -> "SpxMesh | None":
     SpectraX mesh metadata such as ``mpmd_axis``. Use
     :func:`to_jax_mesh` at explicit JAX API boundaries that require a
     raw :class:`jax.sharding.Mesh`.
+
+    Args:
+        raise_error: Raise error value consumed by this operation.
+
+    Returns:
+        Return the active mesh as :class:`SpxMesh`, if one is available.
     """
     from .mesh import _wrap_spx, current_mesh
 
@@ -263,6 +296,12 @@ def _mpmd_axis_name(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> str | None:
     For :class:`SpxMesh` and :class:`MpMdMesh` the name comes from the
     mesh's ``mpmd_axis`` / ``mpmd_axis_name`` attribute. Plain JAX
     meshes have no MPMD axis and return ``None``.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the pipeline-axis name on an MPMD-aware mesh, else ``None``.
     """
     from ..runtime.types.mesh import MpMdMesh
 
@@ -281,6 +320,13 @@ def _drop_axis_name(axis: object, name: str) -> object:
     a bare string equal to ``name`` (returns ``None``), a tuple of
     strings (filters out ``name``; returns the lone survivor or
     ``None`` for an empty result), or anything else (returned unchanged).
+
+    Args:
+        axis: Logical or positional axis used by the operation.
+        name: Name used for lookup, logging, or registration.
+
+    Returns:
+        Result described by this helper.
     """
     if axis == name:
         return None
@@ -300,6 +346,12 @@ def _mesh_axis_names(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> set[str] | Non
     Unwraps :class:`SpxMesh` / :class:`MpMdMesh` via their ``jax_mesh``
     attribute. Returns ``None`` when ``mesh`` is ``None`` or has no
     ``axis_names`` attribute.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the set of axis names on the underlying JAX mesh.
     """
     if mesh is None:
         return None
@@ -317,6 +369,13 @@ def _mesh_axis_size(mesh: "Mesh | SpxMesh | MpMdMesh | None", axis: str) -> int:
     (treating "missing axis" the same as "size-1 axis"), which lets
     callers compute partition products without an explicit existence
     check.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        axis: Logical or positional axis used by the operation.
+
+    Returns:
+        Return the device count along ``axis`` on the underlying JAX mesh.
     """
     raw_mesh = getattr(mesh, "jax_mesh", mesh)
     try:
@@ -331,6 +390,13 @@ def _query_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None, *, raise_error:
     The fallback chain is: explicit ``mesh`` argument → SpectraX
     :func:`current_mesh` → :func:`get_incontext_mesh` (which itself
     falls back to the JAX physical mesh).
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        raise_error: Raise error value consumed by this operation.
+
+    Returns:
+        Return ``mesh`` if given, else fall back to the active mesh context.
     """
     if mesh is not None:
         return mesh
@@ -343,7 +409,15 @@ def _query_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None" = None, *, raise_error:
 
 
 def _same_mesh_devices(a: object, b: object) -> bool:
-    """Return whether two raw JAX meshes cover the same physical devices."""
+    """Return whether two raw JAX meshes cover the same physical devices.
+
+    Args:
+        a: Positional arguments forwarded to the wrapped callable.
+        b: B value consumed by this operation.
+
+    Returns:
+        Return whether two raw JAX meshes cover the same physical devices.
+    """
     try:
         if tuple(a.axis_names) != tuple(b.axis_names):
             return False
@@ -361,6 +435,12 @@ def _promote_active_spx_mesh(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> "Mesh 
     MPMD and points at that same physical mesh, keep the MPMD metadata
     so constraints resolve to stage-local submeshes instead of the full
     PP mesh.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     if mesh is None or _mpmd_axis_name(mesh) is not None:
         return mesh
@@ -379,6 +459,12 @@ def _available_axis_names(mesh: "Mesh | SpxMesh | MpMdMesh | None") -> tuple[str
     inspect "what axes can I shard on?" should not see the rank axis,
     because constraining a tensor along that axis would attempt to
     shard across stages.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the SPMD-only axis names visible on ``mesh``.
     """
     if mesh is None:
         return ()
@@ -400,6 +486,13 @@ def names_in_current_mesh(*names: str, mesh: "Mesh | SpxMesh | MpMdMesh | None" 
     it represents rank/program placement, not a stage-local sharding
     axis. Pass an explicit pure JAX mesh if full raw mesh membership is
     needed.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        *names: Additional positional arguments forwarded to the wrapped callable or backend.
+
+    Returns:
+        Return ``True`` iff all names are usable SPMD axes in the current mesh.
     """
     resolved_mesh = _query_mesh(mesh, raise_error=False)
     if resolved_mesh is None:
@@ -416,6 +509,13 @@ def get_axes_size_in_mesh(
     MPMD-aware behavior: the MPMD/pipeline axis contributes ``1`` so
     callers do not accidentally treat pipeline rank count as an
     intra-stage tensor partition factor.
+
+    Args:
+        axis_names: Named mesh or collective axes used by the operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the product of stage-local mesh sizes for ``axis_names``.
     """
     resolved_mesh = _query_mesh(mesh)
     if axis_names is None:
@@ -443,6 +543,13 @@ def _sanitize_axis_for_mesh(axis: object, mesh: "Mesh | SpxMesh | MpMdMesh | Non
     specific name, this keeps only names that *exist* on the mesh.
     Useful when reusing a spec built for a richer mesh on a simpler
     one (e.g. dropping ``"ep"`` when running with EP=1).
+
+    Args:
+        axis: Logical or positional axis used by the operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     names = _mesh_axis_names(mesh)
     if names is None:
@@ -465,6 +572,13 @@ def _axis_partition_product(axis: object, mesh: "Mesh | SpxMesh | MpMdMesh | Non
     A bare name returns its mesh size; a tuple of names returns the
     product of all parts; ``None`` returns ``1``. Used to test
     "does this axis spec divide the tensor's dim evenly?".
+
+    Args:
+        axis: Logical or positional axis used by the operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return the total device count implied by an axis spec.
     """
     if axis is None:
         return 1
@@ -540,6 +654,12 @@ def _sharding_spec(sharding: object) -> PartitionSpec:
     :class:`PartitionSpec` (returned as-is), ``None`` (becomes the
     fully-replicated spec), or anything iterable (its contents are
     spread into a new ``PartitionSpec``).
+
+    Args:
+        sharding: JAX sharding object describing how an array is placed.
+
+    Returns:
+        Result described by this helper.
     """
     if isinstance(sharding, NamedSharding):
         return sharding.spec
@@ -561,6 +681,13 @@ def _stage_mesh_from_existing_sharding(
     Modern stage meshes drop the MPMD axis; legacy traces may still carry
     the full axis list with the MPMD axis at size one, so both forms are
     accepted.
+
+    Args:
+        arr: Arr value consumed by this operation.
+        mpmd_mesh: Mpmd mesh value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     existing = getattr(arr, "sharding", None)
     if not isinstance(existing, NamedSharding):
@@ -585,6 +712,12 @@ def _stage_mesh_from_current_context(mpmd_mesh: "MpMdMesh") -> "Mesh | None":
     ``jax.interpreters.pxla.thread_resources`` instead of the array's own
     sharding. Both MPMD-axis-free stage meshes and legacy size-one MPMD-axis
     meshes are accepted.
+
+    Args:
+        mpmd_mesh: Mpmd mesh value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     mesh = _physical_mesh_or_none()
     if mesh is None:
@@ -705,6 +838,17 @@ def get_current_stage_mesh(
     process-local MPMD rank. For non-MPMD meshes it returns the plain JAX
     mesh. If a multi-stage MPMD mesh cannot be resolved, returns ``None``
     unless ``raise_error=True``.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        arr: Arr value consumed by this operation.
+        stage: Stage value consumed by this operation.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+        metadata: Metadata object consumed or produced by the operation.
+        raise_error: Raise error value consumed by this operation.
+
+    Returns:
+        Return the stage-local JAX mesh for the current MPMD context.
     """
 
     queried_mesh = _promote_active_spx_mesh(_query_mesh(mesh, raise_error=raise_error))
@@ -830,6 +974,12 @@ def _is_axis_name_like(value: object) -> bool:
     Axis names are strings or ``None``; nested tuples are also valid
     (each element is checked recursively). Anything else (lists,
     ints, ``PartitionSpec``s, …) is rejected.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return ``True`` iff ``value`` is a valid axis-spec component.
     """
     if value is None or isinstance(value, str):
         return True
@@ -846,6 +996,12 @@ def _is_single_sharding_spec(value: object) -> bool:
     per-leaf specs". A bare ``PartitionSpec``, ``NamedSharding``,
     ``None``, or a list/tuple of axis-name-likes counts as a single
     spec.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return ``True`` iff ``value`` is a *single* sharding spec, not a pytree of specs.
     """
     if isinstance(value, (NamedSharding, PartitionSpec)):
         return True
@@ -929,6 +1085,13 @@ def _named_sharding_for_leaf(leaf: object, mesh: "Mesh | SpxMesh | MpMdMesh | No
     sanitized (mesh-axis-filtered, shape-divisibility-checked) and
     re-bound to the mesh argument. Leaves without a ``shape``
     attribute (non-arrays) return ``None``.
+
+    Args:
+        leaf: Leaf value consumed by this operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Return a ``NamedSharding`` for ``leaf`` aligned to ``mesh``.
     """
     if not hasattr(leaf, "shape"):
         return None
@@ -988,6 +1151,16 @@ def _extracted_sharding_for_leaf(
     that pipeline-axis sharding is dropped and the spec lands on the
     correct sub-mesh. Returns ``None`` if the leaf has no
     ``NamedSharding``.
+
+    Args:
+        leaf: Leaf value consumed by this operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        stage: Stage value consumed by this operation.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+        metadata: Metadata object consumed or produced by the operation.
+
+    Returns:
+        Return a sanitized, MPMD-aware ``NamedSharding`` from a leaf's existing sharding.
     """
     existing = getattr(leaf, "sharding", None)
     if not isinstance(existing, NamedSharding):
@@ -1033,6 +1206,16 @@ def extract_sharding_structure(
     shardings are sanitized to the resolved stage-local mesh and the
     pipeline axis is removed from the spec. Leaves without a
     ``NamedSharding`` become ``None``.
+
+    Args:
+        pytree: PyTree consumed or produced by the helper.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+        stage: Stage value consumed by this operation.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+        metadata: Metadata object consumed or produced by the operation.
+
+    Returns:
+        Result described by this helper.
     """
     resolved_mesh = mesh if mesh is not None else _query_mesh(raise_error=False)
     return jax.tree_util.tree_map(
@@ -1091,7 +1274,15 @@ def match_partition_rules(
     """
 
     def _path_to_string(path: tuple[object, ...], sep: str = "/") -> str:
-        """Render a JAX tree-key path as a forward-slash-separated string."""
+        """Render a JAX tree-key path as a forward-slash-separated string.
+
+        Args:
+            path: Logical or filesystem path used by the operation.
+            sep: Sep value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         parts: list[str] = []
         for key in path:
             if isinstance(key, jax.tree_util.SequenceKey):
@@ -1113,6 +1304,13 @@ def match_partition_rules(
         non-arrays / scalars / tiny tensors collapse to fully
         replicated, and over-long specs are truncated to the leaf's
         ``ndim``.
+
+        Args:
+            path: Logical or filesystem path used by the operation.
+            leaf: Leaf value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         if strict:
             if not hasattr(leaf, "shape"):
@@ -1170,7 +1368,14 @@ def make_shard_and_gather_fns(
         raise ValueError("mesh must be provided to make_shard_and_gather_fns")
 
     def _named(raw_spec: object) -> NamedSharding:
-        """Wrap a raw spec in a ``NamedSharding`` bound to the closure's mesh."""
+        """Wrap a raw spec in a ``NamedSharding`` bound to the closure's mesh.
+
+        Args:
+            raw_spec: Raw spec value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if not isinstance(raw_spec, PartitionSpec):
             raw_spec = PartitionSpec()
         spec = sanitize_partition_spec_for_mesh_and_shape(raw_spec, mesh=mesh)
@@ -1183,10 +1388,22 @@ def make_shard_and_gather_fns(
     )
 
     def _make_shard_fn(sharding: NamedSharding) -> Callable:
-        """Build a per-leaf "device_put with this sharding" closure."""
+        """Build a per-leaf "device_put with this sharding" closure.
+
+        Args:
+            sharding: JAX sharding object describing how an array is placed.
+
+        Returns:
+            Result described by this helper.
+        """
 
         def _shard(x, _sharding=sharding):
-            """Place ``x`` on devices according to the captured ``NamedSharding``."""
+            """Place ``x`` on devices according to the captured ``NamedSharding``.
+
+            Args:
+                x: Input value consumed by the operation.
+                _sharding:  sharding value consumed by this operation.
+            """
             if hasattr(x, "shape"):
                 spec = sanitize_partition_spec_for_mesh_and_shape(_sharding.spec, mesh=mesh, shape=tuple(x.shape))
                 return jax.device_put(x, NamedSharding(_sharding.mesh, spec))
@@ -1195,11 +1412,23 @@ def make_shard_and_gather_fns(
         return _shard
 
     def _make_gather_fn(sharding: NamedSharding) -> Callable:
-        """Build a per-leaf "device_put as fully replicated" closure."""
+        """Build a per-leaf "device_put as fully replicated" closure.
+
+        Args:
+            sharding: JAX sharding object describing how an array is placed.
+
+        Returns:
+            Result described by this helper.
+        """
         replicated = NamedSharding(sharding.mesh, PartitionSpec())
 
         def _gather(x, _replicated=replicated):
-            """Replicate ``x`` across every device on the captured mesh."""
+            """Replicate ``x`` across every device on the captured mesh.
+
+            Args:
+                x: Input value consumed by the operation.
+                _replicated:  replicated value consumed by this operation.
+            """
             if hasattr(x, "shape"):
                 return jax.device_put(x, _replicated)
             return x
@@ -1258,10 +1487,21 @@ def apply_logical_sharding(
     """Apply a logical sharding constraint without depending on eformer.
 
     If ``partition_manager`` provides a ``resolve`` method, it is used
-    for compatibility with existing EasyDeL config objects. Otherwise
+        for compatibility with existing EasyDeL config objects. Otherwise
     ``axes`` is treated as an already-physical ``PartitionSpec``. MPMD
     placement is inherited from the manager's mesh, or from the active
     :class:`SpxMesh` plus ``assign_stage(...)`` context.
+
+    Args:
+        x: Input value consumed by the operation.
+        partition_manager: Partition manager value consumed by this operation.
+        axes: Axes value consumed by this operation.
+        mode: Mode value consumed by this operation.
+        dynamic_axes: Dynamic axes value consumed by this operation.
+        auto_correct: Auto correct value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if not hasattr(x, "shape"):
         return x
@@ -1299,6 +1539,13 @@ def _identity_mesh_axis_rules(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -
     Used as the baseline ``current_axis_rules()`` overrides, so that
     ``Sharding.to_partition_spec`` can resolve raw mesh-axis names
     even when no logical-rule context is active.
+
+    Args:
+        base_mesh: Base mesh value consumed by this operation.
+        mpmd_mesh: Mpmd mesh value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     axis_names = mpmd_mesh.spmd_axis_names if mpmd_mesh is not None else base_mesh.axis_names
     return {name: name for name in axis_names}
@@ -1358,6 +1605,13 @@ def named_sharding_for_variable(var: Variable, mesh: "Mesh | SpxMesh | MpMdMesh"
     stage sub-mesh. Untagged variables resolve against the full mesh,
     which means they replicate across the pipeline axis unless their
     spec explicitly names it.
+
+    Args:
+        var: Var value consumed by this operation.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     resolved = named_sharding_for_metadata(var.metadata, mesh)
     if resolved is not None:
@@ -1374,6 +1628,13 @@ def get_named_sharding(module: Module, mesh: "Mesh | SpxMesh | MpMdMesh") -> dic
     or an :class:`~spectrax.runtime.types.MpMdMesh`. When the mesh is
     MPMD and a variable carries a stage hint, the returned sharding is
     stage-local automatically.
+
+    Args:
+        module: SpectraX module instance operated on by the helper.
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     out: dict[str, dict[str, NamedSharding]] = {}
     for path, var in _iter_variables(module):
@@ -1387,6 +1648,13 @@ def with_sharding_constraint_by_name(x: ArrayLike, axis_names: AxisNames) -> Arr
     Inside an active :func:`logical_axis_rules` context the logical names
     are resolved to physical mesh axes; outside one the constraint is a
     no-op replicate.
+
+    Args:
+        x: Input value consumed by the operation.
+        axis_names: Named mesh or collective axes used by the operation.
+
+    Returns:
+        Result described by this helper.
     """
 
     rules = current_axis_rules()

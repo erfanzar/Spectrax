@@ -32,7 +32,16 @@ def normal(stddev: float = 1.0, mean: float = 0.0) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Draw ``jax.random.normal(key, shape) * stddev + mean``."""
+        """Draw ``jax.random.normal(key, shape) * stddev + mean``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         return jax.random.normal(key, shape, dtype=dtype) * stddev + mean
 
     return init
@@ -65,7 +74,16 @@ def truncated_normal(
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Draw a truncated-normal sample and scale by ``stddev``."""
+        """Draw a truncated-normal sample and scale by ``stddev``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         return jax.random.truncated_normal(key, lower, upper, shape, dtype=dtype) * stddev
 
     return init

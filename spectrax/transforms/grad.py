@@ -144,6 +144,13 @@ def value_and_grad(
         :func:`jax.value_and_grad` over the module pytree (when ``rest``
         is empty) or to a state-partitioned pure closure that overlays
         ``target`` and ``rest`` before calling ``fn``.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         idx = argnum if argnum is not None else _find_first_module(args)
         model = args[idx]
@@ -181,6 +188,15 @@ def value_and_grad(
             ``has_aux=True`` on the inner :func:`jax.value_and_grad`
             call so it can pass ``rest_state`` and ``aux`` through
             uniformly.
+
+            Args:
+                target_state: Target state value consumed by this operation.
+                rest_state: Rest state value consumed by this operation.
+                other: Other value consumed by this operation.
+                kw: Keyword arguments forwarded to the wrapped callable.
+
+            Returns:
+                Result described by this helper.
             """
             merged = target_state.overlay(rest_state)
             m = bind(gdef, merged)
@@ -280,6 +296,13 @@ def grad(
         Strips the value (and aux when ``has_aux`` is unset) from the
         underlying :func:`value_and_grad` return so the user sees the
         same surface as :func:`jax.grad`.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Return only the gradient half of the :func:`value_and_grad` output.
         """
         out = vg(*args, **kwargs)
         if has_aux:
@@ -357,6 +380,13 @@ def vjp(
         Rejects keyword primals (since :func:`jax.vjp` does not support
         them), then forwards positional primals into the shared
         :func:`_vjp_call` implementation.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         _ensure_no_kwargs("vjp", kwargs)
         return _vjp_call(fn, args, has_aux=has_aux, reduce_axes=reduce_axes, mutable=mutable)
@@ -427,6 +457,13 @@ def jvp(
         Forwards the eventual ``(primals, tangents)`` invocation through
         the shared :func:`_jvp_call` implementation, preserving
         ``has_aux`` and ``mutable`` from the outer ``spx.jvp`` call.
+
+        Args:
+            primals_: Primals  value consumed by this operation.
+            tangents_: Tangents  value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         return _jvp_call(fn, primals_, tangents_, has_aux=has_aux, mutable=mutable)
 
@@ -564,12 +601,25 @@ def _zeros_like_tree(tree: object) -> object:
     Used to seed the cotangent for the ``new_states`` half of a
     ``pure_with_updates`` pullback so the user only ever sees the
     cotangent for the actual function output.
+
+    Args:
+        tree: PyTree consumed or produced by the helper.
+
+    Returns:
+        Result described by this helper.
     """
     return jax.tree.map(jax.numpy.zeros_like, tree)
 
 
 def _state_is_empty(state: State) -> bool:
-    """Return ``True`` when ``state`` contains no collections."""
+    """Return ``True`` when ``state`` contains no collections.
+
+    Args:
+        state: SpectraX state tree or transform state passed into the operation.
+
+    Returns:
+        Return ``True`` when ``state`` contains no collections.
+    """
     return not state.collections()
 
 
@@ -680,6 +730,16 @@ def _vjp_call(
     returned pullback uses :func:`_splice_module_cotangents` /
     :func:`_splice_one_cotangent` to reshape JAX cotangents back into
     the primal-tuple layout.
+
+    Args:
+        fn: Callable being wrapped, traced, transformed, or executed.
+        primals: Primal inputs supplied to a differentiation transform.
+        has_aux: Has aux value consumed by this operation.
+        reduce_axes: Reduce axes value consumed by this operation.
+        mutable: Mutable value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     args = tuple(primals)
     mutable_sel = resolve_mutable(mutable)
@@ -698,6 +758,12 @@ def _vjp_call(
                 function, calls the underlying ``vjp_fn``, and re-packages the
                 result so the user sees module-shaped grads (where applicable)
                 rather than raw state pytrees.
+
+                Args:
+                    cotangent: Cotangent supplied to a pullback or transpose rule.
+
+                Returns:
+                    Result described by this helper.
                 """
                 cotangents = pullback(cotangent)
                 return _convert_direct_cotangents(args, cotangents)
@@ -713,6 +779,12 @@ def _vjp_call(
             function, calls the underlying ``vjp_fn``, and re-packages the
             result so the user sees module-shaped grads (where applicable)
             rather than raw state pytrees.
+
+            Args:
+                cotangent: Cotangent supplied to a pullback or transpose rule.
+
+            Returns:
+                Result described by this helper.
             """
             cotangents = pullback(cotangent)
             return _convert_direct_cotangents(args, cotangents)
@@ -745,6 +817,12 @@ def _vjp_call(
                     function, calls the underlying ``vjp_fn``, and re-packages the
                     result so the user sees module-shaped grads (where applicable)
                     rather than raw state pytrees.
+
+                    Args:
+                        cotangent: Cotangent supplied to a pullback or transpose rule.
+
+                    Returns:
+                        Result described by this helper.
                     """
                     cotangents = pullback(cotangent)
                     return _splice_one_cotangent(locator, tuple(cotangents[1:]), cotangents[0])
@@ -758,6 +836,13 @@ def _vjp_call(
                 pure ``(state, *args) -> (output, new_state)`` interface even though
                 the user wrote a stateful module-method. The caller separately
                 applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+                Args:
+                    state: SpectraX state tree or transform state passed into the operation.
+                    *other: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
                 """
                 (out, aux), new_state = pure_one(state, *other)
                 return (out, new_state), aux
@@ -773,6 +858,12 @@ def _vjp_call(
                 function, calls the underlying ``vjp_fn``, and re-packages the
                 result so the user sees module-shaped grads (where applicable)
                 rather than raw state pytrees.
+
+                Args:
+                    cotangent: Cotangent supplied to a pullback or transpose rule.
+
+                Returns:
+                    Result described by this helper.
                 """
                 cotangents = pullback((cotangent, zero_state))
                 return _splice_one_cotangent(locator, tuple(cotangents[1:]), cotangents[0])
@@ -792,6 +883,12 @@ def _vjp_call(
                 function, calls the underlying ``vjp_fn``, and re-packages the
                 result so the user sees module-shaped grads (where applicable)
                 rather than raw state pytrees.
+
+                Args:
+                    cotangent: Cotangent supplied to a pullback or transpose rule.
+
+                Returns:
+                    Result described by this helper.
                 """
                 cotangents = pullback(cotangent)
                 return _splice_one_cotangent(locator, tuple(cotangents[1:]), cotangents[0])
@@ -805,6 +902,13 @@ def _vjp_call(
             pure ``(state, *args) -> (output, new_state)`` interface even though
             the user wrote a stateful module-method. The caller separately
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+            Args:
+                state: SpectraX state tree or transform state passed into the operation.
+                *other: Additional positional arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
             """
             return cast(tuple[object, State], pure_one(state, *other))
 
@@ -819,6 +923,12 @@ def _vjp_call(
             function, calls the underlying ``vjp_fn``, and re-packages the
             result so the user sees module-shaped grads (where applicable)
             rather than raw state pytrees.
+
+            Args:
+                cotangent: Cotangent supplied to a pullback or transpose rule.
+
+            Returns:
+                Result described by this helper.
             """
             cotangents = pullback((cotangent, zero_state))
             return _splice_one_cotangent(locator, tuple(cotangents[1:]), cotangents[0])
@@ -843,6 +953,12 @@ def _vjp_call(
                 function, calls the underlying ``vjp_fn``, and re-packages the
                 result so the user sees module-shaped grads (where applicable)
                 rather than raw state pytrees.
+
+                Args:
+                    cotangent: Cotangent supplied to a pullback or transpose rule.
+
+                Returns:
+                    Result described by this helper.
                 """
                 state_cts, arg_cts, _ = pullback(cotangent)
                 return _splice_module_cotangents(refs, arg_cts, state_cts)
@@ -858,6 +974,14 @@ def _vjp_call(
             pure ``(state, *args) -> (output, new_state)`` interface even though
             the user wrote a stateful module-method. The caller separately
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+            Args:
+                states: States value consumed by this operation.
+                stripped: Stripped value consumed by this operation.
+                kwargs: Keyword arguments forwarded to the wrapped callable.
+
+            Returns:
+                Result described by this helper.
             """
             (out, aux), new_states = pure(states, stripped, kwargs)
             return (out, cast(tuple[State, ...], new_states)), aux
@@ -875,6 +999,12 @@ def _vjp_call(
             function, calls the underlying ``vjp_fn``, and re-packages the
             result so the user sees module-shaped grads (where applicable)
             rather than raw state pytrees.
+
+            Args:
+                cotangent: Cotangent supplied to a pullback or transpose rule.
+
+            Returns:
+                Result described by this helper.
             """
             state_cts, arg_cts, _ = pullback((cotangent, zero_states))
             return _splice_module_cotangents(refs, arg_cts, state_cts)
@@ -894,6 +1024,12 @@ def _vjp_call(
             function, calls the underlying ``vjp_fn``, and re-packages the
             result so the user sees module-shaped grads (where applicable)
             rather than raw state pytrees.
+
+            Args:
+                cotangent: Cotangent supplied to a pullback or transpose rule.
+
+            Returns:
+                Result described by this helper.
             """
             state_cts, arg_cts, _ = pullback(cotangent)
             return _splice_module_cotangents(refs, arg_cts, state_cts)
@@ -909,6 +1045,14 @@ def _vjp_call(
         pure ``(state, *args) -> (output, new_state)`` interface even though
         the user wrote a stateful module-method. The caller separately
         applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+        Args:
+            states: States value consumed by this operation.
+            stripped: Stripped value consumed by this operation.
+            kwargs: Keyword arguments forwarded to the wrapped callable.
+
+        Returns:
+            Result described by this helper.
         """
         out, new_states = pure(states, stripped, kwargs)
         return out, new_states
@@ -924,6 +1068,12 @@ def _vjp_call(
         function, calls the underlying ``vjp_fn``, and re-packages the
         result so the user sees module-shaped grads (where applicable)
         rather than raw state pytrees.
+
+        Args:
+            cotangent: Cotangent supplied to a pullback or transpose rule.
+
+        Returns:
+            Result described by this helper.
         """
         state_cts, arg_cts, _ = pullback((cotangent, zero_states))
         return _splice_module_cotangents(refs, arg_cts, state_cts)
@@ -950,6 +1100,16 @@ def _jvp_call(
     actual JVP so JAX never sees the auxiliary output. When
     ``mutable_sel`` is non-``None``, captured mutations from the primal
     pass are written back to the live module before returning.
+
+    Args:
+        fn: Callable being wrapped, traced, transformed, or executed.
+        primals: Primal inputs supplied to a differentiation transform.
+        tangents: Tangent inputs supplied to a JVP transform.
+        has_aux: Has aux value consumed by this operation.
+        mutable: Mutable value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     args = tuple(primals)
     tangent_args = tuple(tangents)
@@ -983,7 +1143,14 @@ def _jvp_call(
                 apply_mutations([ref], [new_state], mutable_sel)
 
             def fn_noaux(*a: object) -> object:
-                """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar."""
+                """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar.
+
+                Args:
+                    *a: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                Returns:
+                    Result described by this helper.
+                """
                 value, _aux = fn(*a)
                 return value
 
@@ -1001,7 +1168,15 @@ def _jvp_call(
             else:
 
                 def out_only(state: State, *other: object) -> object:
-                    """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``."""
+                    """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``.
+
+                    Args:
+                        state: SpectraX state tree or transform state passed into the operation.
+                        *other: Additional positional arguments forwarded to the wrapped callable or backend.
+
+                    Returns:
+                        Result described by this helper.
+                    """
                     out_only_val, _ignored_state = pure_noaux(state, *other)
                     return out_only_val
 
@@ -1027,6 +1202,13 @@ def _jvp_call(
             pure ``(state, *args) -> (output, new_state)`` interface even though
             the user wrote a stateful module-method. The caller separately
             applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+            Args:
+                state: SpectraX state tree or transform state passed into the operation.
+                *other: Additional positional arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
             """
             return cast(tuple[object, State], pure_one(state, *other))
 
@@ -1051,7 +1233,14 @@ def _jvp_call(
             apply_mutations(refs, list(new_states), mutable_sel)
 
         def fn_noaux(*a: object) -> object:
-            """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar."""
+            """``has_aux=False`` adapter: drop the aux output so ``jax.grad`` sees a scalar.
+
+            Args:
+                *a: Additional positional arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
+            """
             value, _aux = fn(*a)
             return value
 
@@ -1065,7 +1254,16 @@ def _jvp_call(
         else:
 
             def out_only(states: tuple[State, ...], stripped: tuple[object, ...], kwargs: dict[str, object]) -> object:
-                """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``."""
+                """Pure-output adapter: return only the primary output (no state) for ``jax.value_and_grad``.
+
+                Args:
+                    states: States value consumed by this operation.
+                    stripped: Stripped value consumed by this operation.
+                    kwargs: Keyword arguments forwarded to the wrapped callable.
+
+                Returns:
+                    Result described by this helper.
+                """
                 out_only_val, _ignored_states = pure_noaux(states, stripped, kwargs)
                 return out_only_val
 
@@ -1093,6 +1291,14 @@ def _jvp_call(
         pure ``(state, *args) -> (output, new_state)`` interface even though
         the user wrote a stateful module-method. The caller separately
         applies ``new_state`` back to the live module via :func:`apply_mutations`.
+
+        Args:
+            states: States value consumed by this operation.
+            stripped: Stripped value consumed by this operation.
+            kwargs: Keyword arguments forwarded to the wrapped callable.
+
+        Returns:
+            Result described by this helper.
         """
         out, new_states = pure(states, stripped, kwargs)
         return out, new_states

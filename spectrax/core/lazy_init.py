@@ -17,12 +17,20 @@ _LAZY_STATE: threading.local = threading.local()
 
 
 def _explicit_lazy_mode() -> bool:
-    """Return ``True`` when construction happens under :func:`lazy_init`."""
+    """Return ``True`` when construction happens under :func:`lazy_init`.
+
+    Returns:
+        Return ``True`` when construction happens under :func:`lazy_init`.
+    """
     return bool(getattr(_LAZY_STATE, "explicit_lazy", False))
 
 
 def _materialization_allowed() -> bool:
-    """Return ``True`` when lazy modules may materialize on this thread."""
+    """Return ``True`` when lazy modules may materialize on this thread.
+
+    Returns:
+        Return ``True`` when lazy modules may materialize on this thread.
+    """
     return bool(getattr(_LAZY_STATE, "allow_materialization", False))
 
 
@@ -48,7 +56,11 @@ def lazy_init() -> Iterator[None]:
 
 @contextlib.contextmanager
 def _allow_materialization() -> Iterator[None]:
-    """Temporarily allow lazy modules to materialize."""
+    """Temporarily allow lazy modules to materialize.
+
+    Returns:
+        Result described by this helper.
+    """
     prev = _materialization_allowed()
     _LAZY_STATE.allow_materialization = True
     try:

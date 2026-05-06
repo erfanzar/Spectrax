@@ -34,14 +34,20 @@ def resolve_mpmd_mesh(mesh: object) -> MpMdMesh:
     """Coerce ``mesh`` to a :class:`MpMdMesh`.
 
     Accepts:
-    * :class:`~spectrax.sharding.SpxMesh` with ``mpmd_axis`` set
-      (canonical, preferred).
-    * :class:`MpMdMesh` (legacy direct usage; still supported).
+        * :class:`~spectrax.sharding.SpxMesh` with ``mpmd_axis`` set
+          (canonical, preferred).
+        * :class:`MpMdMesh` (legacy direct usage; still supported).
 
-    Raises if neither, or if an :class:`SpxMesh` was passed without an
+        Raises if neither, or if an :class:`SpxMesh` was passed without an
     MPMD axis configured. The :class:`SpxMesh` import is performed
     lazily here to avoid a ``spectrax.sharding`` ↔ ``spectrax.runtime``
     module import cycle.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     from ...sharding.mesh import SpxMesh
 
@@ -97,17 +103,29 @@ class MpMdMesh:
 
     @property
     def mpmd_dim(self) -> int:
-        """Number of pipeline stages (size along the MPMD axis)."""
+        """Number of pipeline stages (size along the MPMD axis).
+
+        Returns:
+            Result described by this helper.
+        """
         return int(self.jax_mesh.shape[self.mpmd_axis_name])
 
     @property
     def mpmd_axis(self) -> int:
-        """Index of the MPMD axis within ``jax_mesh.axis_names``."""
+        """Index of the MPMD axis within ``jax_mesh.axis_names``.
+
+        Returns:
+            Result described by this helper.
+        """
         return self.jax_mesh.axis_names.index(self.mpmd_axis_name)
 
     @property
     def spmd_axis_names(self) -> tuple[str, ...]:
-        """Axis names *other than* the MPMD axis — available for SPMD."""
+        """Axis names *other than* the MPMD axis — available for SPMD.
+
+        Returns:
+            Result described by this helper.
+        """
         return tuple(n for n in self.jax_mesh.axis_names if n != self.mpmd_axis_name)
 
     def submesh(self, mpmd_idx: int) -> Mesh:
@@ -145,7 +163,11 @@ class MpMdMesh:
         return Mesh(devices, self.spmd_axis_names, axis_types=spmd_axis_types)
 
     def unstack(self) -> list[Mesh]:
-        """Return one :class:`~jax.sharding.Mesh` per pipeline stage."""
+        """Return one :class:`~jax.sharding.Mesh` per pipeline stage.
+
+        Returns:
+            Return one :class:`~jax.sharding.Mesh` per pipeline stage.
+        """
         return [self.submesh(i) for i in range(self.mpmd_dim)]
 
     def sub_sharding(
@@ -186,10 +208,13 @@ class MpMdMesh:
         """Return the MPMD stage a device belongs to.
 
         Args:
-            device: A :class:`jax.Device`.
+                    device: A :class:`jax.Device`.
 
         Raises:
-            ValueError: If ``device`` is not part of ``jax_mesh``.
+                    ValueError: If ``device`` is not part of ``jax_mesh``.
+
+        Returns:
+            Return the MPMD stage a device belongs to.
         """
         flat = self.jax_mesh.devices.reshape(-1)
         shape = self.jax_mesh.devices.shape
@@ -210,6 +235,9 @@ class MpMdMesh:
         MPMD group whose devices live in the current process; raises
         :class:`ValueError` if the process straddles multiple groups
         (a misconfiguration).
+
+        Returns:
+            Return the MPMD stage the current process owns, or ``None``.
         """
         if jax.process_count() == 1:
             return None

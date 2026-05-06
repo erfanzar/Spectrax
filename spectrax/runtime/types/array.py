@@ -69,18 +69,30 @@ class StagesArray:
 
     @property
     def mpmd_idxs(self) -> frozenset[int]:
-        """Set of pipeline-stage indices this array lives on."""
+        """Set of pipeline-stage indices this array lives on.
+
+        Returns:
+            Result described by this helper.
+        """
         return frozenset(self.shards.keys())
 
     @property
     def shape(self) -> tuple[int, ...]:
-        """Shape of each per-stage shard (all shards share the same shape)."""
+        """Shape of each per-stage shard (all shards share the same shape).
+
+        Returns:
+            Result described by this helper.
+        """
         first = next(iter(self.shards.values()))
         return first.shape
 
     @property
     def dtype(self) -> DType:
-        """Dtype of each per-stage shard."""
+        """Dtype of each per-stage shard.
+
+        Returns:
+            Result described by this helper.
+        """
         first = next(iter(self.shards.values()))
         return first.dtype
 
@@ -91,6 +103,9 @@ class StagesArray:
         Single-process runs have every device local, so this is always
         ``False``. In multi-process mode some shards live on remote
         hosts and :attr:`shards` may only give you a subset.
+
+        Returns:
+            Result described by this helper.
         """
         local = set(jax.local_devices())
         for arr in self.shards.values():
@@ -106,6 +121,9 @@ class StagesArray:
         ``0`` in single-process runs. In multi-process runs it identifies
         which host is asking — useful when building cross-process
         placement decisions around this array's shards.
+
+        Returns:
+            Result described by this helper.
         """
         return int(jax.process_index())
 
@@ -116,6 +134,9 @@ class StagesArray:
         In single-process mode this equals :attr:`shards`. In multi-process
         mode it returns only the entries callable code can inspect
         without crossing process boundaries.
+
+        Returns:
+            Result described by this helper.
         """
         local_devs = set(jax.local_devices())
         local: dict[int, jax.Array] = {}
@@ -130,8 +151,11 @@ class StagesArray:
 
         Empty in single-process mode. When non-empty, those shards can
         only be consumed by the owning process; calling :meth:`__getitem__`
-        with a remote index returns an array handle whose concrete
+                with a remote index returns an array handle whose concrete
         values aren't addressable here.
+
+        Returns:
+            Result described by this helper.
         """
         local = set(self.local_shards.keys())
         return frozenset(self.shards.keys()) - local
@@ -151,14 +175,17 @@ class StagesArray:
         untouched.
 
         Args:
-            target_process: Index of the destination process as
-                reported by :func:`jax.process_index`.
+                    target_process: Index of the destination process as
+                        reported by :func:`jax.process_index`.
 
         Raises:
-            ValueError: If ``target_process`` owns no devices visible
-                to the caller (e.g. the caller holds no handle to any
-                of that process's devices and ``jax.distributed`` is
-                not initialized).
+                    ValueError: If ``target_process`` owns no devices visible
+                        to the caller (e.g. the caller holds no handle to any
+                        of that process's devices and ``jax.distributed`` is
+                        not initialized).
+
+        Returns:
+            Result described by this helper.
         """
         target_devs = [d for d in jax.devices() if int(d.process_index) == int(target_process)]
         if not target_devs:
@@ -177,11 +204,19 @@ class StagesArray:
         return StagesArray(shards=new_shards, replicated=self.replicated)
 
     def __len__(self) -> int:
-        """Return the number of shards."""
+        """Return the number of shards.
+
+        Returns:
+            Integer length for the container.
+        """
         return len(self.shards)
 
     def __iter__(self) -> Iterator[jax.Array]:
-        """Iterate over shards in sorted index order."""
+        """Iterate over shards in sorted index order.
+
+        Returns:
+            Iterator over the contained values.
+        """
         for idx in sorted(self.shards.keys()):
             yield self.shards[idx]
 
@@ -189,19 +224,40 @@ class StagesArray:
         """Return the shard at ``mpmd_idx``.
 
         Raises:
-            KeyError: If this :class:`StagesArray` does not live on stage
-                ``mpmd_idx``.
+                    KeyError: If this :class:`StagesArray` does not live on stage
+                        ``mpmd_idx``.
+
+        Args:
+            mpmd_idx: Mpmd idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
         """
         if mpmd_idx not in self.shards:
             raise KeyError(f"StagesArray has no shard at mpmd_idx={mpmd_idx}; lives on {sorted(self.mpmd_idxs)}.")
         return self.shards[mpmd_idx]
 
     def __contains__(self, mpmd_idx: int) -> bool:
-        """Return ``True`` iff this array has a shard at ``mpmd_idx``."""
+        """Return ``True`` iff this array has a shard at ``mpmd_idx``.
+
+        Args:
+            mpmd_idx: Mpmd idx value consumed by this operation.
+
+        Returns:
+            Return ``True`` iff this array has a shard at ``mpmd_idx``.
+        """
         return mpmd_idx in self.shards
 
     def with_shard(self, mpmd_idx: int, array: jax.Array) -> StagesArray:
-        """Return a copy with shard ``mpmd_idx`` replaced by ``array``."""
+        """Return a copy with shard ``mpmd_idx`` replaced by ``array``.
+
+        Args:
+            mpmd_idx: Mpmd idx value consumed by this operation.
+            array: Array value consumed by this operation.
+
+        Returns:
+            Return a copy with shard ``mpmd_idx`` replaced by ``array``.
+        """
         if array.shape != self.shape or array.dtype != self.dtype:
             raise ValueError(
                 f"New shard has shape/dtype {array.shape}/{array.dtype}; expected {self.shape}/{self.dtype}."
@@ -215,6 +271,9 @@ class StagesArray:
 
         Convenient for single-shard :class:`StagesArray` s — raises if
         the array lives on more than one stage.
+
+        Returns:
+            Return the first shard as a plain :class:`jax.Array`.
         """
         if len(self.shards) != 1:
             raise ValueError(
@@ -229,6 +288,9 @@ class StagesArray:
         :class:`jax.Array`. Because shards typically live on different
         devices, a direct device-side add would fail — this routes
         through numpy on purpose.
+
+        Returns:
+            Result described by this helper.
         """
         acc: np.ndarray | None = None
         for arr in self.shards.values():
@@ -242,6 +304,9 @@ class StagesArray:
 
         Use when this :class:`StagesArray` was constructed to represent a
         constant that happens to be computed on multiple stages.
+
+        Returns:
+            Return any shard, asserting ``replicated`` was set.
         """
         if not self.replicated:
             raise ValueError("replicated_value() requires StagesArray(replicated=True).")
@@ -249,14 +314,23 @@ class StagesArray:
 
 
 def _flatten_stages_array(arr: StagesArray):
-    """PyTree flatten: ordered list of shard arrays + aux tuple of idxs."""
+    """PyTree flatten: ordered list of shard arrays + aux tuple of idxs.
+
+    Args:
+        arr: Arr value consumed by this operation.
+    """
     idxs = tuple(sorted(arr.shards.keys()))
     leaves = tuple(arr.shards[i] for i in idxs)
     return leaves, (idxs, arr.replicated)
 
 
 def _unflatten_stages_array(aux, leaves):
-    """PyTree unflatten: rebuild StagesArray from leaves + aux."""
+    """PyTree unflatten: rebuild StagesArray from leaves + aux.
+
+    Args:
+        aux: Aux value consumed by this operation.
+        leaves: Leaves value consumed by this operation.
+    """
     idxs, replicated = aux
     shards = dict(zip(idxs, leaves, strict=True))
     return StagesArray(shards=shards, replicated=replicated)

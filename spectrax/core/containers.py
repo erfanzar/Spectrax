@@ -46,7 +46,15 @@ P = TypeVar("P", bound=Parameter)
 
 
 def _stack_module_states(items: list[Module], *, context: str) -> tuple[GraphDef, State]:
-    """Export homogeneous modules and stack their states on a leading axis."""
+    """Export homogeneous modules and stack their states on a leading axis.
+
+    Args:
+        items: Items value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     from .graph import export
 
     if not items:
@@ -71,6 +79,13 @@ def _stack_module_scan_states(items: list[Module], *, context: str) -> tuple[tup
     per-layer static fields (for example layer indices, helper closures, or
     placement metadata). ``ModuleList.scan`` can preserve those per-layer
     graph definitions by dispatching the scan body through ``lax.switch``.
+
+    Args:
+        items: Items value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     from .graph import export
 
@@ -103,6 +118,12 @@ def _scan_graph_signature(gdef: GraphDef) -> GraphDef:
     Pipeline stage metadata is intentionally per layer, so it must not make
     homogeneous transformer blocks fail scan/stack checks. Normal export still
     preserves the metadata for sharding and placement.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+
+    Returns:
+        Return a graph signature suitable for repeated-layer scans.
     """
     nodes = []
     changed = False
@@ -130,6 +151,12 @@ def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[object, ...]:
     Static values and opaque object identities are intentionally excluded.
     ``ModuleList.scan`` preserves those values by binding each layer with its
     own graph definition inside a ``lax.switch`` branch.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+
+    Returns:
+        Return the state/child topology used to decide scan compatibility.
     """
     nodes: list[object] = []
     for node in gdef.nodes:
@@ -159,7 +186,16 @@ def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[object, ...]:
 
 
 def _scan_normalize_value(value: object, *, _depth: int = 0, _seen: set[int] | None = None) -> object:
-    """Normalize static/opaque values for scan template compatibility checks."""
+    """Normalize static/opaque values for scan template compatibility checks.
+
+    Args:
+        value: Value consumed by the helper.
+        _depth:  depth value consumed by this operation.
+        _seen:  seen value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if _seen is None:
         _seen = set()
     if _depth > 4:
@@ -294,7 +330,15 @@ class _ScanPlan:
 
 
 def _scan_class_field_names(class_name: str, attr_name: str) -> frozenset[str]:
-    """Return scan metadata field names declared by a module class."""
+    """Return scan metadata field names declared by a module class.
+
+    Args:
+        class_name: Class name value consumed by this operation.
+        attr_name: Attr name value consumed by this operation.
+
+    Returns:
+        Return scan metadata field names declared by a module class.
+    """
     try:
         cls = resolve_class(class_name)
     except Exception:
@@ -306,7 +350,16 @@ def _scan_class_field_names(class_name: str, attr_name: str) -> frozenset[str]:
 
 
 def _scan_static_field_key(node: ModuleNode, name: str, value: object) -> object:
-    """Return the graph-family key payload for a static field."""
+    """Return the graph-family key payload for a static field.
+
+    Args:
+        node: Node value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        value: Value consumed by the helper.
+
+    Returns:
+        Return the graph-family key payload for a static field.
+    """
     safe_fields = _scan_class_field_names(node.class_name, "_spx_scan_safe_static_fields")
     if name in safe_fields:
         return _SCAN_SAFE_VALUE
@@ -314,7 +367,16 @@ def _scan_static_field_key(node: ModuleNode, name: str, value: object) -> object
 
 
 def _scan_opaque_field_key(node: ModuleNode, name: str, value: object) -> object:
-    """Return the graph-family key payload for an opaque field."""
+    """Return the graph-family key payload for an opaque field.
+
+    Args:
+        node: Node value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        value: Value consumed by the helper.
+
+    Returns:
+        Return the graph-family key payload for an opaque field.
+    """
     safe_fields = _scan_class_field_names(node.class_name, "_spx_scan_safe_opaque_fields")
     if name in safe_fields:
         return _SCAN_SAFE_VALUE
@@ -327,6 +389,12 @@ def _scan_graph_family_key(gdef: GraphDef) -> tuple[object, ...]:
     Equal keys mean the graph definitions can share one scan body template.
     Differing behavior-changing statics intentionally produce different keys;
     statics explicitly marked safe by the module class are ignored.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+
+    Returns:
+        Return a scan graph-family key.
     """
     nodes: list[object] = []
     for node in gdef.nodes:
@@ -356,7 +424,15 @@ def _scan_graph_family_key(gdef: GraphDef) -> tuple[object, ...]:
 
 
 def _stack_states(states: list[State], *, context: str) -> State:
-    """Stack same-structure states on a leading layer axis."""
+    """Stack same-structure states on a leading layer axis.
+
+    Args:
+        states: States value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     try:
         return jax.tree.map(lambda *vs: jnp.stack(vs, axis=0), *states)
     except Exception as exc:
@@ -367,7 +443,15 @@ def _stack_states(states: list[State], *, context: str) -> State:
 
 
 def _stage_place_trace_carry(layer: Module, carry: object) -> object:
-    """Move the leading activation carry onto a layer's stage-local mesh."""
+    """Move the leading activation carry onto a layer's stage-local mesh.
+
+    Args:
+        layer: Layer value consumed by this operation.
+        carry: Loop or scan carry value.
+
+    Returns:
+        Result described by this helper.
+    """
     if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(carry)):
         return carry
 
@@ -409,7 +493,14 @@ def _stage_place_trace_carry(layer: Module, carry: object) -> object:
 
 
 def _trace_layer_static_index(layer: Module) -> int | None:
-    """Return the concrete layer index stored on a trace-mode module view."""
+    """Return the concrete layer index stored on a trace-mode module view.
+
+    Args:
+        layer: Layer value consumed by this operation.
+
+    Returns:
+        Return the concrete layer index stored on a trace-mode module view.
+    """
     for attr in ("layer_idx", "layer_index"):
         value = getattr(layer, attr, None)
         if isinstance(value, int):
@@ -418,7 +509,14 @@ def _trace_layer_static_index(layer: Module) -> int | None:
 
 
 def _is_scalar_integer_like(value: object) -> bool:
-    """Return whether ``value`` looks like the carried layer-index scalar."""
+    """Return whether ``value`` looks like the carried layer-index scalar.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return whether ``value`` looks like the carried layer-index scalar.
+    """
     if isinstance(value, int):
         return True
     aval = getattr(value, "aval", None)
@@ -435,6 +533,13 @@ def _inject_trace_layer_index(layer: Module, carry: object) -> object:
     During ``jax.make_jaxpr`` that carry scalar becomes a tracer. When the
     module view already has a concrete ``layer_idx``/``layer_index``, restore
     it in the trailing carry slot so those helpers see the intended index.
+
+    Args:
+        layer: Layer value consumed by this operation.
+        carry: Loop or scan carry value.
+
+    Returns:
+        Result described by this helper.
     """
     layer_index = _trace_layer_static_index(layer)
     if layer_index is None:
@@ -447,10 +552,25 @@ def _inject_trace_layer_index(layer: Module, carry: object) -> object:
 
 
 def _device_put_first_carry_leaf(carry: object, stage_mesh: object) -> object:
-    """Place the leading array carry on ``stage_mesh`` while preserving carry shape."""
+    """Place the leading array carry on ``stage_mesh`` while preserving carry shape.
+
+    Args:
+        carry: Loop or scan carry value.
+        stage_mesh: Mesh assigned to the current pipeline stage.
+
+    Returns:
+        Result described by this helper.
+    """
 
     def place(value: object) -> object:
-        """``device_put`` ``value`` onto ``stage_mesh`` (replicated) if it's a JAX array; else passthrough."""
+        """``device_put`` ``value`` onto ``stage_mesh`` (replicated) if it's a JAX array; else passthrough.
+
+        Args:
+            value: Value consumed by the helper.
+
+        Returns:
+            Result described by this helper.
+        """
         if isinstance(value, jax.Array):
             return jax.device_put(value, jax.sharding.NamedSharding(stage_mesh, jax.sharding.PartitionSpec()))
         return value
@@ -463,7 +583,16 @@ def _device_put_first_carry_leaf(carry: object, stage_mesh: object) -> object:
 
 
 def _slice_stacked_state(stacked: State, start: int, stop: int) -> State:
-    """Slice a stacked state along its leading layer axis."""
+    """Slice a stacked state along its leading layer axis.
+
+    Args:
+        stacked: Stacked value consumed by this operation.
+        start: Start value consumed by this operation.
+        stop: Stop value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     return jax.tree.map(lambda leaf: leaf[start:stop], stacked)
 
 
@@ -477,6 +606,13 @@ def _scan_static_template_signature(
     one graph definition, avoiding per-layer dispatch. Differing static values
     are collapsed only when the module class explicitly marks those fields as
     scan-safe metadata.
+
+    Args:
+        graph_defs: Graph defs value consumed by this operation.
+        family_keys: Family keys value consumed by this operation.
+
+    Returns:
+        Return a reusable graph template when per-layer differences are safe.
     """
     if not graph_defs:
         return None
@@ -491,7 +627,15 @@ def _scan_static_template_signature(
 
 
 def _build_scan_plan_from_exports(exports: list[tuple[GraphDef, State]], *, context: str) -> _ScanPlan:
-    """Build a segmented scan plan from exported module states."""
+    """Build a segmented scan plan from exported module states.
+
+    Args:
+        exports: Exports value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if not exports:
         raise ValueError(f"{context} requires at least one module")
 
@@ -526,14 +670,28 @@ def _scan_plan_cache_key(
     graph_defs: tuple[GraphDef, ...],
     family_keys: tuple[object, ...] | None = None,
 ) -> tuple[object, ...]:
-    """Return a stable key for cached scan segmentation metadata."""
+    """Return a stable key for cached scan segmentation metadata.
+
+    Args:
+        graph_defs: Graph defs value consumed by this operation.
+        family_keys: Family keys value consumed by this operation.
+
+    Returns:
+        Return a stable key for cached scan segmentation metadata.
+    """
     if family_keys is not None:
         return (_graph_epoch(), len(graph_defs), tuple(hash(key) for key in family_keys))
     return (_graph_epoch(), len(graph_defs), tuple(hash(gdef) for gdef in graph_defs))
 
 
 def _cache_plan(owner: Module, key: tuple[object, ...], plan: _ScanPlan) -> None:
-    """Store state-free scan segmentation metadata on a container."""
+    """Store state-free scan segmentation metadata on a container.
+
+    Args:
+        owner: Owner value consumed by this operation.
+        key: Logical key, path segment, or PRNG key used by the operation.
+        plan: Plan value consumed by this operation.
+    """
     segment_specs = tuple((segment.start, segment.stop, segment.gdef, segment.family_id) for segment in plan.segments)
     object.__setattr__(
         owner,
@@ -543,7 +701,15 @@ def _cache_plan(owner: Module, key: tuple[object, ...], plan: _ScanPlan) -> None
 
 
 def _cached_plan_metadata(owner: Module, key: tuple[object, ...]) -> tuple[object, ...] | None:
-    """Return cached scan segmentation metadata when it matches ``key``."""
+    """Return cached scan segmentation metadata when it matches ``key``.
+
+    Args:
+        owner: Owner value consumed by this operation.
+        key: Logical key, path segment, or PRNG key used by the operation.
+
+    Returns:
+        Return cached scan segmentation metadata when it matches ``key``.
+    """
     cache = getattr(owner, "_spx_scan_plan_cache", None)
     if cache is None or cache[0] != key:
         return None
@@ -556,7 +722,16 @@ def _build_cached_scan_plan_from_exports(
     *,
     context: str,
 ) -> _ScanPlan:
-    """Build or reuse a segmented scan plan for live ModuleList items."""
+    """Build or reuse a segmented scan plan for live ModuleList items.
+
+    Args:
+        owner: Owner value consumed by this operation.
+        exports: Exports value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     graph_defs = tuple(gdef for gdef, _state in exports)
     key = _scan_plan_cache_key(graph_defs)
     cached = _cached_plan_metadata(owner, key)
@@ -585,7 +760,15 @@ def _build_cached_scan_plan_from_exports(
 
 
 def _build_scan_plan_from_modules(items: list[Module], *, context: str) -> _ScanPlan:
-    """Export live modules and build a segmented scan plan."""
+    """Export live modules and build a segmented scan plan.
+
+    Args:
+        items: Items value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     from .graph import export
 
     if not items:
@@ -600,7 +783,17 @@ def _build_scan_plan_from_stacked(
     context: str,
     family_keys: tuple[object, ...] | None = None,
 ) -> _ScanPlan:
-    """Build a segmented scan plan for pre-stacked leaves."""
+    """Build a segmented scan plan for pre-stacked leaves.
+
+    Args:
+        graph_defs: Graph defs value consumed by this operation.
+        stacked: Stacked value consumed by this operation.
+        context: Context value consumed by this operation.
+        family_keys: Family keys value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if not graph_defs:
         raise ValueError(f"{context} requires at least one module")
     if family_keys is None:
@@ -647,7 +840,17 @@ def _build_cached_scan_plan_from_stacked(
     *,
     context: str,
 ) -> _ScanPlan:
-    """Build or reuse a segmented scan plan for pre-stacked leaves."""
+    """Build or reuse a segmented scan plan for pre-stacked leaves.
+
+    Args:
+        owner: Owner value consumed by this operation.
+        graph_defs: Graph defs value consumed by this operation.
+        stacked: Stacked value consumed by this operation.
+        context: Context value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     family_keys = getattr(owner, "_spx_item_family_keys", None)
     key = _scan_plan_cache_key(graph_defs, family_keys)
     cached = _cached_plan_metadata(owner, key)
@@ -676,7 +879,15 @@ def _build_cached_scan_plan_from_stacked(
 
 
 def _scan_effective_unroll(unroll: int | None, length: int) -> int:
-    """Resolve explicit ``jax.lax.scan`` unroll values."""
+    """Resolve explicit ``jax.lax.scan`` unroll values.
+
+    Args:
+        unroll: Unroll value consumed by this operation.
+        length: Length value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if length <= 0:
         return 1
     if unroll is None:
@@ -688,12 +899,26 @@ def _scan_effective_unroll(unroll: int | None, length: int) -> int:
 
 
 def _scan_default_unroll(_length: int) -> int:
-    """Choose the compile-oriented default unroll for real scans."""
+    """Choose the compile-oriented default unroll for real scans.
+
+    Args:
+        _length:  length value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     return 1
 
 
 def _scan_constraint_for_metadata(metadata: dict[str, object]) -> object:
-    """Resolve per-layer variable metadata to a scan-body sharding constraint."""
+    """Resolve per-layer variable metadata to a scan-body sharding constraint.
+
+    Args:
+        metadata: Metadata object consumed or produced by the operation.
+
+    Returns:
+        Result described by this helper.
+    """
     from ..sharding.mesh import current_mesh
     from ..sharding.partition import named_sharding_for_metadata
 
@@ -704,7 +929,14 @@ def _scan_constraint_for_metadata(metadata: dict[str, object]) -> object:
 
 
 def _scan_state_constraint_specs(gdef: GraphDef) -> State | None:
-    """Return a State-shaped tree of per-layer sharding constraints."""
+    """Return a State-shaped tree of per-layer sharding constraints.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+
+    Returns:
+        Return a State-shaped tree of per-layer sharding constraints.
+    """
     data: dict[str, dict[str, object]] = {}
     canonical: dict[int, str] = dict(gdef.var_canonical)
     seen_refs: set[int] = set()
@@ -725,7 +957,15 @@ def _scan_state_constraint_specs(gdef: GraphDef) -> State | None:
 
 
 def _apply_nested_constraints(values: dict[str, object], specs: dict[str, object]) -> dict[str, object]:
-    """Apply sharding constraints to a nested state collection."""
+    """Apply sharding constraints to a nested state collection.
+
+    Args:
+        values: Values consumed by the helper.
+        specs: Specs value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     out: dict[str, object] = {}
     for key, value in values.items():
         spec = specs.get(key) if isinstance(specs, dict) else None
@@ -739,7 +979,15 @@ def _apply_nested_constraints(values: dict[str, object], specs: dict[str, object
 
 
 def _apply_scan_state_constraints(state: State, specs: State | None) -> State:
-    """Apply State-shaped scan-body sharding constraints."""
+    """Apply State-shaped scan-body sharding constraints.
+
+    Args:
+        state: SpectraX state tree or transform state passed into the operation.
+        specs: Specs value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if specs is None:
         return state
     constrained: dict[str, dict[str, object]] = {}
@@ -750,13 +998,27 @@ def _apply_scan_state_constraints(state: State, specs: State | None) -> State:
 
 
 def _scan_segment_with_explicit_unroll(segment: _ScanSegment, fn, carry, bind, unroll: int | None):
-    """Run one segment with the direct layer-wise ``lax.scan`` lowering."""
+    """Run one segment with the direct layer-wise ``lax.scan`` lowering.
+
+    Args:
+        segment: Segment value consumed by this operation.
+        fn: Callable being wrapped, traced, transformed, or executed.
+        carry: Loop or scan carry value.
+        bind: Bind value consumed by this operation.
+        unroll: Unroll value consumed by this operation.
+    """
     gdef = segment.gdef
     effective_unroll = _scan_effective_unroll(unroll, segment.length)
     constraint_specs = _scan_state_constraint_specs(gdef)
 
     def body(carry, layer_state, *, gdef=gdef):
-        """``lax.scan`` body: bind a layer's state to the segment graphdef and apply ``fn``."""
+        """``lax.scan`` body: bind a layer's state to the segment graphdef and apply ``fn``.
+
+        Args:
+            carry: Loop or scan carry value.
+            layer_state: Layer state value consumed by this operation.
+            gdef: Gdef value consumed by this operation.
+        """
         layer_state = _apply_scan_state_constraints(layer_state, constraint_specs)
         live = bind(gdef, layer_state)
         return fn(live, carry), None
@@ -803,17 +1065,35 @@ class _ListContainer(Module):
         object.__setattr__(self, "_spx_items", materialized)
 
     def __len__(self) -> int:
-        """Number of stored elements."""
+        """Number of stored elements.
+
+        Returns:
+            Integer length for the container.
+        """
         return len(self._spx_items)
 
     @overload
     def __getitem__(self, idx: int) -> object:
-        """Overload: integer index returns one stored element."""
+        """Overload: integer index returns one stored element.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
+        """
         ...
 
     @overload
     def __getitem__(self, idx: slice) -> _ListContainer:
-        """Overload: slice returns a new container of the same concrete type."""
+        """Overload: slice returns a new container of the same concrete type.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
+        """
         ...
 
     def __getitem__(self, idx: int | slice) -> object:
@@ -821,13 +1101,23 @@ class _ListContainer(Module):
 
         Integer indices return the single element. Slices return a new
         container of the same concrete type.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
         """
         if isinstance(idx, slice):
             return type(self)(self._spx_items[idx])
         return self._spx_items[idx]
 
     def __iter__(self) -> Iterator[object]:
-        """Iterate over stored elements."""
+        """Iterate over stored elements.
+
+        Returns:
+            Iterator over the contained values.
+        """
         return iter(self._spx_items)
 
     def append(self, value: object) -> None:
@@ -860,17 +1150,29 @@ class _ListContainer(Module):
             self.append(v)
 
     def _validate_item(self, value: object) -> None:
-        """Raise :class:`TypeError` if ``value`` is of an unacceptable type."""
+        """Raise :class:`TypeError` if ``value`` is of an unacceptable type.
+
+        Args:
+            value: Value consumed by the helper.
+        """
         raise NotImplementedError
 
     def _spx_graph_children(self) -> Iterator[tuple[int, Module | Variable]]:
-        """Yield ``(index, child)`` for every Module/Variable in the list."""
+        """Yield ``(index, child)`` for every Module/Variable in the list.
+
+        Returns:
+            Result described by this helper.
+        """
         for i, it in enumerate(self._spx_items):
             if isinstance(it, Module | Variable):
                 yield i, it
 
     def _spx_static_fields(self) -> dict[str, object]:
-        """Containers have no static fields."""
+        """Containers have no static fields.
+
+        Returns:
+            Result described by this helper.
+        """
         return {}
 
 
@@ -894,11 +1196,19 @@ class ModuleList(_ListContainer):
     _spx_container_kind: ClassVar[str] = "list"
 
     def __init__(self, items: Iterable[Module] = ()) -> None:
-        """Construct from an iterable of modules."""
+        """Construct from an iterable of modules.
+
+        Args:
+            items: Items value consumed by this operation.
+        """
         super().__init__(items)
 
     def _validate_item(self, value: object) -> None:
-        """Require every item to be a :class:`~spectrax.Module`."""
+        """Require every item to be a :class:`~spectrax.Module`.
+
+        Args:
+            value: Value consumed by the helper.
+        """
         if not isinstance(value, Module):
             raise TypeError(f"ModuleList accepts Modules only, got {type(value).__name__}")
 
@@ -911,6 +1221,10 @@ class ModuleList(_ListContainer):
         Raises:
             RuntimeError: Always, because :class:`ModuleList` cannot be
                 called directly.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
         """
         raise RuntimeError("ModuleList is not callable; iterate or index it.")
 
@@ -939,7 +1253,14 @@ class ModuleList(_ListContainer):
         return self._spx_items[idx]
 
     def _get_traced(self, idx: object) -> Module:
-        """Return the module at tracer index ``idx`` via export/stack/bind."""
+        """Return the module at tracer index ``idx`` via export/stack/bind.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Return the module at tracer index ``idx`` via export/stack/bind.
+        """
         from .graph import bind
 
         cache = getattr(self, "_spx_traced_cache", None)
@@ -1059,7 +1380,12 @@ class ModuleList(_ListContainer):
             gdef, stacked = _stack_module_states(self._spx_items, context="ModuleList.fori_loop")
 
         def body(i, carry):
-            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``."""
+            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``.
+
+            Args:
+                i: I value consumed by this operation.
+                carry: Loop or scan carry value.
+            """
             layer_state = jax.tree.map(lambda leaf: leaf[i], stacked)
             live = bind(gdef, layer_state)
             return fn(i, live, carry)
@@ -1068,7 +1394,14 @@ class ModuleList(_ListContainer):
 
 
 def _prepend_stacked_axis_metadata(metadata: dict[str, object]) -> dict[str, object]:
-    """Adjust variable metadata after adding a leading layer axis."""
+    """Adjust variable metadata after adding a leading layer axis.
+
+    Args:
+        metadata: Metadata object consumed or produced by the operation.
+
+    Returns:
+        Result described by this helper.
+    """
     out = dict(metadata)
     if "axis_names" in out:
         out["axis_names"] = (None, *tuple(out["axis_names"]))
@@ -1082,7 +1415,15 @@ def _prepend_stacked_axis_metadata(metadata: dict[str, object]) -> dict[str, obj
 
 
 def _stacked_variable_like(template: Variable, value: object) -> Variable:
-    """Create a variable of ``template``'s class for a stacked leaf value."""
+    """Create a variable of ``template``'s class for a stacked leaf value.
+
+    Args:
+        template: Template value consumed by this operation.
+        value: Value consumed by the helper.
+
+    Returns:
+        Result described by this helper.
+    """
     cls = type(template)
     var = cls.__new__(cls)
     metadata = _prepend_stacked_axis_metadata(template.metadata)
@@ -1182,23 +1523,42 @@ class StackedModuleList(Module):
             object.__setattr__(self, f"v{i}", _stacked_variable_like(template_var, value))
 
     def __len__(self) -> int:
-        """Number of stacked modules."""
+        """Number of stacked modules.
+
+        Returns:
+            Integer length for the container.
+        """
         return int(self._spx_length)
 
     def __iter__(self) -> Iterator[Module]:
-        """Iterate by materializing read-only layer views."""
+        """Iterate by materializing read-only layer views.
+
+        Returns:
+            Iterator over the contained values.
+        """
         for i in range(len(self)):
             yield cast(Module, self[i])
 
     def __getitem__(self, idx: int | slice) -> object:
-        """Return one layer view or a sliced stacked container."""
+        """Return one layer view or a sliced stacked container.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
+        """
         if isinstance(idx, slice):
             indices = range(*idx.indices(len(self)))
             return ModuleList([self[i] for i in indices]).stack()
         return self._bind_index(idx)
 
     def _spx_static_fields(self) -> dict[str, object]:
-        """Persist the item graph and original leaf paths through bind."""
+        """Persist the item graph and original leaf paths through bind.
+
+        Returns:
+            Result described by this helper.
+        """
         return {
             "_spx_item_gdef": self._spx_item_gdef,
             "_spx_item_gdefs": self._spx_item_gdefs,
@@ -1208,14 +1568,22 @@ class StackedModuleList(Module):
         }
 
     def _spx_graph_children(self) -> Iterator[tuple[str, Module | Variable]]:
-        """Yield stacked leaf variables in deterministic order."""
+        """Yield stacked leaf variables in deterministic order.
+
+        Returns:
+            Result described by this helper.
+        """
         for i in range(len(self._spx_leaf_specs)):
             name = f"v{i}"
             if hasattr(self, name):
                 yield name, getattr(self, name)
 
     def _spx_delete_graph_children(self, names: Iterable[str | int]) -> None:
-        """Remove stacked leaf variables while keeping the leaf table dense."""
+        """Remove stacked leaf variables while keeping the leaf table dense.
+
+        Args:
+            names: Names value consumed by this operation.
+        """
         remove: set[int] = set()
         for name in names:
             if isinstance(name, str) and name.startswith("v"):
@@ -1252,7 +1620,11 @@ class StackedModuleList(Module):
         _bump_graph_epoch()
 
     def _stacked_state(self) -> State:
-        """Rebuild the per-item stacked state expected by ``bind``."""
+        """Rebuild the per-item stacked state expected by ``bind``.
+
+        Returns:
+            Result described by this helper.
+        """
         data: dict[str, dict[str, object]] = {}
         for i, (collection, path) in enumerate(self._spx_leaf_specs):
             var = getattr(self, f"v{i}")
@@ -1260,7 +1632,14 @@ class StackedModuleList(Module):
         return State._from_raw(data)
 
     def _bind_index(self, idx: object) -> Module:
-        """Bind the module at ``idx`` from the stacked state."""
+        """Bind the module at ``idx`` from the stacked state.
+
+        Args:
+            idx: Idx value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         from .graph import bind
 
         graph_defs = getattr(self, "_spx_item_gdefs", ())
@@ -1282,11 +1661,15 @@ class StackedModuleList(Module):
         """Always raises — :class:`StackedModuleList` is not callable.
 
         Returns:
-            Never returns; always raises :class:`RuntimeError`.
+                    Never returns; always raises :class:`RuntimeError`.
 
         Raises:
-            RuntimeError: Always, because :class:`StackedModuleList`
-                cannot be called directly.
+                    RuntimeError: Always, because :class:`StackedModuleList`
+                        cannot be called directly.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
         """
         raise RuntimeError("StackedModuleList is not callable; iterate, index, or scan it.")
 
@@ -1362,7 +1745,12 @@ class StackedModuleList(Module):
         gdef: GraphDef = self._spx_item_gdef
 
         def body(i, carry):
-            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``."""
+            """``fori_loop`` body: bind the i-th layer's state and apply ``fn(i, layer, carry)``.
+
+            Args:
+                i: I value consumed by this operation.
+                carry: Loop or scan carry value.
+            """
             layer_state = jax.tree.map(lambda leaf: leaf[i], stacked)
             live = bind(gdef, layer_state)
             return fn(i, live, carry)
@@ -1381,11 +1769,19 @@ class Sequential(_ListContainer):
     _spx_container_kind: ClassVar[str] = "sequential"
 
     def __init__(self, *modules: Module) -> None:
-        """Construct from positional modules."""
+        """Construct from positional modules.
+
+        Args:
+            *modules: Additional positional arguments forwarded to the wrapped callable or backend.
+        """
         super().__init__(modules)
 
     def _validate_item(self, value: object) -> None:
-        """Require every item to be a :class:`~spectrax.Module`."""
+        """Require every item to be a :class:`~spectrax.Module`.
+
+        Args:
+            value: Value consumed by the helper.
+        """
         if not isinstance(value, Module):
             raise TypeError(f"Sequential accepts Modules only, got {type(value).__name__}")
 
@@ -1419,11 +1815,19 @@ class ParameterList(_ListContainer):
     _spx_container_kind: ClassVar[str] = "list"
 
     def __init__(self, items: Iterable[Parameter] = ()) -> None:
-        """Construct from an iterable of parameters."""
+        """Construct from an iterable of parameters.
+
+        Args:
+            items: Items value consumed by this operation.
+        """
         super().__init__(items)
 
     def _validate_item(self, value: object) -> None:
-        """Require every item to be a :class:`~spectrax.Parameter`."""
+        """Require every item to be a :class:`~spectrax.Parameter`.
+
+        Args:
+            value: Value consumed by the helper.
+        """
         if not isinstance(value, Parameter):
             raise TypeError(f"ParameterList accepts Parameters only, got {type(value).__name__}")
 
@@ -1431,11 +1835,15 @@ class ParameterList(_ListContainer):
         """Always raises — :class:`ParameterList` is not a callable layer.
 
         Returns:
-            Never returns; always raises :class:`RuntimeError`.
+                    Never returns; always raises :class:`RuntimeError`.
 
         Raises:
-            RuntimeError: Always, because :class:`ParameterList` cannot be
-                called directly.
+                    RuntimeError: Always, because :class:`ParameterList` cannot be
+                        called directly.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
         """
         raise RuntimeError("ParameterList is not callable.")
 
@@ -1472,7 +1880,12 @@ class ModuleDict(Module):
                 self[k] = v
 
     def __setitem__(self, key: str, value: Module) -> None:
-        """Assign ``value`` under ``key``, validating both types."""
+        """Assign ``value`` under ``key``, validating both types.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            value: Value consumed by the helper.
+        """
         if not isinstance(value, Module):
             raise TypeError(f"ModuleDict accepts Modules only, got {type(value).__name__}")
         if not isinstance(key, str):
@@ -1482,19 +1895,41 @@ class ModuleDict(Module):
         _bump_graph_epoch()
 
     def __getitem__(self, key: str) -> Module:
-        """Return the module stored under ``key``."""
+        """Return the module stored under ``key``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+
+        Returns:
+            Selected item from the container.
+        """
         return self._spx_items[key]
 
     def __contains__(self, key: object) -> bool:
-        """Membership test by key."""
+        """Membership test by key.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return key in self._spx_items
 
     def __len__(self) -> int:
-        """Number of stored entries."""
+        """Number of stored entries.
+
+        Returns:
+            Integer length for the container.
+        """
         return len(self._spx_items)
 
     def __iter__(self) -> Iterator[str]:
-        """Iterate over keys."""
+        """Iterate over keys.
+
+        Returns:
+            Iterator over the contained values.
+        """
         return iter(self._spx_items)
 
     def keys(self) -> Iterable[str]:
@@ -1523,21 +1958,33 @@ class ModuleDict(Module):
         return self._spx_items.items()
 
     def _spx_graph_children(self) -> Iterator[tuple[str, Module | Variable]]:
-        """Yield ``(key, child)`` for every entry in insertion order."""
+        """Yield ``(key, child)`` for every entry in insertion order.
+
+        Returns:
+            Result described by this helper.
+        """
         yield from self._spx_items.items()
 
     def _spx_static_fields(self) -> dict[str, object]:
-        """Containers have no static fields."""
+        """Containers have no static fields.
+
+        Returns:
+            Result described by this helper.
+        """
         return {}
 
     def forward(self, *args: object, **kwargs: object) -> object:
         """Always raises — :class:`ModuleDict` is not a callable layer.
 
         Returns:
-            Never returns; always raises :class:`RuntimeError`.
+                    Never returns; always raises :class:`RuntimeError`.
 
         Raises:
-            RuntimeError: Always, because :class:`ModuleDict` cannot be
-                called directly.
+                    RuntimeError: Always, because :class:`ModuleDict` cannot be
+                        called directly.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
         """
         raise RuntimeError("ModuleDict is not callable; index by key.")

@@ -53,7 +53,15 @@ class _OptaxModule(Protocol):
     """Subset of :mod:`optax` used by this wrapper."""
 
     def apply_updates(self, params: State, updates: State) -> State:
-        """Apply optax updates to a :class:`State` tree."""
+        """Apply optax updates to a :class:`State` tree.
+
+        Args:
+            params: Parameter mapping or primitive parameter dictionary.
+            updates: Updates value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         ...
 
 

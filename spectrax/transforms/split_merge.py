@@ -262,6 +262,19 @@ def _run_pure_body(
     (the :func:`make_pure_ctx` path), the invocation is wrapped in
     :func:`_ctx_enter` so :func:`~spectrax.scope` lookups inside the
     trace see the traced values instead of concrete ones.
+
+    Args:
+        fn: Callable being wrapped, traced, transformed, or executed.
+        gdefs: Gdefs value consumed by this operation.
+        orig_modules: Orig modules value consumed by this operation.
+        refs: Refs value consumed by this operation.
+        states: States value consumed by this operation.
+        stripped_args: Stripped args value consumed by this operation.
+        stripped_kwargs: Stripped kwargs value consumed by this operation.
+        ctx: Ctx value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     modules = [bind(g, s) for g, s in zip(gdefs, states, strict=False)]
     for src, dst in zip(orig_modules, modules, strict=False):
@@ -302,11 +315,14 @@ def _raise_illegal_mutation(collection: str, path: str) -> NoReturn:
     write.
 
     Args:
-        collection: The variable's collection name (``var.kind``).
-        path: Dotted attribute path to the variable.
+            collection: The variable's collection name (``var.kind``).
+            path: Dotted attribute path to the variable.
 
     Raises:
-        IllegalMutationError: Always.
+            IllegalMutationError: Always.
+
+    Returns:
+        Result described by this helper.
     """
     raise IllegalMutationError(
         f"Collection {collection!r} at path {path!r} changed under a "
@@ -371,6 +387,13 @@ def make_direct_readonly(
         slipped through. Module collections that the caller wants
         to mutate must use the explicit :func:`apply_mutations`
         path instead.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         modules = list(explicit_modules) if explicit_modules is not None else []
         if explicit_modules is None:
@@ -397,6 +420,13 @@ def make_direct_readonly(
             error message includes the variable's path; falls back to
             ``"<unknown>"`` for variables that were created during the
             wrapped function (which is itself a structural mutation).
+
+            Args:
+                var: Var value consumed by this operation.
+                _new:  new value consumed by this operation.
+
+            Returns:
+                Result described by this helper.
             """
             for path, kind, snap_var, _initial in snapshots:
                 if snap_var is var:
@@ -610,7 +640,16 @@ def make_pure(fn: Callable[..., object], refs: list[_ModuleRef]) -> PureFn:
         stripped_args: tuple[object, ...],
         stripped_kwargs: dict[str, object],
     ) -> tuple[object, tuple[State, ...]]:
-        """JAX-traced body: rebind modules, invoke ``fn``, emit only mutated leaves."""
+        """JAX-traced body: rebind modules, invoke ``fn``, emit only mutated leaves.
+
+        Args:
+            states: States value consumed by this operation.
+            stripped_args: Stripped args value consumed by this operation.
+            stripped_kwargs: Stripped kwargs value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
 
     return pure
@@ -643,7 +682,16 @@ def make_pure_readonly(fn: Callable[..., object], refs: list[_ModuleRef]) -> Cal
         stripped_args: tuple[object, ...],
         stripped_kwargs: dict[str, object],
     ) -> object:
-        """JAX-traced body: rebind modules read-only, invoke ``fn``, return its output."""
+        """JAX-traced body: rebind modules read-only, invoke ``fn``, return its output.
+
+        Args:
+            states: States value consumed by this operation.
+            stripped_args: Stripped args value consumed by this operation.
+            stripped_kwargs: Stripped kwargs value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _run_readonly_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, None)
 
     return pure
@@ -674,7 +722,15 @@ def make_pure_single_positional(fn: Callable[..., object], ref: _ModuleRef) -> C
     locator = int(ref.locator)
 
     def pure(state: State, *args_without_module: object) -> tuple[object, State]:
-        """One-module variant: rebind, run ``fn``, return ``(output, mutated_state)``."""
+        """One-module variant: rebind, run ``fn``, return ``(output, mutated_state)``.
+
+        Args:
+            state: SpectraX state tree or transform state passed into the operation.
+            *args_without_module: Additional positional arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
+        """
         return cast(
             tuple[object, State],
             _run_single_positional_body(
@@ -722,7 +778,17 @@ def make_pure_ctx(fn: Callable[..., object], refs: list[_ModuleRef]) -> Callable
         stripped_args: tuple[object, ...],
         stripped_kwargs: dict[str, object],
     ) -> tuple[object, tuple[State, ...]]:
-        """Same shape as :func:`make_pure`'s pure, plus a ``traced_ctx`` arg."""
+        """Same shape as :func:`make_pure`'s pure, plus a ``traced_ctx`` arg.
+
+        Args:
+            states: States value consumed by this operation.
+            traced_ctx: Traced ctx value consumed by this operation.
+            stripped_args: Stripped args value consumed by this operation.
+            stripped_kwargs: Stripped kwargs value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _run_pure_body(fn, gdefs, orig_modules, refs, states, stripped_args, stripped_kwargs, traced_ctx)
 
     return pure
@@ -754,7 +820,17 @@ def make_pure_readonly_ctx(fn: Callable[..., object], refs: list[_ModuleRef]) ->
         stripped_args: tuple[object, ...],
         stripped_kwargs: dict[str, object],
     ) -> object:
-        """Same shape as :func:`make_pure_readonly`'s ``pure``, plus a ``traced_ctx`` arg."""
+        """Same shape as :func:`make_pure_readonly`'s ``pure``, plus a ``traced_ctx`` arg.
+
+        Args:
+            states: States value consumed by this operation.
+            traced_ctx: Traced ctx value consumed by this operation.
+            stripped_args: Stripped args value consumed by this operation.
+            stripped_kwargs: Stripped kwargs value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _run_readonly_body(
             fn,
             gdefs,
@@ -780,13 +856,28 @@ def make_pure_readonly_single_positional(fn: Callable[..., object], ref: _Module
 
     Raises:
         TypeError: If ``ref`` is not a positional ref.
+
+    Args:
+        fn: Callable being wrapped, traced, transformed, or executed.
+        ref: Ref value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if ref.kind != "arg":
         raise TypeError("make_pure_readonly_single_positional() requires a positional Module ref")
     locator = int(ref.locator)
 
     def pure(state: State, *args_without_module: object) -> object:
-        """One-module readonly variant: rebind, run ``fn``, return only its output."""
+        """One-module readonly variant: rebind, run ``fn``, return only its output.
+
+        Args:
+            state: SpectraX state tree or transform state passed into the operation.
+            *args_without_module: Additional positional arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
+        """
         return _run_single_positional_body(
             fn,
             ref.gdef,
@@ -951,6 +1042,10 @@ def _copy_runtime_state(src: Module, dst: Module) -> None:
     therefore do not survive :func:`bind`. This helper walks both trees in
     lockstep and restores them so eager-mode toggles (``train()`` /
     ``eval()``) take effect inside transforms.
+
+    Args:
+        src: Src value consumed by this operation.
+        dst: Dst value consumed by this operation.
     """
     object.__setattr__(dst, "_spx_training", src._spx_training)
     src_children = list(src._spx_graph_children())

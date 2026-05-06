@@ -105,6 +105,33 @@ class TestCheckpointer:
         assert "layer0.weight" in loaded
         assert jnp.allclose(loaded["layer0.weight"], tree["layer0"]["weight"])
 
+    def test_fast_tensorstore_load_options(self, tmp_checkpoint_dir, mesh):
+        """High-level checkpointer forwards TensorStore fast-load options."""
+        cp = Checkpointer(
+            base_path=tmp_checkpoint_dir,
+            save_interval=None,
+            step_policies=[CheckpointInterval(every=10)],
+        )
+        tree = {"layer0": {"weight": jnp.ones((2, 2)), "bias": jnp.zeros(2)}}
+        cp.save_pytree(tree, prefix="model", step=10, mesh=mesh)
+
+        loaded, _ = cp.load_pytree(
+            mesh,
+            prefix="model",
+            path=str(Path(tmp_checkpoint_dir) / "run-10"),
+            discover_latest=False,
+            concurrent_gb=1,
+            tensorstore_io_concurrency=4,
+            tensorstore_copy_concurrency=4,
+            tensorstore_cache_gb=1,
+            tensorstore_assume_metadata=True,
+            tensorstore_metadata_workers=2,
+            show_progress=False,
+            progress_every=2,
+        )
+
+        assert jnp.allclose(loaded["layer0"]["weight"], tree["layer0"]["weight"])
+
     def test_can_skip_structure_preserves_nested_tree_when_load_treedef_true(self, tmp_checkpoint_dir, mesh):
         """High-level index fallback can return a nested reconstructed tree."""
         cp = Checkpointer(

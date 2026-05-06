@@ -145,7 +145,14 @@ def _make_stage_region_spec(
 
 
 def _is_marker_leaf(x: object) -> bool:
-    """Return whether ``x`` can safely be used as a JAX primitive operand."""
+    """Return whether ``x`` can safely be used as a JAX primitive operand.
+
+    Args:
+        x: Input value consumed by the operation.
+
+    Returns:
+        Return whether ``x`` can safely be used as a JAX primitive operand.
+    """
     dtype = getattr(getattr(x, "aval", None), "dtype", getattr(x, "dtype", None))
     if dtype is not None and not np.issubdtype(np.dtype(dtype), np.inexact):
         return False
@@ -153,10 +160,26 @@ def _is_marker_leaf(x: object) -> bool:
 
 
 def _bind_stage_region_marker(x: object, primitive: Primitive, *, spec: StageRegionSpec) -> object:
-    """Mark every JAX value leaf in ``x`` while leaving static leaves unchanged."""
+    """Mark every JAX value leaf in ``x`` while leaving static leaves unchanged.
+
+    Args:
+        x: Input value consumed by the operation.
+        primitive: JAX primitive associated with the current equation or rule.
+        spec: Partition specification or related sharding specification.
+
+    Returns:
+        Result described by this helper.
+    """
 
     def mark_leaf(leaf: object) -> object:
-        """Bind one leaf to the region primitive if it is a JAX traceable value."""
+        """Bind one leaf to the region primitive if it is a JAX traceable value.
+
+        Args:
+            leaf: Leaf value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if not _is_marker_leaf(leaf):
             return leaf
         (marked,) = primitive.bind(leaf, spec=spec)
@@ -166,14 +189,28 @@ def _bind_stage_region_marker(x: object, primitive: Primitive, *, spec: StageReg
 
 
 def _normalize_sharding_axis(axis: object) -> object:
-    """Return a hashable axis-spec component for primitive metadata."""
+    """Return a hashable axis-spec component for primitive metadata.
+
+    Args:
+        axis: Logical or positional axis used by the operation.
+
+    Returns:
+        Return a hashable axis-spec component for primitive metadata.
+    """
     if isinstance(axis, list | tuple):
         return tuple(_normalize_sharding_axis(part) for part in axis)
     return axis
 
 
 def _normalize_edge_sharding(sharding: object) -> PartitionSpec | None:
-    """Normalize user-facing edge sharding metadata to a ``PartitionSpec``."""
+    """Normalize user-facing edge sharding metadata to a ``PartitionSpec``.
+
+    Args:
+        sharding: JAX sharding object describing how an array is placed.
+
+    Returns:
+        Result described by this helper.
+    """
     if sharding is None:
         return None
     if isinstance(sharding, NamedSharding):
@@ -238,6 +275,12 @@ def _mpmd_stage_iter_impl(*args, stage, sharding, treedef):
     unmarked function exactly. The ``stage``, ``sharding`` and
     ``treedef`` parameters are pure metadata consumed only by the MPMD
     compiler pass.
+
+    Args:
+        stage: Stage value consumed by this operation.
+        sharding: JAX sharding object describing how an array is placed.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del stage, sharding, treedef
     return args
@@ -250,6 +293,12 @@ def _mpmd_stage_iter_abs(*args, stage, sharding, treedef):
     The marker is the identity, so its output avals equal its input
     avals. Used by JAX during tracing to propagate shape/dtype
     information through marked code paths.
+
+    Args:
+        stage: Stage value consumed by this operation.
+        sharding: JAX sharding object describing how an array is placed.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del stage, sharding, treedef
     return args
@@ -262,6 +311,13 @@ def _mpmd_stage_iter_transpose(cotangents, *args, stage, sharding, treedef):
     identity: incoming cotangents flow back through unchanged. This
     keeps :func:`jax.grad` / :func:`jax.vjp` numerically equivalent
     between marked and unmarked models.
+
+    Args:
+        cotangents: Cotangents value consumed by this operation.
+        stage: Stage value consumed by this operation.
+        sharding: JAX sharding object describing how an array is placed.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del args, stage, sharding, treedef
     return cotangents
@@ -278,6 +334,13 @@ def _mpmd_stage_iter_lowering(ctx, *args, stage, sharding, treedef):
     program matches the unmarked function. The MPMD compiler removes
     these primitives before lowering when it splits the jaxpr by
     marker boundaries.
+
+    Args:
+        ctx: Ctx value consumed by this operation.
+        stage: Stage value consumed by this operation.
+        sharding: JAX sharding object describing how an array is placed.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
     """
     del ctx, stage, sharding, treedef
     return list(args)
@@ -287,7 +350,15 @@ mlir.register_lowering(sxstage_iter_p, _mpmd_stage_iter_lowering)
 
 
 def _mpmd_stage_iter_batch(vector_arg_values, batch_axes, *, stage, sharding, treedef):
-    """``vmap`` rule for ``sxstage_iter_p``: the marker is identity, so axes pass through unchanged."""
+    """``vmap`` rule for ``sxstage_iter_p``: the marker is identity, so axes pass through unchanged.
+
+    Args:
+        vector_arg_values: Vector arg values value consumed by this operation.
+        batch_axes: Batch axes value consumed by this operation.
+        stage: Stage value consumed by this operation.
+        sharding: JAX sharding object describing how an array is placed.
+        treedef: Treedef value consumed by this operation.
+    """
     del stage, sharding, treedef
     return vector_arg_values, batch_axes
 
@@ -395,7 +466,15 @@ class _StageRegion:
 
         @functools.wraps(fn)
         def wrapped(*args: object, **kwargs: object) -> object:
-            """Run the original function with region markers on args/kwargs and output."""
+            """Run the original function with region markers on args/kwargs and output.
+
+            Args:
+                *args: Additional positional arguments forwarded to the wrapped callable or backend.
+                **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
+            """
             marked_args, marked_kwargs = self.enter((args, kwargs))
             out = fn(*marked_args, **marked_kwargs)
             return self.exit(out)
@@ -403,53 +482,106 @@ class _StageRegion:
         return wrapped
 
     def __enter__(self) -> "_StageRegion":
-        """Enter the context-manager protocol; returns ``self``."""
+        """Enter the context-manager protocol; returns ``self``.
+
+        Returns:
+            Result described by this helper.
+        """
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        """Exit the context-manager protocol; does not suppress exceptions."""
+        """Exit the context-manager protocol; does not suppress exceptions.
+
+        Args:
+            exc_type: Exc type value consumed by this operation.
+            exc: Exc value consumed by this operation.
+            tb: Tb value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         del exc_type, exc, tb
         return False
 
     def enter(self, x: object) -> object:
-        """Insert a region-enter marker around ``x``."""
+        """Insert a region-enter marker around ``x``.
+
+        Args:
+            x: Input value consumed by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _bind_stage_region_marker(x, sxstage_region_enter_p, spec=self.spec)
 
     def exit(self, x: object) -> object:
-        """Insert a region-exit marker around ``x``."""
+        """Insert a region-exit marker around ``x``.
+
+        Args:
+            x: Input value consumed by the operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return _bind_stage_region_marker(x, sxstage_region_exit_p, spec=self.spec)
 
 
 @sxstage_region_enter_p.def_impl
 def _mpmd_stage_region_enter_impl(*args, spec):
-    """Eager impl rule for :data:`sxstage_region_enter_p`: identity."""
+    """Eager impl rule for :data:`sxstage_region_enter_p`: identity.
+
+    Args:
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del spec
     return args
 
 
 @sxstage_region_enter_p.def_abstract_eval
 def _mpmd_stage_region_enter_abs(*args, spec):
-    """Abstract-eval rule for :data:`sxstage_region_enter_p`: identity."""
+    """Abstract-eval rule for :data:`sxstage_region_enter_p`: identity.
+
+    Args:
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del spec
     return args
 
 
 @sxstage_region_exit_p.def_impl
 def _mpmd_stage_region_exit_impl(*args, spec):
-    """Eager impl rule for :data:`sxstage_region_exit_p`: identity."""
+    """Eager impl rule for :data:`sxstage_region_exit_p`: identity.
+
+    Args:
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del spec
     return args
 
 
 @sxstage_region_exit_p.def_abstract_eval
 def _mpmd_stage_region_exit_abs(*args, spec):
-    """Abstract-eval rule for :data:`sxstage_region_exit_p`: identity."""
+    """Abstract-eval rule for :data:`sxstage_region_exit_p`: identity.
+
+    Args:
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del spec
     return args
 
 
 def _mpmd_stage_region_transpose(cotangents, *args, spec):
-    """Linear transpose for region markers: cotangents pass through."""
+    """Linear transpose for region markers: cotangents pass through.
+
+    Args:
+        cotangents: Cotangents value consumed by this operation.
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del args, spec
     return cotangents
 
@@ -459,7 +591,13 @@ ad.deflinear2(sxstage_region_exit_p, _mpmd_stage_region_transpose)
 
 
 def _mpmd_stage_region_lowering(ctx, *args, spec):
-    """MLIR lowering for region markers: pass operands through."""
+    """MLIR lowering for region markers: pass operands through.
+
+    Args:
+        ctx: Ctx value consumed by this operation.
+        spec: Partition specification or related sharding specification.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del ctx, spec
     return list(args)
 
@@ -469,7 +607,13 @@ mlir.register_lowering(sxstage_region_exit_p, _mpmd_stage_region_lowering)
 
 
 def _mpmd_stage_region_batch(vector_arg_values, batch_axes, *, spec):
-    """``vmap`` rule for region markers: axes pass through unchanged."""
+    """``vmap`` rule for region markers: axes pass through unchanged.
+
+    Args:
+        vector_arg_values: Vector arg values value consumed by this operation.
+        batch_axes: Batch axes value consumed by this operation.
+        spec: Partition specification or related sharding specification.
+    """
     del spec
     return vector_arg_values, batch_axes
 
@@ -519,20 +663,39 @@ def sxexit_loop(x: object, *, name: str | None = None) -> object:
 
 @sxenter_loop_p.def_impl
 def _mpmd_enter_loop_impl(*args, name, treedef):
-    """Eager impl rule for :data:`sxenter_loop_p`: return inputs unchanged (identity)."""
+    """Eager impl rule for :data:`sxenter_loop_p`: return inputs unchanged (identity).
+
+    Args:
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del name, treedef
     return args
 
 
 @sxenter_loop_p.def_abstract_eval
 def _mpmd_enter_loop_abs(*args, name, treedef):
-    """Abstract-eval rule for :data:`sxenter_loop_p`: outputs have the same avals as inputs."""
+    """Abstract-eval rule for :data:`sxenter_loop_p`: outputs have the same avals as inputs.
+
+    Args:
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del name, treedef
     return args
 
 
 def _mpmd_enter_loop_transpose(cotangents, *args, name, treedef):
-    """Linear-transpose rule for :data:`sxenter_loop_p`: cotangents flow through unchanged."""
+    """Linear-transpose rule for :data:`sxenter_loop_p`: cotangents flow through unchanged.
+
+    Args:
+        cotangents: Cotangents value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del args, name, treedef
     return cotangents
 
@@ -542,20 +705,39 @@ ad.deflinear2(sxenter_loop_p, _mpmd_enter_loop_transpose)
 
 @sxexit_loop_p.def_impl
 def _mpmd_exit_loop_impl(*args, name, treedef):
-    """Eager impl rule for :data:`sxexit_loop_p`: return inputs unchanged (identity)."""
+    """Eager impl rule for :data:`sxexit_loop_p`: return inputs unchanged (identity).
+
+    Args:
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del name, treedef
     return args
 
 
 @sxexit_loop_p.def_abstract_eval
 def _mpmd_exit_loop_abs(*args, name, treedef):
-    """Abstract-eval rule for :data:`sxexit_loop_p`: outputs have the same avals as inputs."""
+    """Abstract-eval rule for :data:`sxexit_loop_p`: outputs have the same avals as inputs.
+
+    Args:
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del name, treedef
     return args
 
 
 def _mpmd_exit_loop_transpose(cotangents, *args, name, treedef):
-    """Linear-transpose rule for :data:`sxexit_loop_p`: cotangents flow through unchanged."""
+    """Linear-transpose rule for :data:`sxexit_loop_p`: cotangents flow through unchanged.
+
+    Args:
+        cotangents: Cotangents value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del args, name, treedef
     return cotangents
 
@@ -564,13 +746,27 @@ ad.deflinear2(sxexit_loop_p, _mpmd_exit_loop_transpose)
 
 
 def _mpmd_enter_loop_batch(vector_arg_values, batch_axes, *, name, treedef):
-    """``vmap`` rule for :data:`sxenter_loop_p`: identity primitive, axes pass through."""
+    """``vmap`` rule for :data:`sxenter_loop_p`: identity primitive, axes pass through.
+
+    Args:
+        vector_arg_values: Vector arg values value consumed by this operation.
+        batch_axes: Batch axes value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+    """
     del name, treedef
     return vector_arg_values, batch_axes
 
 
 def _mpmd_exit_loop_batch(vector_arg_values, batch_axes, *, name, treedef):
-    """``vmap`` rule for :data:`sxexit_loop_p`: identity primitive, axes pass through."""
+    """``vmap`` rule for :data:`sxexit_loop_p`: identity primitive, axes pass through.
+
+    Args:
+        vector_arg_values: Vector arg values value consumed by this operation.
+        batch_axes: Batch axes value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+    """
     del name, treedef
     return vector_arg_values, batch_axes
 
@@ -580,13 +776,27 @@ batching.primitive_batchers[sxexit_loop_p] = _mpmd_exit_loop_batch
 
 
 def _mpmd_enter_loop_lowering(ctx, *args, name, treedef):
-    """MLIR lowering for :data:`sxenter_loop_p`: pass operands through (identity)."""
+    """MLIR lowering for :data:`sxenter_loop_p`: pass operands through (identity).
+
+    Args:
+        ctx: Ctx value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del ctx, name, treedef
     return list(args)
 
 
 def _mpmd_exit_loop_lowering(ctx, *args, name, treedef):
-    """MLIR lowering for :data:`sxexit_loop_p`: pass operands through (identity)."""
+    """MLIR lowering for :data:`sxexit_loop_p`: pass operands through (identity).
+
+    Args:
+        ctx: Ctx value consumed by this operation.
+        name: Name used for lookup, logging, or registration.
+        treedef: Treedef value consumed by this operation.
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+    """
     del ctx, name, treedef
     return list(args)
 
@@ -630,7 +840,14 @@ def sxloop(
 
 
 def _collect_used_vars(eqns: list[JaxprEqn]) -> set[Var]:
-    """Return the set of :class:`Var` s read by any eqn in ``eqns``."""
+    """Return the set of :class:`Var` s read by any eqn in ``eqns``.
+
+    Args:
+        eqns: Eqns value consumed by this operation.
+
+    Returns:
+        Return the set of :class:`Var` s read by any eqn in ``eqns``.
+    """
     used: set[Var] = set()
     for eqn in eqns:
         for invar in eqn.invars:
@@ -640,7 +857,14 @@ def _collect_used_vars(eqns: list[JaxprEqn]) -> set[Var]:
 
 
 def _collect_defined_vars(eqns: list[JaxprEqn]) -> set[Var]:
-    """Return the set of :class:`Var` s written by any eqn in ``eqns``."""
+    """Return the set of :class:`Var` s written by any eqn in ``eqns``.
+
+    Args:
+        eqns: Eqns value consumed by this operation.
+
+    Returns:
+        Return the set of :class:`Var` s written by any eqn in ``eqns``.
+    """
     defined: set[Var] = set()
     for eqn in eqns:
         for outvar in eqn.outvars:
@@ -659,6 +883,12 @@ def _collect_defined_vars_ordered(eqns: list[JaxprEqn]) -> list[Var]:
     the input tuple, forcing XLA to copy full cache-page buffers to satisfy the
     input/output alias contract. Keeping definition order makes cache carry
     leaves line up with the calls that produced them.
+
+    Args:
+        eqns: Eqns value consumed by this operation.
+
+    Returns:
+        Return vars written by ``eqns`` in jaxpr definition order.
     """
     ordered: list[Var] = []
     seen: set[int] = set()
@@ -678,6 +908,12 @@ def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
     tracer emits the exit markers together after the wrapped body, though, so
     a region call is the interval from its first enter marker to the last
     adjacent exit marker for that call.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+
+    Returns:
+        Return top-level equation spans covered by stage-region markers.
     """
     spans: list[tuple[int, int]] = []
     open_starts: dict[StageRegionSpec, int] = {}
@@ -702,7 +938,15 @@ def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
 
 
 def _inside_any_span(idx: int, spans: tuple[tuple[int, int], ...]) -> bool:
-    """Return whether ``idx`` lies inside any inclusive region span."""
+    """Return whether ``idx`` lies inside any inclusive region span.
+
+    Args:
+        idx: Idx value consumed by this operation.
+        spans: Spans value consumed by this operation.
+
+    Returns:
+        Return whether ``idx`` lies inside any inclusive region span.
+    """
     return any(start <= idx <= end for start, end in spans)
 
 
@@ -719,6 +963,12 @@ def stage_region_cluster_boundaries(jaxpr: Jaxpr) -> tuple[int, ...]:
     begin. Only leaf regions are considered: enclosing regions such as a
     top-level VLM module wrap nested towers but should not add their own
     split points.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+
+    Returns:
+        Return extra split points between serial leaf pipeline regions.
     """
     spans = _stage_region_spans(jaxpr)
     if not spans:
@@ -742,7 +992,15 @@ def stage_region_cluster_boundaries(jaxpr: Jaxpr) -> tuple[int, ...]:
 
 
 def _sxstage_iter_positions(jaxpr: Jaxpr, *, ignore_region_local_markers: bool) -> list[int]:
-    """Return stage-boundary marker positions visible to the current splitter."""
+    """Return stage-boundary marker positions visible to the current splitter.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        ignore_region_local_markers: Ignore region local markers value consumed by this operation.
+
+    Returns:
+        Return stage-boundary marker positions visible to the current splitter.
+    """
     spans = _stage_region_spans(jaxpr) if ignore_region_local_markers else ()
     return [i for i, eqn in enumerate(jaxpr.eqns) if eqn.primitive is sxstage_iter_p and not _inside_any_span(i, spans)]
 
@@ -757,6 +1015,13 @@ def marker_edge_shardings(
     Entry ``i`` describes the transfer edge leaving logical stage
     ``i``. ``None`` means the runtime should keep its default transfer
     target for that boundary.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+        ignore_region_local_markers: Ignore region local markers value consumed by this operation.
+
+    Returns:
+        Return ``sxstage_iter`` edge shardings in marker order.
     """
     return [
         jaxpr.eqns[i].params.get("sharding")
@@ -773,6 +1038,12 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
     Nested jaxprs in primitive params (for example scan/cond bodies) are
     inspected as well. The returned list includes both enter and exit marker
     occurrences because each marker carries the same region spec.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+
+    Returns:
+        Return all :func:`sxstage_region` specs found in ``jaxpr`` order.
     """
     specs: list[StageRegionSpec] = []
     seen: set[int] = set()
@@ -784,6 +1055,9 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
         tuples, and lists are traversed elementwise; objects exposing a
         ``.jaxpr`` attribute (e.g. closed jaxprs) are unwrapped and
         scanned as well.
+
+        Args:
+            obj: Object inspected or transformed by the helper.
         """
         obj_id = id(obj)
         if obj_id in seen:
@@ -810,6 +1084,9 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
         Every matching equation's ``spec`` parameter is appended to the
         outer ``specs`` list. Nested params are forwarded to
         :func:`visit_obj` so scan/cond bodies etc. are also searched.
+
+        Args:
+            sub_jaxpr: Sub jaxpr value consumed by this operation.
         """
         for eqn in sub_jaxpr.eqns:
             if eqn.primitive in _REGION_PRIMITIVES:
@@ -822,7 +1099,14 @@ def stage_region_specs(jaxpr: Jaxpr) -> list[StageRegionSpec]:
 
 
 def has_stage_regions(jaxpr: Jaxpr) -> bool:
-    """Return whether ``jaxpr`` contains any :func:`sxstage_region` markers."""
+    """Return whether ``jaxpr`` contains any :func:`sxstage_region` markers.
+
+    Args:
+        jaxpr: JAXPR being inspected, rewritten, split, or executed.
+
+    Returns:
+        Return whether ``jaxpr`` contains any :func:`sxstage_region` markers.
+    """
     return bool(_stage_region_spans(jaxpr))
 
 
@@ -913,6 +1197,12 @@ def cluster_jaxpr_by_markers(
         shipped through the pipeline as activations. Values that touch closed
         consts are left as real stage outputs because those consts may be
         stage-owned trainable weights.
+
+        Args:
+            var: Var value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         var_id = id(var)
         cached = remat_cache.get(var_id)
@@ -954,6 +1244,12 @@ def cluster_jaxpr_by_markers(
         upstream stage). Output is accumulated into the ``out`` dict
         keyed by equation ``id`` so the same equation isn't added
         twice.
+
+        Args:
+            var: Var value consumed by this operation.
+            local_defined_ids: Local defined ids value consumed by this operation.
+            local_eqn_ids: Local eqn ids value consumed by this operation.
+            out: Output value from an earlier call or transform.
         """
         if id(var) in jaxpr_invar_ids or id(var) in jaxpr_constvar_ids or id(var) in local_defined_ids:
             return
@@ -1109,7 +1405,11 @@ def split_by_markers(
     consts = closed.consts
 
     def make_stage(cluster_jaxpr: Jaxpr):
-        """Build a Python callable that evaluates ``cluster_jaxpr`` with bound consts."""
+        """Build a Python callable that evaluates ``cluster_jaxpr`` with bound consts.
+
+        Args:
+            cluster_jaxpr: Cluster jaxpr value consumed by this operation.
+        """
 
         def stage_fn(*args):
             """Evaluate ``cluster_jaxpr`` against ``args`` with the captured consts.

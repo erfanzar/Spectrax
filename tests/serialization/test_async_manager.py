@@ -15,6 +15,7 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec
 
 from spectrax.serialization import AsyncCheckpointManager
+from spectrax.serialization.async_manager import _tensorstore_spec_for_load
 
 
 class TestAsyncCheckpointManager:
@@ -86,6 +87,56 @@ class TestAsyncCheckpointManager:
         assert set(loaded.keys()) == set(tree.keys())
         for k in tree:
             assert jnp.allclose(loaded[k], tree[k])
+
+    def test_fast_tensorstore_load_options(self, tmp_checkpoint_dir, mesh):
+        """TensorStore fast-load options deserialize through the custom path."""
+        tree = {f"p{i}": jnp.arange(8, dtype=jnp.float32).reshape(2, 4) + i for i in range(3)}
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            concurrent_gb=1,
+            tensorstore_io_concurrency=4,
+            tensorstore_copy_concurrency=4,
+            tensorstore_cache_gb=1,
+            tensorstore_assume_metadata=True,
+            tensorstore_metadata_workers=2,
+            show_progress=False,
+            progress_every=2,
+        )
+
+        assert set(loaded.keys()) == set(tree.keys())
+        for key in tree:
+            assert jnp.allclose(loaded[key], tree[key])
+
+    def test_fast_tensorstore_metadata_preserves_bfloat16_dtype(self, tmp_checkpoint_dir, mesh):
+        """Assumed zarr metadata uses TensorStore's native bfloat16 dtype spelling."""
+        sharding = NamedSharding(mesh, PartitionSpec())
+        spec = _tensorstore_spec_for_load(
+            str(Path(tmp_checkpoint_dir) / "arr"),
+            sharding=sharding,
+            shape=(2, 4),
+            storage_dtype=jnp.bfloat16,
+            assume_metadata=True,
+            metadata={"shape": [2, 4], "chunks": [2, 4], "dtype": "bfloat16"},
+        )
+
+        assert spec["metadata"]["dtype"] == "bfloat16"
+
+    def test_fast_tensorstore_metadata_not_synthesized_without_sidecar(self, tmp_checkpoint_dir, mesh):
+        """Assumed metadata is only embedded when exact sidecar metadata is supplied."""
+        spec = _tensorstore_spec_for_load(
+            str(Path(tmp_checkpoint_dir) / "arr"),
+            sharding=NamedSharding(mesh, PartitionSpec()),
+            shape=(2, 4),
+            storage_dtype=jnp.bfloat16,
+            assume_metadata=True,
+        )
+
+        assert "metadata" not in spec
 
     def test_load_pytree_prefix_mismatch_raises(self, tmp_checkpoint_dir, mesh):
         """Loading with a different prefix than saved raises ValueError."""
@@ -192,6 +243,36 @@ class TestAsyncCheckpointManager:
         assert jnp.allclose(loaded["model"]["a"], tree["model"]["a"].astype(jnp.bfloat16) + 1)
         assert jnp.allclose(loaded["model"]["b"], tree["model"]["b"].astype(jnp.bfloat16) + 1)
         assert jnp.allclose(loaded["model"]["c"], tree["model"]["c"].astype(jnp.bfloat16) + 1)
+
+    def test_load_pytree_missing_structure_fast_options(self, tmp_checkpoint_dir, mesh):
+        """Index-only fallback supports TensorStore fast-load options."""
+        tree = {
+            "model": {
+                "a": jnp.arange(4, dtype=jnp.float32),
+                "b": jnp.ones((2, 2), dtype=jnp.float32),
+            }
+        }
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+        (Path(tmp_checkpoint_dir) / "model_structure.json").unlink()
+
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            can_skip_structure=True,
+            concurrent_gb=1,
+            tensorstore_io_concurrency=4,
+            tensorstore_copy_concurrency=4,
+            tensorstore_cache_gb=1,
+            tensorstore_assume_metadata=True,
+            tensorstore_metadata_workers=2,
+            show_progress=False,
+            progress_every=2,
+        )
+
+        assert jnp.allclose(loaded["model"]["a"], tree["model"]["a"])
+        assert jnp.allclose(loaded["model"]["b"], tree["model"]["b"])
 
     def test_load_pytree_missing_structure_uses_template(self, tmp_checkpoint_dir, mesh):
         """Index-only checkpoints can load into a caller-provided template."""

@@ -57,7 +57,11 @@ _TRANSFORM_FLAG: threading.local = threading.local()
 
 
 def _inside_transform() -> bool:
-    """Return ``True`` iff a spectrax transform is currently active in this thread."""
+    """Return ``True`` iff a spectrax transform is currently active in this thread.
+
+    Returns:
+        Return ``True`` iff a spectrax transform is currently active in this thread.
+    """
     return bool(getattr(_TRANSFORM_FLAG, "active", False))
 
 
@@ -65,6 +69,9 @@ def _set_inside_transform(active: bool) -> None:
     """Set the thread-local "inside a spectrax transform" flag.
 
     Called by the split/merge shim on entry and exit of every transform.
+
+    Args:
+        active: Active value consumed by this operation.
     """
     _TRANSFORM_FLAG.active = active
 
@@ -97,19 +104,37 @@ def _bump_graph_epoch() -> None:
 
 
 def _graph_epoch() -> int:
-    """Return the current global graph-structure epoch."""
+    """Return the current global graph-structure epoch.
+
+    Returns:
+        Return the current global graph-structure epoch.
+    """
     return _GRAPH_EPOCH
 
 
 def _public_value(value: object) -> object:
-    """Return the value users should see for wrapper-backed attributes."""
+    """Return the value users should see for wrapper-backed attributes.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return the value users should see for wrapper-backed attributes.
+    """
     if isinstance(value, Opaque | Static):
         return value.value
     return value
 
 
 def _opaque_hash_payload(value: object) -> object:
-    """Build a best-effort stable payload for an opaque Python object."""
+    """Build a best-effort stable payload for an opaque Python object.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Result described by this helper.
+    """
     if isinstance(value, Opaque):
         return {"opaque": _opaque_hash_payload(value.value)}
     if hasattr(value, "to_dict") and callable(value.to_dict):
@@ -138,6 +163,13 @@ def _normalize_hash_payload(value: object, *, _seen: set[int] | None = None) -> 
     """Normalize arbitrary metadata into a deterministic JSON-like tree.
 
     Arrays are represented by shape and dtype only, never by values.
+
+    Args:
+        value: Value consumed by the helper.
+        _seen:  seen value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if _seen is None:
         _seen = set()
@@ -214,7 +246,14 @@ def _normalize_hash_payload(value: object, *, _seen: set[int] | None = None) -> 
 
 
 def _digest_payload(payload: object) -> str:
-    """Return a stable hex digest for a normalized payload."""
+    """Return a stable hex digest for a normalized payload.
+
+    Args:
+        payload: Payload value consumed by this operation.
+
+    Returns:
+        Return a stable hex digest for a normalized payload.
+    """
     normalized = _normalize_hash_payload(payload)
     encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -256,7 +295,11 @@ class Opaque:
         self.value = value
 
     def __repr__(self) -> str:
-        """Return ``Opaque(<class name of value>)`` for diagnostics."""
+        """Return ``Opaque(<class name of value>)`` for diagnostics.
+
+        Returns:
+            Return ``Opaque(<class name of value>)`` for diagnostics.
+        """
         return f"Opaque({type(self.value).__name__})"
 
 
@@ -308,6 +351,12 @@ def _is_context_manager(value: object) -> bool:
 
     Duck-typed: any object exposing both ``__enter__`` and ``__exit__``
     is accepted, matching the looseness of :keyword:`with`.
+
+    Args:
+        value: Value consumed by the helper.
+
+    Returns:
+        Return ``True`` when ``value`` implements the context-manager protocol.
     """
     return hasattr(value, "__enter__") and hasattr(value, "__exit__")
 
@@ -430,6 +479,13 @@ class Module:
         Slots are created here (rather than in ``__init__``) so that
         subclasses which assign attributes *before* calling
         ``super().__init__()`` do not crash in ``__setattr__``.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+        Returns:
+            Result described by this helper.
         """
         instance = super().__new__(cls)
         object.__setattr__(instance, "_spx_attr_order", [])
@@ -462,6 +518,9 @@ class Module:
         each subclass at class-definition time. Safe to call
         repeatedly — JAX raises if a class is re-registered, so we
         guard with a sentinel attribute.
+
+        Args:
+            **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
         """
         super().__init_subclass__(**kwargs)
         _register_module_pytree(cls)
@@ -480,13 +539,17 @@ class Module:
         One convenience makes the ergonomics friendlier:
 
         **Annotation-driven static.** If the class declares
-           ``name: spx.Static[T]``, the value is automatically wrapped in
-           :class:`Static` and stored in :attr:`_spx_static`.
+        ``name: spx.Static[T]``, the value is automatically wrapped in
+        :class:`Static` and stored in :attr:`_spx_static`.
 
         Everything else falls back to :class:`Opaque`. This keeps
         ergonomic attributes such as ``self.config = config`` available
         on the module without accidentally treating large mutable config
         objects as graph-def static fields.
+
+        Args:
+            name: Name used for lookup, logging, or registration.
+            value: Value consumed by the helper.
         """
         if name.startswith("_spx_"):
             object.__setattr__(self, name, value)
@@ -546,7 +609,11 @@ class Module:
         object.__setattr__(self, name, value)
 
     def __delattr__(self, name: str) -> None:
-        """Delete an attribute and remove it from the graph order/static dicts."""
+        """Delete an attribute and remove it from the graph order/static dicts.
+
+        Args:
+            name: Name used for lookup, logging, or registration.
+        """
         if name in self._spx_attr_order:
             self._spx_attr_order.remove(name)
         self._spx_static.pop(name, None)
@@ -560,6 +627,9 @@ class Module:
         The base implementation iterates :attr:`_spx_attr_order` and
         yields attribute-name keys. Containers override this method to
         yield integer or string keys reflecting their native addressing.
+
+        Returns:
+            Result described by this helper.
         """
         for name in self._spx_attr_order:
             value = getattr(self, name, None)
@@ -567,7 +637,11 @@ class Module:
                 yield name, value
 
     def _spx_static_fields(self) -> dict[str, object]:
-        """Return a shallow copy of :attr:`_spx_static` for graph-def export."""
+        """Return a shallow copy of :attr:`_spx_static` for graph-def export.
+
+        Returns:
+            Return a shallow copy of :attr:`_spx_static` for graph-def export.
+        """
         return dict(self._spx_static)
 
     def structure_hash(self) -> str:
@@ -628,7 +702,11 @@ class Module:
 
     @property
     def training(self) -> bool:
-        """Whether this module is currently in training mode."""
+        """Whether this module is currently in training mode.
+
+        Returns:
+            Result described by this helper.
+        """
         return self._spx_training
 
     def train(self, mode: bool = True) -> Module:
@@ -821,6 +899,9 @@ class Module:
             value) is picked up on every call. Raises
             :class:`TypeError` if any factory yields something that
             isn't a context manager.
+
+            Returns:
+                Result described by this helper.
             """
             with contextlib.ExitStack() as stack:
                 for make_context in factories:
@@ -906,6 +987,9 @@ class Module:
 
         Used by lazy layers to refuse materialization under ``jit`` /
         ``grad`` / ``vmap`` / ``scan`` / ``remat``.
+
+        Args:
+            what: What value consumed by this operation.
         """
         if _inside_transform():
             raise LazyInitUnderTransformError(
@@ -1011,6 +1095,9 @@ class Module:
             same module via shared references, which would otherwise
             cause unbounded recursion or duplicate ``materialize()``
             calls on the same deferred variable.
+
+            Args:
+                m: M value consumed by this operation.
             """
             mid = id(m)
             if mid in seen:
@@ -1182,6 +1269,9 @@ class Module:
             closure ``set``) guards against revisiting the same module
             via shared references and so against double-applying
             attribute updates.
+
+            Args:
+                m: M value consumed by this operation.
             """
             mid = id(m)
             if mid in seen:
@@ -1202,6 +1292,9 @@ class Module:
         """Render a pretty tree repr via
         :func:`spectrax.inspect.repr_module`, falling back to the class
         name if rendering raises.
+
+        Returns:
+            Result described by this helper.
         """
         try:
             from ..inspect.repr import repr_module
@@ -1216,6 +1309,9 @@ def _warn_hooks_suppressed(module: Module) -> None:
 
     Each distinct module instance produces at most one warning to keep
     traces clean during training loops.
+
+    Args:
+        module: SpectraX module instance operated on by the helper.
     """
     key = id(module)
     if key in _HOOK_WARNING_ONCE:
@@ -1260,7 +1356,11 @@ class _ModuleAux:
     opaque: dict
 
     def __hash__(self) -> int:
-        """Hash structural parts directly; hash hook/policy/opaque by identity."""
+        """Hash structural parts directly; hash hook/policy/opaque by identity.
+
+        Returns:
+            Result described by this helper.
+        """
         return hash(
             (
                 self.gdef,
@@ -1275,7 +1375,14 @@ class _ModuleAux:
         )
 
     def __eq__(self, other: object) -> bool:
-        """Match on structural fields, and on identity for mutable containers."""
+        """Match on structural fields, and on identity for mutable containers.
+
+        Args:
+            other: Other value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         if not isinstance(other, _ModuleAux):
             return NotImplemented
         return (
@@ -1308,6 +1415,12 @@ def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[object], ...], _Mo
     an intermediate :class:`~spectrax.State` pytree. Static /
     structural information, runtime flags, and non-graph attributes all
     go into :class:`_ModuleAux`.
+
+    Args:
+        m: M value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     from .graph import export
 
@@ -1342,6 +1455,12 @@ def _module_flatten(m: Module) -> tuple[list[object], _ModuleAux]:
     Needed by :func:`jax.tree_util.register_pytree_with_keys` so
     ``tree_flatten`` / ``tree_leaves`` can skip the key computation
     when the caller doesn't need paths.
+
+    Args:
+        m: M value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     from .graph import export
 
@@ -1376,6 +1495,13 @@ def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
     the runtime-state attributes from ``aux``. Hooks and the opaque
     dict are shallow-copied so mutations on the unflattened copy don't
     leak back to the original list/dict references held in ``aux``.
+
+    Args:
+        aux: Aux value consumed by this operation.
+        leaves: Leaves value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     from .graph import bind
     from .paths import str_to_path

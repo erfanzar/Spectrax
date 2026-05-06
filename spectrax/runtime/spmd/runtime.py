@@ -147,6 +147,10 @@ def _unstack_leaves_jit(stacked_leaves, n: int):
     offset index. Wrapping in ``@jax.jit`` collapses what was a
     ~0.9 ms per-leaf eager dispatch (hundreds of ms total on TPU)
     into one compiled kernel that XLA can fuse with downstream work.
+
+    Args:
+        stacked_leaves: Stacked leaves value consumed by this operation.
+        n: N value consumed by this operation.
     """
     return tuple(tuple(leaf[i] for leaf in stacked_leaves) for i in range(n))
 
@@ -157,6 +161,13 @@ def _unstack_state(stacked: State, n: int) -> tuple[State, ...]:
     Runs the per-leaf slicing inside one jitted kernel instead of N
     eager dispatches per leaf. For ~200-leaf State on TPU v5p this
     cuts ~170 ms off every call.
+
+    Args:
+        stacked: Stacked value consumed by this operation.
+        n: N value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     raw = stacked.raw()
     paths: list[tuple[str, str]] = []
@@ -291,6 +302,12 @@ def _extract_and_stack(
     re-exports every stage and re-runs ``jnp.stack`` on every parameter
     leaf — eager dispatches that cost ~0.3 ms each on TPU and dominate
     step time at small batch sizes.
+
+    Args:
+        container: Container value consumed by this operation.
+
+    Returns:
+        Return the cached ``(gdef, stacked_params, stacked_rest)`` for ``container``.
     """
     gdef, per_stage_states = _extract_stages(container)
     signature = _stage_state_signature(per_stage_states)
@@ -349,6 +366,15 @@ def _get_cached_spmd_step(
     distinct closures computing the same loss would still miss the
     cache — that matches how :func:`jax.jit` itself keys on function
     identity.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+        n_stages: N stages value consumed by this operation.
+        microbatches: Number of microbatches used by the pipeline schedule.
+        loss_fn: Loss fn value consumed by this operation.
+
+    Returns:
+        Return the jitted step fn for this config, building + caching if needed.
     """
     key = (gdef, n_stages, microbatches, id(loss_fn))
     fn = _COMPILE_CACHE.get(key)
@@ -374,20 +400,20 @@ def _build_spmd_step(
 
     The step traces a straight-line computation:
 
-    1. For each microbatch ``mb``, thread the input through every
-       stage sequentially by indexing ``stacked_params[s]`` at the
-       static offset ``s``. Because ``stacked_params`` is sharded
-       along the pipeline axis before the call, XLA places stage
-       ``s``'s forward on device ``s`` and automatically inserts the
-       cross-device transfer between stages.
-    2. Compute the microbatch loss and add it to an accumulator.
-    3. After all microbatches, divide by ``M`` to recover the
-       single-device mean.
-    4. Wrap the whole thing in :func:`jax.value_and_grad` so JAX
-       generates the reverse pass. XLA schedules forward and
-       backward ops across devices based on the initial param
-       sharding — no manual schedule table, no ppermutes, no nested
-       conds: just regular SPMD.
+        1. For each microbatch ``mb``, thread the input through every
+           stage sequentially by indexing ``stacked_params[s]`` at the
+    static offset ``s``. Because ``stacked_params`` is sharded
+    along the pipeline axis before the call, XLA places stage
+    ``s``'s forward on device ``s`` and automatically inserts the
+    cross-device transfer between stages.
+        2. Compute the microbatch loss and add it to an accumulator.
+        3. After all microbatches, divide by ``M`` to recover the
+           single-device mean.
+        4. Wrap the whole thing in :func:`jax.value_and_grad` so JAX
+           generates the reverse pass. XLA schedules forward and
+    backward ops across devices based on the initial param
+    sharding — no manual schedule table, no ppermutes, no nested
+    conds: just regular SPMD.
 
     The per-microbatch forward is vmapped over the leading
     microbatches axis rather than unrolled into ``M`` copies of the
@@ -398,6 +424,15 @@ def _build_spmd_step(
     transform (free at runtime). The alternative — an outer jitted
     ``_unstack_state`` call — costs an extra dispatch (~1-3 ms on TPU)
     that we can save here.
+
+    Args:
+        gdef: Gdef value consumed by this operation.
+        n_stages: N stages value consumed by this operation.
+        microbatches: Number of microbatches used by the pipeline schedule.
+        loss_fn: Loss fn value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
 
     def stage_apply(params, rest, x):

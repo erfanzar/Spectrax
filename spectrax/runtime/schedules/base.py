@@ -196,7 +196,10 @@ class Schedule(ABC):
 
         Flat schedules return ``1``; virtual-stage schedules
         (:class:`InterleavedH1`, :class:`KimiK2`, :class:`DualPipeV`,
-        ...) override.
+                ...) override.
+
+        Returns:
+            Result described by this helper.
         """
         return 1
 

@@ -37,6 +37,9 @@ def _stack() -> list[Rngs]:
     Each call returns the same list object for the calling thread, so
     appends and pops are observed across all callers within that thread
     while remaining isolated from other threads.
+
+    Returns:
+        Return the thread-local :class:`Rngs` stack, initializing it lazily.
     """
     s = getattr(_state, "stack", None)
     if s is None:
@@ -97,5 +100,8 @@ def has_default_rngs() -> bool:
 
     Used by :func:`spectrax.rng.resolve_rngs` to decide whether to fall
     back to :func:`default_rngs` or raise.
+
+    Returns:
+        Return ``True`` iff a :func:`seed` context is currently active on this thread.
     """
     return bool(_stack())

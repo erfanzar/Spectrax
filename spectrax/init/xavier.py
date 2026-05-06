@@ -78,7 +78,16 @@ def xavier_uniform(gain: float = 1.0) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Uniformly sample scaled by the Glorot gain."""
+        """Uniformly sample scaled by the Glorot gain.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         fan_in, fan_out = _fan_in_fan_out(shape)
         a = gain * math.sqrt(6.0 / (fan_in + fan_out))
         return jax.random.uniform(key, shape, dtype=dtype, minval=-a, maxval=a)
@@ -103,7 +112,16 @@ def xavier_normal(gain: float = 1.0) -> Initializer:
     """
 
     def init(key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Normal sample scaled by the Glorot gain."""
+        """Normal sample scaled by the Glorot gain.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result described by this helper.
+        """
         fan_in, fan_out = _fan_in_fan_out(shape)
         std = gain * math.sqrt(2.0 / (fan_in + fan_out))
         return jax.random.normal(key, shape, dtype=dtype) * std

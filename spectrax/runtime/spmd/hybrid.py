@@ -19,9 +19,16 @@ def hybrid_linear_run(*args: object, **kwargs: object) -> object:
     """Reject calls to the removed hybrid helper.
 
     Raises:
-        NotImplementedError: Always. Use
-            :func:`spectrax.runtime.mpmd.sxcall` or
-            :func:`spectrax.runtime.mpmd.sxjit` for true MPMD execution.
+            NotImplementedError: Always. Use
+                :func:`spectrax.runtime.mpmd.sxcall` or
+                :func:`spectrax.runtime.mpmd.sxjit` for true MPMD execution.
+
+    Args:
+        *args: Additional positional arguments forwarded to the wrapped callable or backend.
+        **kwargs: Additional keyword arguments forwarded to the wrapped callable or backend.
+
+    Returns:
+        Result described by this helper.
     """
     del args, kwargs
     raise NotImplementedError(

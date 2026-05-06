@@ -34,7 +34,14 @@ _CRC32C_TABLE: tuple[int, ...] | None = None
 
 
 def _crc32c(data: bytes) -> int:
-    """Compute CRC32C (Castagnoli), the checksum used by TFRecord."""
+    """Compute CRC32C (Castagnoli), the checksum used by TFRecord.
+
+    Args:
+        data: Data value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     if _google_crc32c is not None:
         return int(_google_crc32c.value(data)) & 0xFFFFFFFF
 

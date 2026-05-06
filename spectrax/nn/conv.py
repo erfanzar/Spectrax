@@ -22,14 +22,14 @@ Conventions
       outputs ``(N, *spatial_out, C_out)``.
     * **Kernel layout**: ``(*kernel_size, C_in / groups, C_out)`` for
       direct convolutions; ``(*kernel_size, C_in, C_out)`` for the
-      transpose.
+transpose.
     * **Logical axis names** ``(*"k" * rank, "in", "out")`` are
       attached to every kernel for sharding resolution; biases use
-      ``("out",)``.
+``("out",)``.
     * **Deferred shape inference**: passing ``in_channels=None``
       defers kernel allocation to the first :meth:`forward` call,
-      where ``C_in`` is read off ``x.shape[-1]``. Not safe inside JAX
-      transforms.
+where ``C_in`` is read off ``x.shape[-1]``. Not safe inside JAX
+transforms.
 """
 
 from __future__ import annotations
@@ -281,6 +281,21 @@ class Conv(_ConvND):
         ``out_channels``, ``stride``, ``padding``, ``dilation``,
         ``groups``, ``use_bias``, ``rngs``, ``dtype`` /
         ``param_dtype``, and the sharding arguments.
+
+        Args:
+            in_channels: In channels value consumed by this operation.
+            out_channels: Out channels value consumed by this operation.
+            kernel_size: Kernel size value consumed by this operation.
+            stride: Stride value consumed by this operation.
+            padding: Padding value consumed by this operation.
+            dilation: Dilation value consumed by this operation.
+            groups: Groups value consumed by this operation.
+            use_bias: Use bias value consumed by this operation.
+            rngs: Random-number generator collection used to initialize or run the module.
+            dtype: Array dtype requested for the produced value.
+            param_dtype: Param dtype value consumed by this operation.
+            sharding: JAX sharding object describing how an array is placed.
+            bias_sharding: Bias sharding value consumed by this operation.
         """
         if isinstance(kernel_size, int):
             object.__setattr__(self, "_N", 1)

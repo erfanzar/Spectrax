@@ -50,13 +50,31 @@ def flatten_dict(
             raise TypeError(f"expected dict or Mapping; got {type(xs)}")
 
     def _key(path: tuple[object, ...]) -> tuple[object, ...] | str:
-        """Format *path* as a tuple or a ``sep``-joined string."""
+        """Format a flattened dictionary key.
+
+        Args:
+            path: Tuple of key segments collected while walking the nested
+                mapping.
+
+        Returns:
+            ``path`` unchanged when ``sep`` is ``None``; otherwise a string
+            formed by joining each segment with ``sep``.
+        """
         if sep is None:
             return path
         return sep.join(str(p) for p in path)
 
     def _flatten(obj: object, prefix: tuple[object, ...]) -> dict[tuple[object, ...] | str, object]:
-        """Recursively flatten *obj*, emitting ``{_key(prefix): obj}`` at leaves."""
+        """Recursively flatten a nested mapping.
+
+        Args:
+            obj: Current subtree or leaf value being visited.
+            prefix: Tuple path from the root mapping to ``obj``.
+
+        Returns:
+            Flat dictionary entries for every leaf below ``obj``. Leaf keys are
+            formatted by :func:`_key`.
+        """
         if not isinstance(obj, dict) or (is_leaf and is_leaf(prefix, obj)):
             return {_key(prefix): obj}
         result: dict[tuple[object, ...] | str, object] = {}

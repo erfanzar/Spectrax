@@ -107,7 +107,11 @@ class PipelineSequential(Module):
 
     @property
     def num_stages(self) -> int:
-        """Number of pipeline stages currently held by the container."""
+        """Number of pipeline stages currently held by the container.
+
+        Returns:
+            Result described by this helper.
+        """
         return len(self._spx_items)
 
     @property
@@ -116,6 +120,9 @@ class PipelineSequential(Module):
 
         The returned list is a fresh copy so callers can iterate or
         reorder without mutating the container's internal state.
+
+        Returns:
+            Result described by this helper.
         """
         return list(self._spx_items)
 
@@ -145,11 +152,18 @@ class PipelineSequential(Module):
         to discover sub-modules and their state. Indexing by integer
         position keeps stage paths stable across pickling and
         container surgery.
+
+        Returns:
+            Result described by this helper.
         """
         yield from enumerate(self._spx_items)
 
     def __len__(self) -> int:
-        """Return the number of stages (same as :attr:`num_stages`)."""
+        """Return the number of stages (same as :attr:`num_stages`).
+
+        Returns:
+            Integer length for the container.
+        """
         return len(self._spx_items)
 
     def __getitem__(self, idx: int) -> Module:
@@ -165,5 +179,9 @@ class PipelineSequential(Module):
         return self._spx_items[idx]
 
     def __iter__(self) -> Iterator[Module]:
-        """Iterate over stages in application order."""
+        """Iterate over stages in application order.
+
+        Returns:
+            Iterator over the contained values.
+        """
         return iter(self._spx_items)

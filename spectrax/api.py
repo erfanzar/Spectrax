@@ -210,6 +210,11 @@ def _run_spmd(
 
                 Cached per-``GraphDef`` so the same compiled program is
                 reused across calls.
+
+                Args:
+                    state: SpectraX state tree or transform state passed into the operation.
+                    *a: Additional positional arguments forwarded to the wrapped callable or backend.
+                    **kw: Additional keyword arguments forwarded to the wrapped callable or backend.
                 """
                 return bind(gdef, state)(*a, **kw)
 
@@ -233,6 +238,13 @@ def _run_spmd(
             Differentiates with respect to the full :class:`State`
             tree; partition out trainable subsets at the call site if
             you want narrower gradients.
+
+            Args:
+                state: SpectraX state tree or transform state passed into the operation.
+                args: Positional arguments forwarded to the wrapped callable.
+                kwargs: Keyword arguments forwarded to the wrapped callable.
+                l_args: L args value consumed by this operation.
+                l_kwargs: L kwargs value consumed by this operation.
             """
 
             def loss(state):
@@ -241,6 +253,9 @@ def _run_spmd(
                 Captures ``gdef``, the model call args, and the
                 supplied ``loss_fn`` from the enclosing scope so the
                 resulting function depends only on ``state``.
+
+                Args:
+                    state: SpectraX state tree or transform state passed into the operation.
                 """
                 out = bind(gdef, state)(*args, **kwargs)
                 return loss_fn(out, *l_args, **l_kwargs)
@@ -337,6 +352,13 @@ def _run_mpmd(
             the captured ``target_keys`` and calls the original
             ``loss_fn`` with keyword targets, preserving its kwargs
             interface even though the pipeline batch is positional.
+
+            Args:
+                out: Output value from an earlier call or transform.
+                *vals: Additional positional arguments forwarded to the wrapped callable or backend.
+
+            Returns:
+                Result described by this helper.
             """
             return original_loss(out, **dict(zip(target_keys, vals, strict=True)))
 

@@ -84,7 +84,16 @@ class Initializer(Protocol):
     """
 
     def __call__(self, key: PRNGKey, shape: Shape, dtype: DType = jnp.float32) -> Array:
-        """Return a freshly-initialized array of ``shape`` and ``dtype`` from ``key``."""
+        """Return a freshly-initialized array of ``shape`` and ``dtype`` from ``key``.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            shape: Array shape requested by the initializer or helper.
+            dtype: Array dtype requested for the produced value.
+
+        Returns:
+            Result of invoking the wrapped callable or module.
+        """
         ...
 
 
@@ -114,7 +123,16 @@ class ForwardPreHook(Protocol):
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> tuple[tuple[object, ...], dict[str, object]] | None:
-        """Optionally rewrite ``(args, kwargs)`` before ``forward`` runs."""
+        """Optionally rewrite ``(args, kwargs)`` before ``forward`` runs.
+
+        Args:
+            module: SpectraX module instance operated on by the helper.
+            args: Positional arguments forwarded to the wrapped callable.
+            kwargs: Keyword arguments forwarded to the wrapped callable.
+
+        Returns:
+            Result of invoking the wrapped callable or module.
+        """
         ...
 
 
@@ -133,7 +151,17 @@ class ForwardHook(Protocol):
         kwargs: dict[str, object],
         output: object,
     ) -> object | None:
-        """Optionally rewrite the forward output. Return ``None`` to keep it unchanged."""
+        """Optionally rewrite the forward output. Return ``None`` to keep it unchanged.
+
+        Args:
+            module: SpectraX module instance operated on by the helper.
+            args: Positional arguments forwarded to the wrapped callable.
+            kwargs: Keyword arguments forwarded to the wrapped callable.
+            output: Output value consumed by this operation.
+
+        Returns:
+            Result of invoking the wrapped callable or module.
+        """
         ...
 
 
@@ -147,5 +175,11 @@ class VariableObserver(Protocol):
     """
 
     def __call__(self, var: object, old: object, new: object) -> None:
-        """React to ``var`` having its value changed from ``old`` to ``new``."""
+        """React to ``var`` having its value changed from ``old`` to ``new``.
+
+        Args:
+            var: Var value consumed by this operation.
+            old: Old value consumed by this operation.
+            new: New value consumed by this operation.
+        """
         ...

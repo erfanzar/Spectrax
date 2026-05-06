@@ -55,7 +55,11 @@ _CURRENT_MESH: threading.local = threading.local()
 
 
 def current_mesh() -> SpxMesh | None:
-    """Return the innermost active :class:`SpxMesh`, if any."""
+    """Return the innermost active :class:`SpxMesh`, if any.
+
+    Returns:
+        Return the innermost active :class:`SpxMesh`, if any.
+    """
     stack = getattr(_CURRENT_MESH, "stack", ())
     return stack[-1] if stack else None
 
@@ -98,16 +102,19 @@ class SpxMesh:
     def is_mpmd(self) -> bool:
         """``True`` iff there is a real MPMD pipeline (mpmd_axis set AND its dim > 1).
 
-        @erfanzar NOTE:
-            Naming an mpmd_axis with dim==1 is a degenerate single-stage
-            pipeline — semantically equivalent to no pipeline at all.
-            Treating it as MPMD routes every ``spx.jit`` through the
-            heavy MPMD pipeline runtime (cluster builder, per-rank
-            re-jit, layout reassignment) and forces XLA to insert
-            layout-reformat copies at JIT boundaries because the MPMD
-            path does not honor caller-allocated array layouts. We
-            require the axis to actually have parallel size to flip
-            this on.
+                @erfanzar NOTE:
+        Naming an mpmd_axis with dim==1 is a degenerate single-stage
+        pipeline — semantically equivalent to no pipeline at all.
+        Treating it as MPMD routes every ``spx.jit`` through the
+        heavy MPMD pipeline runtime (cluster builder, per-rank
+        re-jit, layout reassignment) and forces XLA to insert
+        layout-reformat copies at JIT boundaries because the MPMD
+        path does not honor caller-allocated array layouts. We
+        require the axis to actually have parallel size to flip
+        this on.
+
+        Returns:
+            Result described by this helper.
         """
         if self.mpmd_axis is None:
             return False
@@ -140,6 +147,9 @@ class SpxMesh:
         Includes the pipeline axis if one is configured (use
         :attr:`spmd_axis_names` on :class:`MpMdMesh` to get only the
         SPMD axes).
+
+        Returns:
+            Result described by this helper.
         """
         return self.jax_mesh.axis_names
 
@@ -177,6 +187,9 @@ class SpxMesh:
         stack is unwound to ``self`` (handling well-nested and
         out-of-order exits) before the JAX mesh's ``__exit__`` runs.
         object exception from the JAX side propagates unchanged.
+
+        Args:
+            *args: Additional positional arguments forwarded to the wrapped callable or backend.
         """
         stack = list(getattr(_CURRENT_MESH, "stack", ()))
         for idx in range(len(stack) - 1, -1, -1):
@@ -192,6 +205,9 @@ class SpxMesh:
         Makes :class:`SpxMesh` a near-drop-in for plain ``Mesh`` in
         user code. Dunder names skip this path (they're looked up on
         the type, not the instance, so ``__getattr__`` isn't invoked).
+
+        Args:
+            name: Name used for lookup, logging, or registration.
         """
         try:
             return getattr(self.jax_mesh, name)
@@ -241,6 +257,12 @@ def use_mesh(mesh: SpxMesh | Mesh) -> Iterator[SpxMesh]:
     Passing a raw :class:`jax.sharding.Mesh` is accepted at migration
     boundaries, but SpectraX code receives the wrapped ``SpxMesh`` so
     MPMD metadata can continue to flow through sharding helpers.
+
+    Args:
+        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
+
+    Returns:
+        Result described by this helper.
     """
     spx_mesh = mesh if isinstance(mesh, SpxMesh) else _wrap_spx(mesh, None)
     with spx_mesh:
@@ -254,6 +276,12 @@ def _device_sort_key(device: object) -> tuple[object, ...]:
     to keep devices on the same host/slice contiguous. Used as a
     tiebreaker when ranking stage placements in
     :func:`_topology_mpmd_order`.
+
+    Args:
+        device: Device value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     coords = getattr(device, "coords", None)
     if coords is None:
@@ -277,6 +305,12 @@ def _stage_center(devices: np.ndarray) -> tuple[float, ...] | None:
     interconnect. The centroid is the per-component mean. Returns
     ``None`` if any device lacks coords or has non-numeric ones, which
     forces callers to fall back to the default mesh ordering.
+
+    Args:
+        devices: Device collection used to construct or inspect a mesh.
+
+    Returns:
+        Result described by this helper.
     """
     coords: list[tuple[float, ...]] = []
     for device in devices.reshape(-1):
@@ -300,6 +334,13 @@ def _center_distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
     Pads the shorter tuple with zeros so different-rank centroids can
     still be compared. Squared (not square-rooted) since callers only
     need the relative ordering.
+
+    Args:
+        a: Positional arguments forwarded to the wrapped callable.
+        b: B value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     width = max(len(a), len(b))
     aa = a + (0.0,) * (width - len(a))
@@ -321,6 +362,13 @@ def _topology_mpmd_order(jax_mesh: Mesh, mpmd_axis: str) -> tuple[int, ...] | No
     stages, missing topology coords, or the natural mesh order
     already matches the topology order. ``None`` signals "leave the
     mesh device order alone".
+
+    Args:
+        jax_mesh: Jax mesh value consumed by this operation.
+        mpmd_axis: Mpmd axis value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     axis = jax_mesh.axis_names.index(mpmd_axis)
     n = int(jax_mesh.devices.shape[axis])
@@ -358,8 +406,15 @@ def _topology_order_mpmd_axis(jax_mesh: Mesh, mpmd_axis: str | None) -> Mesh:
     non-trivial permutation, the device array is re-sliced along
     ``mpmd_axis`` and a fresh :class:`jax.sharding.Mesh` is built
     (cached by ``id(jax_mesh) x mpmd_axis`` so subsequent calls
-    return the same mesh object). Otherwise the original mesh is
+        return the same mesh object). Otherwise the original mesh is
     returned unchanged.
+
+    Args:
+        jax_mesh: Jax mesh value consumed by this operation.
+        mpmd_axis: Mpmd axis value consumed by this operation.
+
+    Returns:
+        Return a permuted mesh with stages ordered by physical proximity.
     """
     if mpmd_axis is None:
         return jax_mesh
@@ -384,6 +439,12 @@ def _get_num_slices(devices: Sequence[object]) -> int:
     multi-slice TPU pod runtimes). Falls back to the
     ``MEGASCALE_NUM_SLICES`` environment variable when device objects
     don't carry the attribute.
+
+    Args:
+        devices: Device collection used to construct or inspect a mesh.
+
+    Returns:
+        Result described by this helper.
     """
     num_slices = 1
     if devices and hasattr(devices[0], "slice_index"):
@@ -495,6 +556,13 @@ def calculate_host_mesh_shape(
 
         Prefers larger factors on the leading dims (matching the historical
         greedy intent of keeping per-host blocks contiguous on trailing axes).
+
+        Args:
+            remaining: Remaining value consumed by this operation.
+            dims: Dims value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         if not dims:
             return () if remaining == 1 else None
@@ -532,6 +600,18 @@ def _cached_mesh(
     can use them as dict keys) and falls back to
     :func:`jax.default_backend` when ``backend`` is ``None``. The actual
     mesh creation happens in :func:`_cached_mesh_impl`.
+
+    Args:
+        axis_dims: Axis dims value consumed by this operation.
+        axis_names: Named mesh or collective axes used by the operation.
+        axis_types: Axis types value consumed by this operation.
+        dcn_mesh_dims: Dcn mesh dims value consumed by this operation.
+        should_sort_granules_by_key: Should sort granules by key value consumed by this operation.
+        allow_split_physical_axes: Allow split physical axes value consumed by this operation.
+        backend: Backend value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     return _cached_mesh_impl(
         axis_dims=tuple(axis_dims),
@@ -558,13 +638,25 @@ def _cached_mesh_impl(
 
     Three branches:
 
-    1. **Multi-slice TPU pods** — one mesh axis is divided across the
-       slices, the rest replicated via ``create_hybrid_device_mesh``
-       with ``process_is_granule=False``.
-    2. **Multi-process (non-TPU) setups** — per-host submesh via
-       :func:`calculate_host_mesh_shape` + ``create_hybrid_device_mesh``
-       with ``process_is_granule=True``.
-    3. **Single-process** — ordinary :func:`create_device_mesh`.
+        1. **Multi-slice TPU pods** — one mesh axis is divided across the
+           slices, the rest replicated via ``create_hybrid_device_mesh``
+           with ``process_is_granule=False``.
+        2. **Multi-process (non-TPU) setups** — per-host submesh via
+           :func:`calculate_host_mesh_shape` + ``create_hybrid_device_mesh``
+           with ``process_is_granule=True``.
+        3. **Single-process** — ordinary :func:`create_device_mesh`.
+
+    Args:
+        axis_dims: Axis dims value consumed by this operation.
+        axis_names: Named mesh or collective axes used by the operation.
+        axis_types: Axis types value consumed by this operation.
+        dcn_mesh_dims: Dcn mesh dims value consumed by this operation.
+        should_sort_granules_by_key: Should sort granules by key value consumed by this operation.
+        allow_split_physical_axes: Allow split physical axes value consumed by this operation.
+        backend: Backend value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     devices = jax.devices(backend)
     total_devices = jax.device_count(backend)
@@ -575,7 +667,15 @@ def _cached_mesh_impl(
     num_slices = _get_num_slices(devices)
 
     def fill_minus_one(shape: tuple[int, ...], target: int) -> tuple[int, ...]:
-        """Replace a single ``-1`` entry with the value needed to reach ``target`` product."""
+        """Replace a single ``-1`` entry with the value needed to reach ``target`` product.
+
+        Args:
+            shape: Array shape requested by the initializer or helper.
+            target: Target value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         shp = list(shape)
         minus = [i for i, v in enumerate(shp) if v == -1]
         if len(minus) > 1:
@@ -769,7 +869,15 @@ def _wrap_spx(jax_mesh: Mesh, mpmd_axis: str | None) -> SpxMesh:
     """Wrap ``jax_mesh`` in :class:`SpxMesh`, caching per ``(jax_mesh,
     mpmd_axis)`` so repeat calls to :func:`create_mesh` return the
     *same* :class:`SpxMesh` object (matches the underlying
-    ``_cached_mesh`` semantics)."""
+    ``_cached_mesh`` semantics).
+
+    Args:
+        jax_mesh: Jax mesh value consumed by this operation.
+        mpmd_axis: Mpmd axis value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
+    """
     key = (id(jax_mesh), mpmd_axis)
     cached = _SPX_MESH_CACHE.get(key)
     if cached is not None:

@@ -106,13 +106,25 @@ class RngStream(Variable):
         Reads ``self.metadata["key_size"]`` (recorded in
         :meth:`__init__`) to know how many leading words make up the
         key; the next two words are the counter halves.
+
+        Returns:
+            Return ``(raw_key_u32, counter_hi, counter_lo)`` from the packed leaf.
         """
         n = int(self.metadata["key_size"])
         raw = self._raw_get()
         return raw[:n], raw[n], raw[n + 1]
 
     def _repack(self, key: Array, hi: Array, lo: Array) -> Array:
-        """Pack ``(key, counter_hi, counter_lo)`` back into a single ``uint32`` leaf."""
+        """Pack ``(key, counter_hi, counter_lo)`` back into a single ``uint32`` leaf.
+
+        Args:
+            key: Logical key, path segment, or PRNG key used by the operation.
+            hi: Hi value consumed by this operation.
+            lo: Lo value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
+        """
         return jnp.concatenate([jnp.asarray(key, dtype=jnp.uint32), jnp.asarray([hi, lo], dtype=jnp.uint32)])
 
     def next_key(self) -> PRNGKey:
@@ -168,7 +180,11 @@ class RngStream(Variable):
         return RngStream(jax.random.fold_in(typed, jnp.int32(h)))
 
     def __call__(self) -> PRNGKey:
-        """Alias for :meth:`next_key` — convenient when treating the stream as a callable."""
+        """Alias for :meth:`next_key` — convenient when treating the stream as a callable.
+
+        Returns:
+            Result of invoking the wrapped callable or module.
+        """
         return self.next_key()
 
 
@@ -394,11 +410,22 @@ class _ForkedRngs:
         self._keys = keys
 
     def __len__(self) -> int:
-        """Return the leading axis length (the number of forked Rngs)."""
+        """Return the leading axis length (the number of forked Rngs).
+
+        Returns:
+            Integer length for the container.
+        """
         return int(self._keys.shape[0])
 
     def __getitem__(self, i: int) -> Rngs:
-        """Return a fresh :class:`Rngs` seeded with the ``i``-th key slice."""
+        """Return a fresh :class:`Rngs` seeded with the ``i``-th key slice.
+
+        Args:
+            i: I value consumed by this operation.
+
+        Returns:
+            Selected item from the container.
+        """
         return Rngs(self._keys[i])
 
     def as_stack(self) -> Array:
@@ -406,6 +433,9 @@ class _ForkedRngs:
 
         Useful as the ``in_axes``-mapped argument to a vmapped
         constructor or training step.
+
+        Returns:
+            Return the backing stacked-keys array unchanged.
         """
         return self._keys
 
@@ -448,6 +478,12 @@ def _coerce_seed(s: int | ArrayLike) -> Array:
     ``int`` inputs are wrapped via :func:`jax.random.PRNGKey`; everything
     else is forwarded to :func:`_to_typed_key` (which wraps raw
     ``uint32`` data when necessary).
+
+    Args:
+        s: S value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     if isinstance(s, int):
         return jax.random.PRNGKey(s)
@@ -461,6 +497,12 @@ def _to_typed_key(x: ArrayLike) -> Array:
     :mod:`jax.dtypes` PRNG-key family and returns them unchanged;
     otherwise calls :func:`jax.random.wrap_key_data` on a ``uint32``
     view of the input.
+
+    Args:
+        x: Input value consumed by the operation.
+
+    Returns:
+        Return a typed PRNG key, wrapping raw ``uint32`` data when necessary.
     """
     if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jax.dtypes.prng_key):
         return cast(Array, x)
@@ -473,6 +515,12 @@ def _to_raw_key(x: ArrayLike) -> Array:
     The inverse of :func:`_to_typed_key`. Used by :class:`RngStream` so
     the packed-leaf representation can store key data alongside the
     counter words inside a single ``uint32`` array.
+
+    Args:
+        x: Input value consumed by the operation.
+
+    Returns:
+        Return raw ``uint32`` key data, unwrapping a typed PRNG key when necessary.
     """
     if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jax.dtypes.prng_key):
         return jax.random.key_data(x)
@@ -486,6 +534,12 @@ def _str_hash(s: str) -> int:
     ``"layer_3"``, …) for :func:`jax.random.fold_in`. The result is
     re-mapped to the signed ``int32`` range expected by ``fold_in`` —
     values >= 2**31 wrap around to the negative half.
+
+    Args:
+        s: S value consumed by this operation.
+
+    Returns:
+        Result described by this helper.
     """
     h = 0x811C9DC5
     for c in s.encode("utf-8"):

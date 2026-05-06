@@ -35,7 +35,11 @@ _POLICY_STACK: threading.local = threading.local()
 
 
 def _get_stack() -> list["Policy"]:
-    """Return (or create) the thread-local policy stack."""
+    """Return (or create) the thread-local policy stack.
+
+    Returns:
+        Return (or create) the thread-local policy stack.
+    """
     s = getattr(_POLICY_STACK, "stack", None)
     if s is None:
         s = []

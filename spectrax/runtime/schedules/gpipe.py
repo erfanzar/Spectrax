@@ -53,8 +53,14 @@ class GPipe(Schedule):
 
         Forward phase: stage ``s`` runs microbatch ``t - s`` at time
         ``t`` while ``0 <= t - s < m``. Backward phase mirrors this
-        with reversed stage order — stage ``s`` runs backward on
+                with reversed stage order — stage ``s`` runs backward on
         microbatch ``t - (n - 1 - s)``.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         n, m = n_stages, self.microbatches
         fwd_steps = m + n - 1

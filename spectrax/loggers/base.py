@@ -114,27 +114,59 @@ class _NullBackend(BaseBackend):
     """No-op backend used when no backends are configured."""
 
     def log_scalar(self, tag: str, value: Scalar, step: int) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            value: Value consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def log_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            values: Values consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def log_image(self, tag: str, image: ArrayLike, step: int) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            image: Image value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def log_text(self, tag: str, text: str, step: int) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            text: Text value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def log_hparams(self, hparams: dict[str, LogValue]) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            hparams: Hparams value consumed by this operation.
+        """
         pass
 
     def log_summary(self, metrics: dict[str, LogValue]) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            metrics: Metrics value consumed by this operation.
+        """
         pass
 
     def log_table(
@@ -144,7 +176,14 @@ class _NullBackend(BaseBackend):
         rows: list[list[LogValue]],
         step: int,
     ) -> None:
-        """No-op."""
+        """No-op.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            columns: Columns value consumed by this operation.
+            rows: Rows value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         pass
 
     def flush(self) -> None:
@@ -321,43 +360,99 @@ class Logger:
         self._dispatch("log_table", tag, columns, rows, step)
 
     def add_scalar(self, tag: str, value: Scalar, step: int) -> None:
-        """Alias for :meth:`log_scalar`."""
+        """Alias for :meth:`log_scalar`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            value: Value consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         self.log_scalar(tag, value, step)
 
     def add_histogram(self, tag: str, values: ArrayLike, step: int) -> None:
-        """Alias for :meth:`log_histogram`."""
+        """Alias for :meth:`log_histogram`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            values: Values consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         self.log_histogram(tag, values, step)
 
     def add_image(self, tag: str, image: ArrayLike, step: int) -> None:
-        """Alias for :meth:`log_image`."""
+        """Alias for :meth:`log_image`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            image: Image value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         self.log_image(tag, image, step)
 
     def add_text(self, tag: str, text: str, step: int) -> None:
-        """Alias for :meth:`log_text`."""
+        """Alias for :meth:`log_text`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            text: Text value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         self.log_text(tag, text, step)
 
     def add_hparams(self, hparams: dict[str, LogValue]) -> None:
-        """Alias for :meth:`log_hparams`."""
+        """Alias for :meth:`log_hparams`.
+
+        Args:
+            hparams: Hparams value consumed by this operation.
+        """
         self.log_hparams(hparams)
 
     def scalar(self, tag: str, value: Scalar, step: int) -> None:
-        """Flax-style alias for :meth:`log_scalar`."""
+        """Flax-style alias for :meth:`log_scalar`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            value: Value consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         self.log_scalar(tag, value, step)
 
     def histogram(self, tag: str, values: ArrayLike, step: int) -> None:
-        """Flax-style alias for :meth:`log_histogram`."""
+        """Flax-style alias for :meth:`log_histogram`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            values: Values consumed by the helper.
+            step: Step value consumed by this operation.
+        """
         self.log_histogram(tag, values, step)
 
     def image(self, tag: str, image: ArrayLike, step: int) -> None:
-        """Flax-style alias for :meth:`log_image`."""
+        """Flax-style alias for :meth:`log_image`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            image: Image value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         self.log_image(tag, image, step)
 
     def text(self, tag: str, textdata: str, step: int) -> None:
-        """Flax-style alias for :meth:`log_text`."""
+        """Flax-style alias for :meth:`log_text`.
+
+        Args:
+            tag: Tag value consumed by this operation.
+            textdata: Textdata value consumed by this operation.
+            step: Step value consumed by this operation.
+        """
         self.log_text(tag, textdata, step)
 
     def hparams(self, hparams: dict[str, LogValue]) -> None:
-        """Flax-style alias for :meth:`log_hparams`."""
+        """Flax-style alias for :meth:`log_hparams`.
+
+        Args:
+            hparams: Hparams value consumed by this operation.
+        """
         self.log_hparams(hparams)
 
     def flush(self) -> None:
@@ -384,9 +479,17 @@ class Logger:
                 _logger.warning_once(f"Logger backend {type(backend).__name__}.close failed: {e}")
 
     def __enter__(self) -> Logger:
-        """Context-manager entry — returns ``self``."""
+        """Context-manager entry — returns ``self``.
+
+        Returns:
+            Result described by this helper.
+        """
         return self
 
     def __exit__(self, *exc: object) -> None:
-        """Context-manager exit — closes all backends."""
+        """Context-manager exit — closes all backends.
+
+        Args:
+            *exc: Additional positional arguments forwarded to the wrapped callable or backend.
+        """
         self.close()

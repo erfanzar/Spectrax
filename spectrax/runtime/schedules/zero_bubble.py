@@ -59,6 +59,12 @@ class ZeroBubbleH1(Schedule):
         mb)``; we scan stage-``s`` slots and fill the earliest
         eligible bubble, extending the grid with new rows if we run
         out of room.
+
+        Args:
+            n_stages: N stages value consumed by this operation.
+
+        Returns:
+            Result described by this helper.
         """
         n, m = n_stages, self.microbatches
         n_stages_ref = n

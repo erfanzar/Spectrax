@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 
 import jax
@@ -13,6 +14,23 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+_USCENTRAL1STUFF_TESTS_ENV = "SPECTRAX_RUN_USCENTRAL1STUFF_TESTS"
+
+
+def _env_truthy(name: str) -> bool:
+    """Return whether an environment variable is set to a common truthy value."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@pytest.fixture
+def gcs_auth_ino():
+    """Skip tests that need authenticated access to gs://uscentral1stuff."""
+    if not _env_truthy(_USCENTRAL1STUFF_TESTS_ENV):
+        pytest.skip(
+            "requires authenticated access to gs://uscentral1stuff; "
+            f"set {_USCENTRAL1STUFF_TESTS_ENV}=1 to run"
+        )
 
 
 @pytest.fixture

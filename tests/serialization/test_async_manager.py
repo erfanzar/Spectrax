@@ -345,7 +345,7 @@ class TestAsyncCheckpointManager:
         assert "arr_mask" in data
         assert "array_keys" in data
 
-    def test_save_load_gcs_roundtrip(self, mesh):
+    def test_save_load_gcs_roundtrip(self, mesh, gcs_auth_ino):
         """Save and load from GCS bucket gs://uscentral1stuff/spx-save-tmp."""
         import uuid
 

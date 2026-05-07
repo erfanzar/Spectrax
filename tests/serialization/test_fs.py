@@ -83,7 +83,7 @@ class TestMkdir:
         (tmp_path / "existing").mkdir()
         mkdir(target, exist_ok=True)
 
-    def test_gs_mkdir(self):
+    def test_gs_mkdir(self, gcs_auth_ino):
         """Gs mkdir."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-mkdir-{run_id}"
@@ -106,7 +106,7 @@ class TestExists:
         """Local missing file."""
         assert exists(str(tmp_path / "missing.txt")) is False
 
-    def test_gs_existing_file(self):
+    def test_gs_existing_file(self, gcs_auth_ino):
         """Gs existing file."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-exists-{run_id}/file.txt"
@@ -114,7 +114,7 @@ class TestExists:
         assert exists(path) is True
         rm(joinpath(path, ".."), recursive=True)
 
-    def test_gs_missing_file(self):
+    def test_gs_missing_file(self, gcs_auth_ino):
         """Gs missing file."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-exists-missing-{run_id}/file.txt"
@@ -136,7 +136,7 @@ class TestIsDir:
         f.write_text("x")
         assert is_dir(str(f)) is False
 
-    def test_gs_directory(self):
+    def test_gs_directory(self, gcs_auth_ino):
         """Gs directory."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-isdir-{run_id}"
@@ -161,7 +161,7 @@ class TestIsFile:
         d.mkdir()
         assert is_file(str(d)) is False
 
-    def test_gs_file(self):
+    def test_gs_file(self, gcs_auth_ino):
         """Gs file."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-isfile-{run_id}/file.txt"
@@ -185,7 +185,7 @@ class TestWriteText:
         write_text(f, "日本語")
         assert read_text(f) == "日本語"
 
-    def test_gs_write_and_read(self):
+    def test_gs_write_and_read(self, gcs_auth_ino):
         """Gs write and read."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-writetext-{run_id}/file.txt"
@@ -208,7 +208,7 @@ class TestReadText:
         with pytest.raises(FileNotFoundError):
             read_text(str(tmp_path / "missing.txt"))
 
-    def test_gs_missing_raises(self):
+    def test_gs_missing_raises(self, gcs_auth_ino):
         """Gs missing raises."""
         run_id = str(uuid.uuid4())[:8]
         path = f"{GCS_BASE}/test-readtext-missing-{run_id}/file.txt"
@@ -229,7 +229,7 @@ class TestIterdir:
         basenames = [p.split("/")[-1] for p in names]
         assert set(basenames) == {"a", "b", "c.txt"}
 
-    def test_gs_iterdir(self):
+    def test_gs_iterdir(self, gcs_auth_ino):
         """Gs iterdir."""
         run_id = str(uuid.uuid4())[:8]
         base = f"{GCS_BASE}/test-iterdir-{run_id}"
@@ -264,7 +264,7 @@ class TestRm:
         """Local rm missing noop."""
         rm(str(tmp_path / "missing"), recursive=True)
 
-    def test_gs_rm_recursive(self):
+    def test_gs_rm_recursive(self, gcs_auth_ino):
         """Gs rm recursive."""
         run_id = str(uuid.uuid4())[:8]
         base = f"{GCS_BASE}/test-rm-{run_id}"

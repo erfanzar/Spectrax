@@ -298,7 +298,7 @@ class TestCheckpointer:
         loaded, _meta = cp.load_pytree(mesh, prefix="model", discover_latest=True, discover_raise=False)
         assert loaded is None
 
-    def test_gcs_save_load(self, mesh):
+    def test_gcs_save_load(self, mesh, gcs_auth_ino):
         """Checkpointer save/load roundtrip on GCS."""
         import uuid
 

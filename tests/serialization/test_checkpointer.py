@@ -11,14 +11,40 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from spectrax.serialization import Checkpointer, CheckpointInterval
 
 
 class TestCheckpointer:
     """End-to-end tests for Checkpointer save/load/discovery."""
+
+    def test_load_pytree_template_uses_caller_key_aliases(self, tmp_checkpoint_dir):
+        """High-level load_pytree forwards aliases and shards by current template keys."""
+        mesh = Mesh(np.array(jax.devices()[:1]), ("x",))
+        cp = Checkpointer(
+            base_path=tmp_checkpoint_dir,
+            save_interval=None,
+            step_policies=[],
+        )
+        tree = {"old": jnp.arange(4, dtype=jnp.float32)}
+        cp.save_pytree(tree, prefix="model", mesh=mesh)
+
+        template = {"new": jnp.zeros((4,), dtype=jnp.float32)}
+        sharding = NamedSharding(mesh, PartitionSpec("x"))
+        loaded, _ = cp.load_pytree(
+            mesh,
+            prefix="model",
+            discover_latest=False,
+            template=template,
+            key_aliases=lambda key: ("model.old",) if key == "model.new" else (),
+            sharding_rules=[("model/new", sharding)],
+        )
+
+        assert jnp.allclose(loaded["new"], tree["old"])
+        assert loaded["new"].sharding == sharding
 
     def test_save_load_pytree(self, tmp_checkpoint_dir, mesh, sample_pytree):
         """Checkpointer save_pytree -> load_pytree roundtrip."""

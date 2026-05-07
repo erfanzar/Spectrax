@@ -70,6 +70,9 @@ def _keyentry_to_str(path_elem: object) -> str:
     Returns:
         String representation of the path element.
     """
+    if isinstance(path_elem, tuple | list):
+        return ".".join(_keyentry_to_str(path_elem=elem) for elem in path_elem)
+
     try:
         if isinstance(path_elem, DictKey):
             return str(path_elem.key)

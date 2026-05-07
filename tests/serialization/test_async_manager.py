@@ -11,8 +11,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from spectrax.serialization import AsyncCheckpointManager
 from spectrax.serialization.async_manager import _tensorstore_spec_for_load
@@ -20,6 +21,26 @@ from spectrax.serialization.async_manager import _tensorstore_spec_for_load
 
 class TestAsyncCheckpointManager:
     """End-to-end tests for AsyncCheckpointManager save/load."""
+
+    def test_load_pytree_template_uses_caller_key_aliases(self, tmp_checkpoint_dir):
+        """Template restore may alias keys and resolve shardings from the template layout."""
+        mesh = Mesh(np.array(jax.devices()[:1]), ("x",))
+        tree = {"old": jnp.arange(4, dtype=jnp.float32)}
+        mgr = AsyncCheckpointManager()
+        mgr.save_pytree(tree, tmp_checkpoint_dir, mesh=mesh, prefix="model")
+
+        template = {"new": jnp.zeros((4,), dtype=jnp.float32)}
+        sharding = NamedSharding(mesh, PartitionSpec("x"))
+        loaded, _ = mgr.load_pytree(
+            tmp_checkpoint_dir,
+            mesh,
+            prefix="model",
+            template=template,
+            key_aliases=lambda key: ("model.old",) if key == "model.new" else (),
+            sharding_rules=[("model/new", sharding)],
+        )
+        assert jnp.allclose(loaded["new"], tree["old"])
+        assert loaded["new"].sharding == sharding
 
     def test_save_load_pytree_roundtrip(self, tmp_checkpoint_dir, mesh, sample_pytree):
         """save_pytree -> load_pytree preserves values and structure."""

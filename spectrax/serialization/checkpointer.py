@@ -25,17 +25,15 @@ import jax.numpy as jnp
 from jax.experimental import multihost_utils as mh
 from jax.sharding import Mesh, NamedSharding
 
-from spectrax._internal.logging import get_logger
+from spectrax._internal.logging import LazyLogger, get_logger
 
 from . import _fs
 from ._compat import PyTree, flatten_dict
 from .async_manager import AsyncCheckpointManager
 
-logger = get_logger(__name__)
+logger: LazyLogger = get_logger("Checkpointer")
 
-MetadataDict = dict[str, object]
-Sequence = tp.Sequence
-Callable = tp.Callable
+MetadataDict: tp.TypeAlias = dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -69,7 +67,7 @@ class Checkpointer:
         self,
         base_path: str,
         save_interval: timedelta | None,
-        step_policies: Sequence[CheckpointInterval],
+        step_policies: tp.Sequence[CheckpointInterval],
         *,
         manager: AsyncCheckpointManager | None = None,
         delete_old_temp_checkpoints: bool = True,
@@ -321,6 +319,7 @@ class Checkpointer:
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         template: PyTree | None = None,
         strict_shapes: bool = True,
+        key_aliases: tp.Callable[[str], tp.Iterable[str]] | None = None,
         chunk_size: int | None = None,
         can_skip_structure: bool = False,
         concurrent_gb: int = 32,
@@ -350,6 +349,9 @@ class Checkpointer:
             callback: Optional per-array callback ``fn(array, key) -> array``.
             template: Optional template PyTree for shape coercion.
             strict_shapes: Whether to enforce exact shape matches.
+            key_aliases: Optional function that receives a template key and
+                returns alternate checkpoint keys to try when the exact key is
+                absent.
             chunk_size: Optional batch size for array loading.
             can_skip_structure: If ``True``, allow loading array-only
                 TensorStore checkpoints from ``tensorstore_index.json`` when
@@ -408,6 +410,7 @@ class Checkpointer:
             dtype=dtype,
             strict_shapes=strict_shapes,
             template=template,
+            key_aliases=key_aliases,
             callback=callback,
             chunk_size=chunk_size,
             can_skip_structure=can_skip_structure,

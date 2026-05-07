@@ -19,6 +19,7 @@ checkpointing. Supports:
 import asyncio
 import base64
 import concurrent.futures
+import importlib
 import json
 import os
 import pickle
@@ -36,7 +37,7 @@ from jax.experimental.array_serialization import serialization as array_serializ
 from jax.experimental.array_serialization.serialization import GlobalAsyncCheckpointManager
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from spectrax._internal.logging import get_logger
+from spectrax._internal.logging import LazyLogger, get_logger
 from spectrax._version import __version__
 from spectrax.serialization.serialization import leaf_key_paths
 
@@ -44,8 +45,9 @@ from . import _fs, fsspec_utils
 from ._compat import PyTree
 from .serialization import tree_serialize_leaves
 
-logger = get_logger("AsyncCheckpointManager")
-GLOBAL_CHECKPOINT_TIMEOUT = int(os.getenv("GLOBAL_CHECKPOINT_TIMEOUT", "400"))
+logger: LazyLogger = get_logger("AsyncCheckpointManager")
+GLOBAL_CHECKPOINT_TIMEOUT: int = int(os.getenv("GLOBAL_CHECKPOINT_TIMEOUT", "400"))
+KeyAliases: tp.TypeAlias = tp.Callable[[str], tp.Iterable[str]]
 
 
 def _is_array_like(x):
@@ -465,6 +467,51 @@ def _resolve_apply_shardings(
     return [shardings.get(key, fallback) for key in array_keys]
 
 
+def _template_sharding_lookup_keys(
+    array_keys: list[str],
+    *,
+    template: PyTree | None,
+    prefix: str | None,
+    key_aliases: KeyAliases | None,
+) -> list[str]:
+    """Choose the logical keys used to resolve shardings for saved arrays.
+
+    Args:
+        array_keys: Saved checkpoint array keys, including *prefix* when the
+            checkpoint structure records one.
+        template: Optional destination PyTree. When provided, arrays may be
+            restored into template keys that differ from the saved checkpoint
+            keys.
+        prefix: Prefix passed to :func:`leaf_key_paths` for template keys.
+        key_aliases: Optional alias function used by template restore.
+
+    Returns:
+        Keys aligned with ``array_keys``. Exact template matches and alias
+        matches are rewritten to the current template key so sharding regexes
+        are resolved against the live layout rather than a legacy checkpoint
+        layout.
+    """
+    if template is None:
+        return array_keys
+
+    tpl_leaves, _tpl_treedef = jax.tree_util.tree_flatten(template, is_leaf=_is_none)
+    tpl_leaf_keys_tree = leaf_key_paths(template, prefix=prefix, is_leaf=_is_none)
+    tpl_leaf_keys_full: list[str] = jax.tree_util.tree_leaves(tpl_leaf_keys_tree, is_leaf=_is_none)
+    tpl_arr_mask = [_is_array_like(x) for x in tpl_leaves]
+
+    saved_to_template: dict[str, str] = {}
+    for key, is_array in zip(tpl_leaf_keys_full, tpl_arr_mask, strict=True):
+        if not is_array:
+            continue
+        saved_to_template.setdefault(key, key)
+        if key_aliases is None:
+            continue
+        for alias in key_aliases(key):
+            saved_to_template.setdefault(alias, key)
+
+    return [saved_to_template.get(key, key) for key in array_keys]
+
+
 @dataclass
 class CheckpointMetadata:
     """Enhanced metadata for checkpoints with versioning and validation.
@@ -623,8 +670,7 @@ class AsyncCheckpointManager:
             progress_bar = None
             if show_bar:
                 try:
-                    from tqdm.auto import tqdm
-
+                    tqdm = importlib.import_module("tqdm.auto").tqdm
                     progress_bar = tqdm(
                         total=len(paths),
                         desc="Loading",
@@ -836,6 +882,7 @@ class AsyncCheckpointManager:
         dtype: jnp.dtype | None = None,
         template: PyTree | None = None,
         strict_shapes: bool = True,
+        key_aliases: KeyAliases | None = None,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         chunk_size: int | None = None,
         can_skip_structure: bool = False,
@@ -874,6 +921,10 @@ class AsyncCheckpointManager:
                 ``True``.
             strict_shapes: Whether to raise on shape mismatches when a
                 *template* is provided. Defaults to ``True``.
+            key_aliases: Optional function that receives a template key and
+                returns alternate checkpoint keys to try when the exact key is
+                absent. This keeps framework-specific legacy naming outside
+                SpectraX while allowing strict template restores.
             callback: Optional per-array callback ``fn(array, key) -> array``
                 invoked after each array is loaded.
             chunk_size: If set, arrays are loaded in batches of this size to
@@ -935,6 +986,7 @@ class AsyncCheckpointManager:
                 dtype=dtype,
                 template=template,
                 strict_shapes=strict_shapes,
+                key_aliases=key_aliases,
                 callback=callback,
                 chunk_size=chunk_size,
                 concurrent_gb=concurrent_gb,
@@ -998,8 +1050,14 @@ class AsyncCheckpointManager:
                 f"Available prefixes in this directory: {prefixes}"
             )
 
-        apply_shardings = _resolve_apply_shardings(
+        sharding_lookup_keys: list[str] = _template_sharding_lookup_keys(
             array_keys,
+            template=template,
+            prefix=prefix,
+            key_aliases=key_aliases,
+        )
+        apply_shardings: list[object] = _resolve_apply_shardings(
+            sharding_lookup_keys,
             mesh=mesh,
             shardings=shardings,
             sharding_rules=sharding_rules,
@@ -1032,18 +1090,24 @@ class AsyncCheckpointManager:
             if callback is not None:
                 array_leaves = [callback(arr, key) for arr, key in zip(array_leaves, array_keys, strict=False)]
         else:
-            array_leaves = []
+            array_leaves_by_index: list[jax.Array | None] = [None] * len(abs_paths)
             expected_arrays = sum(arr_mask)
-            for start in range(0, len(abs_paths), chunk_size):
-                end = min(start + chunk_size, len(abs_paths))
-                chunk_paths = abs_paths[start:end]
-                chunk_shardings = apply_shardings[start:end]
-                chunk_keys = array_keys[start:end]
+            load_indices = list(range(len(abs_paths)))
+            if template is not None:
+                load_indices.sort(
+                    key=lambda index: _array_nbytes(saved_shapes[index], storage_dtypes[index]),
+                    reverse=True,
+                )
+            for start in range(0, len(load_indices), chunk_size):
+                chunk_indices = load_indices[start : start + chunk_size]
+                chunk_paths = [abs_paths[index] for index in chunk_indices]
+                chunk_shardings = [apply_shardings[index] for index in chunk_indices]
+                chunk_keys = [array_keys[index] for index in chunk_indices]
                 chunk_arrays = self._deserialize_with_paths(
                     shardings=chunk_shardings,
                     paths=chunk_paths,
-                    shapes=saved_shapes[start:end],
-                    storage_dtypes=storage_dtypes[start:end],
+                    shapes=[saved_shapes[index] for index in chunk_indices],
+                    storage_dtypes=[storage_dtypes[index] for index in chunk_indices],
                     target_dtype=dtype,
                     concurrent_gb=concurrent_gb,
                     tensorstore_io_concurrency=tensorstore_io_concurrency,
@@ -1052,13 +1116,19 @@ class AsyncCheckpointManager:
                     tensorstore_assume_metadata=tensorstore_assume_metadata,
                     show_progress=show_progress,
                     progress_every=progress_every,
-                    tensorstore_metadata=tensorstore_metadata[start:end] if tensorstore_metadata is not None else None,
+                    tensorstore_metadata=(
+                        [tensorstore_metadata[index] for index in chunk_indices]
+                        if tensorstore_metadata is not None
+                        else None
+                    ),
                 )
                 if dtype is not None:
                     chunk_arrays = [jnp.asarray(x, dtype=dtype) for x in chunk_arrays]
                 if callback is not None:
                     chunk_arrays = [callback(arr, key) for arr, key in zip(chunk_arrays, chunk_keys, strict=False)]
-                array_leaves.extend(chunk_arrays)
+                for index, array in zip(chunk_indices, chunk_arrays, strict=True):
+                    array_leaves_by_index[index] = array
+            array_leaves = [array for array in array_leaves_by_index if array is not None]
             if len(array_leaves) != expected_arrays:
                 raise ValueError(
                     f"Loaded {len(array_leaves)} arrays but structure expects {expected_arrays}. "
@@ -1126,11 +1196,18 @@ class AsyncCheckpointManager:
                 raise ValueError(f"Array shape mismatch for key '{key}': got {loaded.shape}, expected {expected.shape}.")
             return expected
 
+        alias_hits = 0
         tpl_leaves_full = [None] * len(tpl_leaf_keys_full)
         for i, key in enumerate(tpl_leaf_keys_full):
             if tpl_arr_mask[i]:
                 expected = tpl_leaves[i]
                 loaded = saved_arrays_by_key.get(key)
+                if loaded is None and key_aliases is not None:
+                    for alias in key_aliases(key):
+                        loaded = saved_arrays_by_key.get(alias)
+                        if loaded is not None:
+                            alias_hits += 1
+                            break
                 if loaded is None:
                     if strict_shapes:
                         raise KeyError(f"Missing array for key '{key}' in checkpoint.")
@@ -1141,6 +1218,8 @@ class AsyncCheckpointManager:
                 tpl_leaves_full[i] = tpl_leaves[i]
 
         pytree = jax.tree_util.tree_unflatten(tpl_treedef, tpl_leaves_full)
+        if alias_hits:
+            logger.info(f"Resolved {alias_hits} checkpoint tensor(s) through caller-provided key aliases.")
         return pytree, metadata
 
     def _load_pytree_from_index(
@@ -1154,6 +1233,7 @@ class AsyncCheckpointManager:
         dtype: jnp.dtype | None = None,
         template: PyTree | None = None,
         strict_shapes: bool = True,
+        key_aliases: KeyAliases | None = None,
         callback: tp.Callable[[jax.Array, str], jax.Array] | None = None,
         chunk_size: int | None = None,
         concurrent_gb: int = 32,
@@ -1185,6 +1265,8 @@ class AsyncCheckpointManager:
             template: Optional PyTree template used to restore non-array leaves
                 and coerce loaded arrays into expected shapes.
             strict_shapes: Whether template shape mismatches should raise.
+            key_aliases: Optional function that receives a template key and
+                returns alternate index keys to try when the exact key is absent.
             callback: Optional per-array callback ``fn(array, key) -> array``.
             chunk_size: Optional number of arrays to load per batch.
             concurrent_gb: In-flight read budget in decimal GiB units.
@@ -1259,8 +1341,14 @@ class AsyncCheckpointManager:
         if missing:
             raise FileNotFoundError(f"{len(missing)} arrays missing (example: {missing[0]}).")
 
-        apply_shardings = _resolve_apply_shardings(
+        sharding_lookup_keys = _template_sharding_lookup_keys(
             array_keys,
+            template=template,
+            prefix=prefix,
+            key_aliases=key_aliases,
+        )
+        apply_shardings = _resolve_apply_shardings(
+            sharding_lookup_keys,
             mesh=mesh,
             shardings=shardings,
             sharding_rules=sharding_rules,
@@ -1362,10 +1450,17 @@ class AsyncCheckpointManager:
             return expected
 
         tpl_leaves_full = [None] * len(tpl_leaf_keys_full)
+        alias_hits = 0
         for i, key in enumerate(tpl_leaf_keys_full):
             if tpl_arr_mask[i]:
                 expected = tpl_leaves[i]
                 loaded = saved_arrays_by_key.get(key)
+                if loaded is None and key_aliases is not None:
+                    for alias in key_aliases(key):
+                        loaded = saved_arrays_by_key.get(alias)
+                        if loaded is not None:
+                            alias_hits += 1
+                            break
                 if loaded is None:
                     if strict_shapes:
                         raise KeyError(f"Missing array for key '{key}' in checkpoint.")
@@ -1375,4 +1470,6 @@ class AsyncCheckpointManager:
             else:
                 tpl_leaves_full[i] = tpl_leaves[i]
 
+        if alias_hits:
+            logger.info(f"Resolved {alias_hits} checkpoint tensor(s) through caller-provided key aliases.")
         return jax.tree_util.tree_unflatten(tpl_treedef, tpl_leaves_full), metadata

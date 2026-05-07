@@ -17,8 +17,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 @pytest.fixture
 def mesh():
-    """A 2x2 mesh over all local TPU devices."""
-    devices = np.array(jax.devices()).reshape(2, 2)
+    """A two-axis mesh over local devices, with a single-device CPU fallback."""
+    devices = np.array(jax.devices())
+    if devices.size >= 4:
+        devices = devices[:4].reshape(2, 2)
+    else:
+        devices = devices.reshape(devices.size, 1)
     return Mesh(devices, ("x", "y"))
 
 

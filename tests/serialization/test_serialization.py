@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec
 
+from spectrax import State
 from spectrax.serialization.serialization import (
     _fs_paths_from_key_paths,
     _fully_replicated_sharding,
@@ -203,6 +204,14 @@ class TestSerializationHelpers:
         tree = {"a": 1}
         result = leaf_key_paths(tree, prefix="")
         assert result == {"a": "a"}
+
+    def test_leaf_key_paths_state_custom_tuple_keys(self):
+        """State key-path tuples are flattened into stable dotted keys."""
+        state = State({"parameters": {"model": {"lm_head": {"weight": jnp.ones(())}}}})
+
+        result = leaf_key_paths(state, prefix="tx")
+
+        assert jax.tree_util.tree_leaves(result) == ["tx.parameters.model.lm_head.weight"]
 
     def test_fs_paths_from_key_paths(self):
         """Fs paths from key paths."""

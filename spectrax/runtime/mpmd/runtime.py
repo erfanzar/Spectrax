@@ -129,10 +129,10 @@ from .pscan_compiler import (
     _make_bwd_jit,
     _make_bwd_w_jit,
     _make_fwd_jit,
+    _make_private_stage_jit,
     _make_terminal_jit,
     _materialize_cotangents,
     _rebase_jaxpr_mesh_params,
-    _scope_stage_persistent_cache,
     _stage_jit_name_suffix,
     build_pscan_plan,
     dispatch_pscan,
@@ -5716,7 +5716,7 @@ def _build_cluster_plans(
         out_shardings_tuple = out_shardings_per_stage[rank]
         if out_shardings_tuple is not None:
             jit_kwargs["out_shardings"] = out_shardings_tuple
-        stage_jit = _scope_stage_persistent_cache(jax.jit(stage_body, **jit_kwargs))
+        stage_jit = _make_private_stage_jit(stage_body, **jit_kwargs)
 
         plans.append(
             (

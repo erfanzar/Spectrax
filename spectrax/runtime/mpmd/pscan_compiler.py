@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -134,48 +135,67 @@ class _ScopedPersistentCacheJit:
     executable cache is hot and later calls run at normal dispatch speed.
     """
 
-    def __init__(self, jitted: Callable[..., object]) -> None:
+    def __init__(
+        self,
+        jitted: Callable[..., object] | None = None,
+        *,
+        factory: Callable[[], Callable[..., object]] | None = None,
+        wrapped: Callable[..., object] | None = None,
+    ) -> None:
+        if jitted is None and factory is None:
+            raise ValueError("Either jitted or factory must be provided.")
         self._jitted = jitted
+        self._factory = factory
         self._compiled_once = False
-        functools.update_wrapper(self, jitted)
+        self._cache_dir = tempfile.TemporaryDirectory(prefix="spectrax-stage-jit-")
+        functools.update_wrapper(self, wrapped or jitted or factory)
+
+    def _ensure_jitted(self) -> Callable[..., object]:
+        """Construct the wrapped ``jax.jit`` while the private cache is active."""
+        if self._jitted is not None:
+            return self._jitted
+        if self._factory is None:
+            raise RuntimeError("Missing stage jit factory.")
+        jitted = self._call_with_private_cache(self._factory, block_result=False)
+        self._jitted = cast(Callable[..., object], jitted)
+        return self._jitted
+
+    def _call_with_private_cache(self, call: Callable[[], object], *, block_result: bool) -> object:
+        """Run one compile/lower call without touching the global eJIT cache."""
+        was_enabled = bool(jax.config.jax_enable_compilation_cache)
+        old_cache_dir = jax.config.jax_compilation_cache_dir
+        jax.config.update("jax_enable_compilation_cache", False)
+        jax.config.update("jax_compilation_cache_dir", self._cache_dir.name)
+        _reset_jax_persistent_cache_state()
+        try:
+            result = call()
+            if block_result:
+                jax.block_until_ready(result)
+            return result
+        finally:
+            jax.config.update("jax_compilation_cache_dir", old_cache_dir)
+            jax.config.update("jax_enable_compilation_cache", was_enabled)
+            _reset_jax_persistent_cache_state()
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         if self._compiled_once:
-            return self._jitted(*args, **kwargs)
+            return self._ensure_jitted()(*args, **kwargs)
 
         with _persistent_cache_scope_lock:
             if self._compiled_once:
-                return self._jitted(*args, **kwargs)
-            was_enabled = bool(jax.config.jax_enable_compilation_cache)
-            if not was_enabled:
-                result = self._jitted(*args, **kwargs)
-                self._compiled_once = True
-                return result
-            jax.config.update("jax_enable_compilation_cache", False)
-            _reset_jax_persistent_cache_state()
-            try:
-                result = self._jitted(*args, **kwargs)
-                self._compiled_once = True
-                return result
-            finally:
-                jax.config.update("jax_enable_compilation_cache", was_enabled)
-                _reset_jax_persistent_cache_state()
+                return self._ensure_jitted()(*args, **kwargs)
+            jitted = self._ensure_jitted()
+            result = self._call_with_private_cache(lambda: jitted(*args, **kwargs), block_result=True)
+            self._compiled_once = True
+            return result
 
     def lower(self, *args: object, **kwargs: object) -> object:
         with _persistent_cache_scope_lock:
-            was_enabled = bool(jax.config.jax_enable_compilation_cache)
-            if not was_enabled:
-                return self._jitted.lower(*args, **kwargs)
-            jax.config.update("jax_enable_compilation_cache", False)
-            _reset_jax_persistent_cache_state()
-            try:
-                return self._jitted.lower(*args, **kwargs)
-            finally:
-                jax.config.update("jax_enable_compilation_cache", was_enabled)
-                _reset_jax_persistent_cache_state()
+            jitted = self._ensure_jitted()
+            return self._call_with_private_cache(lambda: jitted.lower(*args, **kwargs), block_result=False)
 
     def __getattr__(self, name: str) -> object:
-        return getattr(self._jitted, name)
+        return getattr(self._ensure_jitted(), name)
 
 
 def _project_partition_spec(spec: object, keep_axes: set[str]) -> object:
@@ -618,6 +638,20 @@ def _scope_stage_persistent_cache(jitted: Callable[..., object]) -> Callable[...
     return _ScopedPersistentCacheJit(jitted)
 
 
+def _make_private_stage_jit(
+    fn: Callable[..., object],
+    **jit_kwargs: object,
+) -> Callable[..., object]:
+    """Build a stage ``jax.jit`` inside SpectraX's private cache scope.
+
+    JAX/eJIT can capture the persistent-cache directory when the jit object is
+    constructed, before execution starts. Stage programs must therefore create
+    the ``jax.jit`` under the same guard used for the first call.
+    """
+
+    return _ScopedPersistentCacheJit(factory=lambda: jax.jit(fn, **jit_kwargs), wrapped=fn)
+
+
 def _make_fwd_jit(
     cluster_jaxpr: Jaxpr,
     donate_argnums: tuple[int, ...] = (),
@@ -661,10 +695,8 @@ def _make_fwd_jit(
     fwd.__qualname__ = f"{fwd.__qualname__}_{cache_tag}"
     fwd.__name__ = f"{fwd.__name__}_{cache_tag}"
     if donate_argnums:
-        return cast(
-            Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd, donate_argnums=donate_argnums))
-        )
-    return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(fwd)))
+        return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(fwd, donate_argnums=donate_argnums))
+    return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(fwd))
 
 
 def _make_bwd_jit(
@@ -744,9 +776,7 @@ def _make_bwd_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd.__qualname__ = f"{bwd.__qualname__}_{cache_tag}"
     bwd.__name__ = f"{bwd.__name__}_{cache_tag}"
-    return cast(
-        Callable[..., tuple[object, tuple[object, ...]]], _scope_stage_persistent_cache(jax.jit(bwd, **jit_kwargs))
-    )
+    return cast(Callable[..., tuple[object, tuple[object, ...]]], _make_private_stage_jit(bwd, **jit_kwargs))
 
 
 def _make_bwd_i_jit(
@@ -821,7 +851,7 @@ def _make_bwd_i_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd_i.__qualname__ = f"{bwd_i.__qualname__}_{cache_tag}"
     bwd_i.__name__ = f"{bwd_i.__name__}_{cache_tag}"
-    return cast(Callable[..., tuple[object, ...]], _scope_stage_persistent_cache(jax.jit(bwd_i, **jit_kwargs)))
+    return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(bwd_i, **jit_kwargs))
 
 
 def _make_bwd_w_jit(
@@ -892,7 +922,7 @@ def _make_bwd_w_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     bwd_w.__qualname__ = f"{bwd_w.__qualname__}_{cache_tag}"
     bwd_w.__name__ = f"{bwd_w.__name__}_{cache_tag}"
-    return _scope_stage_persistent_cache(jax.jit(bwd_w, **jit_kwargs))
+    return _make_private_stage_jit(bwd_w, **jit_kwargs)
 
 
 def _make_terminal_jit(
@@ -978,7 +1008,7 @@ def _make_terminal_jit(
     cache_tag = _stage_jit_name_suffix(cluster_jaxpr, stage_mesh)
     term.__qualname__ = f"{term.__qualname__}_{cache_tag}"
     term.__name__ = f"{term.__name__}_{cache_tag}"
-    return _scope_stage_persistent_cache(jax.jit(term, **jit_kwargs))
+    return _make_private_stage_jit(term, **jit_kwargs)
 
 
 def _build_logical_locs(

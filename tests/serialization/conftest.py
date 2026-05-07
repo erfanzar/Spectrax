@@ -27,10 +27,7 @@ def _env_truthy(name: str) -> bool:
 def gcs_auth_ino():
     """Skip tests that need authenticated access to gs://uscentral1stuff."""
     if not _env_truthy(_USCENTRAL1STUFF_TESTS_ENV):
-        pytest.skip(
-            "requires authenticated access to gs://uscentral1stuff; "
-            f"set {_USCENTRAL1STUFF_TESTS_ENV}=1 to run"
-        )
+        pytest.skip(f"requires authenticated access to gs://uscentral1stuff; set {_USCENTRAL1STUFF_TESTS_ENV}=1 to run")
 
 
 @pytest.fixture

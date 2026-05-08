@@ -53,6 +53,7 @@ from .partition import (
     with_sharding_constraint,
     with_sharding_constraint_by_name,
 )
+from .placement import place_setup_leaf_with_sharding, place_setup_tree_with_shardings
 
 __all__ = [
     "DEFAULT_MESH_AXIS_DIMS",
@@ -84,6 +85,8 @@ __all__ = [
     "match_partition_rules",
     "names_in_current_mesh",
     "parse_mesh_from_string",
+    "place_setup_leaf_with_sharding",
+    "place_setup_tree_with_shardings",
     "sanitize_partition_spec_for_mesh_and_shape",
     "to_jax_mesh",
     "use_mesh",

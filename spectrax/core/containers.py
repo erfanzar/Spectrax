@@ -1403,6 +1403,9 @@ def _prepend_stacked_axis_metadata(metadata: dict[str, object]) -> dict[str, obj
         Result described by this helper.
     """
     out = dict(metadata)
+    # A stacked variable represents several logical layers, so one template
+    # layer's pipeline-stage hint is not a valid owner for the whole stack.
+    out.pop(PIPELINE_STAGE_METADATA_KEY, None)
     if "axis_names" in out:
         out["axis_names"] = (None, *tuple(out["axis_names"]))
     sharding = normalize_sharding(out.get("sharding"))

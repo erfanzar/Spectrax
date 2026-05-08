@@ -52,6 +52,15 @@ def test_logical_axis_rules_nesting_inner_overrides():
         assert dict(current_axis_rules())["in"] == "dp"
 
 
+def test_logical_axis_rules_preserve_compound_physical_targets():
+    """Logical axis rules can map one semantic axis to multiple mesh axes."""
+    with logical_axis_rules([("batch", ("fsdp", "dp")), ("hidden", "tp")]):
+        rules = dict(current_axis_rules())
+        assert rules["batch"] == ("fsdp", "dp")
+        assert rules["hidden"] == "tp"
+    assert dict(current_axis_rules()) == {}
+
+
 def test_with_partitioning_stamps_sharding_on_output():
     """Wrapped initializer records the sharding on its output."""
     from spectrax.init import zeros
@@ -361,6 +370,17 @@ def test_get_partition_spec_uses_active_rules():
     assert tuple(spec) == ("dp", "mp")
 
 
+def test_get_partition_spec_preserves_compound_active_rules():
+    """Active rules must not collapse fused physical mesh axes."""
+    m = Linear(4, 8, rngs=Rngs(0))
+    with logical_axis_rules([("in", ("fsdp", "dp")), ("out", "tp")]):
+        specs = get_partition_spec(m)
+    weight_paths = [p for p in specs["parameters"] if p.endswith("weight")]
+    assert len(weight_paths) == 1
+    spec = specs["parameters"][weight_paths[0]]
+    assert tuple(spec) == (("fsdp", "dp"), "tp")
+
+
 def test_get_named_sharding_wraps_in_namedsharding_for_single_device_mesh():
     """Against a 1-device mesh the NamedSharding tree is well-formed."""
     m = Linear(2, 4, rngs=Rngs(0))
@@ -370,6 +390,19 @@ def test_get_named_sharding_wraps_in_namedsharding_for_single_device_mesh():
         tree = get_named_sharding(m, mesh)
     for _p, ns in tree["parameters"].items():
         assert isinstance(ns, jax.sharding.NamedSharding)
+
+
+def test_get_named_sharding_preserves_compound_active_rules():
+    """NamedSharding resolution keeps compound logical-rule targets."""
+    m = Linear(4, 8, rngs=Rngs(0))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]).reshape((1, 1, 1)), ("fsdp", "dp", "tp"))
+
+    with logical_axis_rules([("in", ("fsdp", "dp")), ("out", "tp")]):
+        tree = get_named_sharding(m, mesh)
+
+    weight_paths = [p for p in tree["parameters"] if p.endswith("weight")]
+    assert len(weight_paths) == 1
+    assert tuple(tree["parameters"][weight_paths[0]].spec) == (("fsdp", "dp"), "tp")
 
 
 def test_parameter_named_sharding_accepts_compound_physical_axis_names():
@@ -609,6 +642,17 @@ def test_with_sharding_constraint_by_name_accepts_compound_axis_names():
 
     with mesh, logical_axis_rules([("data", "fsdp"), ("sequence", "sp"), ("model", "tp")]):
         y = with_sharding_constraint_by_name(x, (("data", "sequence"), "model"))
+
+    assert jnp.array_equal(x, y)
+
+
+def test_with_sharding_constraint_by_name_accepts_compound_rule_values():
+    """Constraint rules can map one logical axis to a fused physical spec."""
+    x = jnp.arange(16.0).reshape((4, 4))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:1]).reshape((1, 1, 1)), ("fsdp", "dp", "tp"))
+
+    with mesh, logical_axis_rules([("batch", ("fsdp", "dp")), ("features", "tp")]):
+        y = with_sharding_constraint_by_name(x, ("batch", "features"))
 
     assert jnp.array_equal(x, y)
 

@@ -19,18 +19,22 @@ from __future__ import annotations
 import contextlib
 import threading
 from collections.abc import Iterator, Mapping, Sequence
+from typing import TypeAlias
 
 __all__ = ["current_axis_rules", "logical_axis_rules"]
 
 
 _STACK: threading.local = threading.local()
 
+AxisRuleValue: TypeAlias = str | tuple[str | None, ...] | None
+"""Physical mesh-axis target for one logical axis-rule entry."""
 
-def _get_stack() -> list[dict[str, str | None]]:
+
+def _get_stack() -> list[dict[str, AxisRuleValue]]:
     """Return the thread-local stack of axis-rule mappings.
 
-    Each frame is a ``dict[str, str | None]`` mapping a logical name to
-    a physical mesh-axis name (or ``None`` to drop the axis). The list
+    Each frame maps a logical name to a physical mesh-axis name, a fused
+    tuple of physical mesh axes, or ``None`` to drop the axis. The list
     grows with each :func:`logical_axis_rules` ``with`` and shrinks on
     exit; per-thread storage means worker threads do not see each
     other's frames.
@@ -46,7 +50,7 @@ def _get_stack() -> list[dict[str, str | None]]:
 
 
 @contextlib.contextmanager
-def logical_axis_rules(rules: Sequence[tuple[str, str | None]]) -> Iterator[None]:
+def logical_axis_rules(rules: Sequence[tuple[str, AxisRuleValue]]) -> Iterator[None]:
     """Push a logical-to-mesh axis mapping onto the stack for the ``with`` body.
 
     The mapping is consulted by :func:`current_axis_rules` (and through
@@ -59,9 +63,10 @@ def logical_axis_rules(rules: Sequence[tuple[str, str | None]]) -> Iterator[None
     inheriting the rest. On exit the pushed frame is popped.
 
     Args:
-        rules: Sequence of ``(logical_name, mesh_axis_name_or_None)``
-            pairs. ``None`` means "drop this logical axis", i.e.
-            replicate along it.
+        rules: Sequence of ``(logical_name, mesh_axis_target)`` pairs.
+            The target may be a physical mesh-axis name, a fused tuple
+            such as ``("fsdp", "dp")``, or ``None`` to drop the logical
+            axis and replicate along it.
 
     Yields:
         ``None``. Use :func:`current_axis_rules` inside the block to
@@ -76,7 +81,7 @@ def logical_axis_rules(rules: Sequence[tuple[str, str | None]]) -> Iterator[None
         stack.pop()
 
 
-def current_axis_rules() -> Mapping[str, str | None]:
+def current_axis_rules() -> Mapping[str, AxisRuleValue]:
     """Return the merged logical-to-mesh axis mapping currently in effect.
 
     Frames pushed by :func:`logical_axis_rules` are merged from the
@@ -88,7 +93,7 @@ def current_axis_rules() -> Mapping[str, str | None]:
         A new ``dict`` (the caller may mutate it without affecting the
         stack).
     """
-    merged: dict[str, str | None] = {}
+    merged: dict[str, AxisRuleValue] = {}
     for frame in _get_stack():
         merged.update(frame)
     return merged

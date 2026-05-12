@@ -655,6 +655,9 @@ class AsyncCheckpointManager:
         shapes = shapes or [None] * len(paths)
         storage_dtypes = storage_dtypes or [None] * len(paths)
         tensorstore_metadata = tensorstore_metadata or [None] * len(paths)
+        shapes = tp.cast(list[tuple[int, ...] | None], shapes)
+        storage_dtypes = tp.cast(list[np.dtype | jnp.dtype | type | str | None], storage_dtypes)
+        tensorstore_metadata = tp.cast(list[dict[str, tp.Any] | None], tensorstore_metadata)
         requested_bytes = [
             _array_nbytes(shape, storage_dtype) for shape, storage_dtype in zip(shapes, storage_dtypes, strict=True)
         ]

@@ -47,6 +47,7 @@ __all__ = [
     "find",
     "iter_variables",
     "live_variables",
+    "strip_pipeline_stage_metadata",
     "tree_state",
     "update",
 ]
@@ -226,6 +227,35 @@ class GraphDef:
             if r == ref_id:
                 return p
         raise KeyError(f"No canonical path for ref_id {ref_id}")
+
+
+def strip_pipeline_stage_metadata(graphdef: GraphDef) -> GraphDef:
+    """Return ``graphdef`` with per-variable pipeline-stage hints removed.
+
+    A graph template can represent a stack or scan segment containing several
+    logical layers/stages. In that case one concrete layer's
+    ``pipeline_stage`` metadata is not a valid owner for the whole template.
+    """
+    from .stage_assignment import PIPELINE_STAGE_METADATA_KEY
+
+    nodes: list[Node] = []
+    changed = False
+    for node in graphdef.nodes:
+        if isinstance(node, VarNode):
+            metadata = tuple((k, v) for k, v in node.metadata if k != PIPELINE_STAGE_METADATA_KEY)
+            if metadata != node.metadata:
+                changed = True
+                node = VarNode(class_name=node.class_name, collection=node.collection, metadata=metadata)
+        nodes.append(node)
+    if not changed:
+        return graphdef
+    return GraphDef(
+        nodes=tuple(nodes),
+        root=graphdef.root,
+        var_refs=graphdef.var_refs,
+        var_canonical=graphdef.var_canonical,
+        shared_paths=graphdef.shared_paths,
+    )
 
 
 def _container_kind(m: Module) -> str:

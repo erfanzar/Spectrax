@@ -41,6 +41,8 @@ from jax.extend.core import Jaxpr, JaxprEqn, Primitive, Var
 from jax.interpreters import ad, batching, mlir
 from jax.sharding import NamedSharding, PartitionSpec
 
+from spectrax._internal.logging import get_logger
+
 __all__ = [
     "cluster_jaxpr_by_markers",
     "has_stage_regions",
@@ -54,6 +56,9 @@ __all__ = [
     "sxstage_iter",
     "sxstage_region",
 ]
+
+logger = get_logger(__name__)
+_CLUSTER_PRUNE_DIAGNOSTICS = {"logged": 0}
 
 
 sxstage_iter_p = Primitive("sxstage_iter")
@@ -900,6 +905,42 @@ def _collect_defined_vars_ordered(eqns: list[JaxprEqn]) -> list[Var]:
     return ordered
 
 
+def _prune_stage_jaxpr(sub: Jaxpr) -> Jaxpr:
+    """Drop stage equations that do not feed the stage outputs.
+
+    ``cluster_jaxpr_by_markers`` already computes a minimal-ish output tuple
+    for each stage boundary, but the stage body is later evaluated through
+    ``jax.core.eval_jaxpr``. Keeping dead equations in that private jaxpr can
+    force expensive auxiliary computations to survive tracing even when their
+    values are not part of the stage ABI. This pass performs plain reverse
+    liveness over the chosen outvars before the stage reaches ``jax.jit``.
+    """
+    needed: set[int] = {id(v) for v in sub.outvars if isinstance(v, Var)}
+    kept_rev: list[JaxprEqn] = []
+    for eqn in reversed(sub.eqns):
+        eqn_outvars = [v for v in eqn.outvars if isinstance(v, Var)]
+        effects = getattr(eqn, "effects", core.no_effects)
+        keep = bool(effects) or any(id(v) in needed for v in eqn_outvars)
+        if not keep:
+            continue
+        kept_rev.append(eqn)
+        for invar in eqn.invars:
+            if isinstance(invar, Var):
+                needed.add(id(invar))
+
+    pruned_eqns = list(reversed(kept_rev))
+    pruned_invars = [v for v in sub.invars if not isinstance(v, Var) or id(v) in needed]
+    if len(pruned_eqns) == len(sub.eqns) and len(pruned_invars) == len(sub.invars):
+        return sub
+    return Jaxpr(
+        constvars=list(sub.constvars),
+        invars=pruned_invars,
+        outvars=list(sub.outvars),
+        eqns=pruned_eqns,
+        effects=sub.effects,
+    )
+
+
 def _stage_region_spans(jaxpr: Jaxpr) -> tuple[tuple[int, int], ...]:
     """Return top-level equation spans covered by stage-region markers.
 
@@ -1309,6 +1350,8 @@ def cluster_jaxpr_by_markers(
             defined_order_up_to_at[idx] = list(pre_order)
 
     clusters: list[Jaxpr] = []
+    dropped_eqns_total = 0
+    dropped_invars_total = 0
     for idx, (start, end) in enumerate(itertools.pairwise(boundaries)):
         base_eqns = [
             e for eqn_idx, e in enumerate(jaxpr.eqns[start:end], start=start) if eqn_idx not in boundary_marker_positions
@@ -1369,8 +1412,25 @@ def cluster_jaxpr_by_markers(
             eqns=eqns,
             effects=core.no_effects,
         )
-        clusters.append(sub)
+        pruned = _prune_stage_jaxpr(sub)
+        dropped_eqns_total += len(sub.eqns) - len(pruned.eqns)
+        dropped_invars_total += len(sub.invars) - len(pruned.invars)
+        clusters.append(pruned)
         del idx
+    if dropped_eqns_total and _CLUSTER_PRUNE_DIAGNOSTICS.get("logged", 0) < 5:
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index == 0:
+            logger.warning(
+                "SpectraX MPMD marker clustering pruned %d dead stage equation(s) "
+                "and %d unused stage input(s) across %d stage(s).",
+                dropped_eqns_total,
+                dropped_invars_total,
+                len(clusters),
+            )
+            _CLUSTER_PRUNE_DIAGNOSTICS["logged"] = _CLUSTER_PRUNE_DIAGNOSTICS.get("logged", 0) + 1
     return clusters
 
 

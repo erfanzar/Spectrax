@@ -5,8 +5,10 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from spectrax.runtime.mpmd import MpmdPipelineExecutor
+from spectrax.runtime.mpmd.pipeline_executor import _PreparedCall
 
 
 class _FakeSubmesh:
@@ -260,3 +262,18 @@ def test_mpmd_pipeline_executor_workers_enter_stage_submesh_for_every_launch():
     assert submesh0.enter_count == 4
     assert submesh1.enter_count == 4
     executor.shutdown()
+
+
+def test_mpmd_pipeline_executor_raises_for_missing_required_stage_output():
+    executor = MpmdPipelineExecutor()
+    call = _PreparedCall(
+        state={
+            "fn_outvar_map": [(1, 0)],
+            "out_shardings": None,
+            "result_treedef": None,
+        },
+        flat_args=[],
+    )
+
+    with pytest.raises(RuntimeError, match="missing output for required stage 1"):
+        executor._assemble_result(call, [(jnp.array([1], dtype=jnp.int32),), None])

@@ -505,8 +505,10 @@ class Selector:
                 writer = state._writers.get((c, path))
                 if writer is not None:
                     if is_match:
+                        assert matched_writers is not None
                         matched_writers[(c, path)] = writer
                     else:
+                        assert rest_writers is not None
                         rest_writers[(c, path)] = writer
         return State._from_raw(matched_nested, writers=matched_writers), State._from_raw(
             rest_nested, writers=rest_writers

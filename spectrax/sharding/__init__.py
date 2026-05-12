@@ -53,7 +53,17 @@ from .partition import (
     with_sharding_constraint,
     with_sharding_constraint_by_name,
 )
-from .placement import place_setup_leaf_with_sharding, place_setup_tree_with_shardings
+from .placement import (
+    mesh_axis_product,
+    named_sharding_for_shape,
+    named_sharding_for_value,
+    place_setup_leaf_with_sharding,
+    place_setup_tree_with_shardings,
+    reshape_with_named_shardings,
+    spec_shape_mismatches,
+    transpose_with_named_shardings,
+    with_named_sharding,
+)
 
 __all__ = [
     "DEFAULT_MESH_AXIS_DIMS",
@@ -83,13 +93,20 @@ __all__ = [
     "logical_axis_rules",
     "make_shard_and_gather_fns",
     "match_partition_rules",
+    "mesh_axis_product",
+    "named_sharding_for_shape",
+    "named_sharding_for_value",
     "names_in_current_mesh",
     "parse_mesh_from_string",
     "place_setup_leaf_with_sharding",
     "place_setup_tree_with_shardings",
+    "reshape_with_named_shardings",
     "sanitize_partition_spec_for_mesh_and_shape",
+    "spec_shape_mismatches",
     "to_jax_mesh",
+    "transpose_with_named_shardings",
     "use_mesh",
+    "with_named_sharding",
     "with_partitioning",
     "with_sharding_constraint",
     "with_sharding_constraint_by_name",

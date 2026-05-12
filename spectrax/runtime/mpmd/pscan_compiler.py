@@ -55,6 +55,7 @@ from ...core.selector import as_selector
 from ...core.stage_assignment import metadata_stage_assignment, resolve_stage_rank
 from ...sharding.partition import get_named_sharding, sanitize_partition_spec_for_mesh_and_shape
 from ..schedules import (
+    DualPipeV,
     Eager1F1B,
     FusedTask,
     InterleavedH1,
@@ -655,6 +656,7 @@ def _make_private_stage_jit(
 def _make_fwd_jit(
     cluster_jaxpr: Jaxpr,
     donate_argnums: tuple[int, ...] = (),
+    out_shardings: object | None = None,
     stage_mesh: object | None = None,
 ) -> Callable[..., tuple[object, ...]]:
     """Return ``@jax.jit`` callable ``(consts, *invars) -> outvars`` for a non-terminal cluster.
@@ -694,9 +696,12 @@ def _make_fwd_jit(
 
     fwd.__qualname__ = f"{fwd.__qualname__}_{cache_tag}"
     fwd.__name__ = f"{fwd.__name__}_{cache_tag}"
+    jit_kwargs: dict[str, object] = {}
     if donate_argnums:
-        return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(fwd, donate_argnums=donate_argnums))
-    return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(fwd))
+        jit_kwargs["donate_argnums"] = donate_argnums
+    if out_shardings is not None:
+        jit_kwargs["out_shardings"] = out_shardings
+    return cast(Callable[..., tuple[object, ...]], _make_private_stage_jit(fwd, **jit_kwargs))
 
 
 def _make_bwd_jit(
@@ -785,6 +790,7 @@ def _make_bwd_i_jit(
     donate_argnums: tuple[int, ...] = (),
     out_shardings: object | None = None,
     stage_mesh: object | None = None,
+    invar_grad_mask: tuple[bool, ...] | None = None,
 ) -> Callable[..., tuple[object, ...]]:
     """Return a ``@jax.jit`` VJP callable that yields only input cotangents.
 
@@ -807,6 +813,14 @@ def _make_bwd_i_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
+    if invar_grad_mask is None:
+        invar_grad_mask = (True,) * n_invars
+    elif len(invar_grad_mask) != n_invars:
+        raise ValueError(
+            f"bwd_i invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}."
+        )
+    active_invar_positions = tuple(i for i, active in enumerate(invar_grad_mask) if active)
+
     def bwd_i(consts: tuple[object, ...], *invars_and_cotangents: object) -> tuple[object, ...]:
         """Compute ``grad(invars)`` only, dropping the const grads.
 
@@ -825,23 +839,33 @@ def _make_bwd_i_jit(
         with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input"):
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
+            if not active_invar_positions:
+                return (None,) * n_invars
 
-            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`.
+            active_invars = tuple(invars[i] for i in active_invar_positions)
+
+            def pure(*active_xs: object) -> tuple[object, ...]:
+                """Closed-over consts/inactive invars -> outs interpreter.
 
                 Args:
-                    c: C value consumed by this operation.
-                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+                    *active_xs: Invars whose cotangents are needed by the
+                        schedule. Other invars are closed over as primals, so
+                        masks / labels / other batch leaves are not treated as
+                        differentiation targets.
 
                 Returns:
                     Result described by this helper.
                 """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_input/pure_forward"):
-                    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
+                    xs = list(invars)
+                    for pos, value in zip(active_invar_positions, active_xs, strict=True):
+                        xs[pos] = value
+                    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *xs))
 
-            _, vjp_fn = jax.vjp(pure, consts, *invars)
-            grads = vjp_fn(tuple(cotangents))
-            return tuple(grads[1:])
+            _, vjp_fn = jax.vjp(pure, *active_invars)
+            active_grads = vjp_fn(tuple(cotangents))
+            active_by_pos = dict(zip(active_invar_positions, active_grads, strict=True))
+            return tuple(active_by_pos.get(i) for i in range(n_invars))
 
     jit_kwargs: dict[str, object] = {}
     if donate_argnums:
@@ -860,6 +884,8 @@ def _make_bwd_w_jit(
     donate_argnums: tuple[int, ...] = (),
     out_shardings: object | None = None,
     stage_mesh: object | None = None,
+    invar_grad_mask: tuple[bool, ...] | None = None,
+    return_invars: bool = False,
 ) -> Callable[..., object]:
     """Return ``@jax.jit`` VJP callable for weight/const gradients only.
 
@@ -876,6 +902,14 @@ def _make_bwd_w_jit(
 
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
+
+    if invar_grad_mask is None:
+        invar_grad_mask = (False,) * n_invars
+    elif len(invar_grad_mask) != n_invars:
+        raise ValueError(
+            f"bwd_w invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}."
+        )
+    active_invar_positions = tuple(i for i, active in enumerate(invar_grad_mask) if active)
 
     def bwd_w(consts: tuple[object, ...], *invars_and_cotangents: object) -> object:
         """Compute ``grad(consts)`` only, dropping invar cotangents.
@@ -897,22 +931,34 @@ def _make_bwd_w_jit(
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
 
-            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-                """Closed-over consts+invars -> outs interpreter used by :func:`jax.vjp`.
+            active_invars = tuple(invars[i] for i in active_invar_positions)
+
+            def pure(c: tuple[object, ...], *active_xs: object) -> tuple[object, ...]:
+                """Closed-over inactive invars -> outs interpreter for VJP.
 
                 Args:
                     c: C value consumed by this operation.
-                    *xs: Additional positional arguments forwarded to the wrapped callable or backend.
+                    *active_xs: Direct body invars whose cotangents should be
+                        produced in BWD-W together with const/weight grads.
 
                 Returns:
                     Result described by this helper.
                 """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward_weight/pure_forward"):
+                    xs = list(invars)
+                    for pos, value in zip(active_invar_positions, active_xs, strict=True):
+                        xs[pos] = value
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
-            _, vjp_fn = jax.vjp(pure, consts, *invars)
+            _, vjp_fn = jax.vjp(pure, consts, *active_invars)
             grads = vjp_fn(tuple(cotangents))
-            return grads[0]
+            g_consts = grads[0]
+            if not return_invars:
+                return g_consts
+            active_grads = grads[1:]
+            active_by_pos = dict(zip(active_invar_positions, active_grads, strict=True))
+            g_invars = tuple(active_by_pos.get(i) for i in range(n_invars))
+            return g_consts, g_invars
 
     jit_kwargs: dict[str, object] = {}
     if donate_argnums:
@@ -1397,7 +1443,7 @@ def _build_schedule_grid(schedule: object, n: int) -> list[list[object]]:
     skip_1f1b_fusion = getattr(schedule, "_skip_auto_fuse_1f1b", False)
     if callable(skip_1f1b_fusion):
         skip_1f1b_fusion = bool(skip_1f1b_fusion())
-    if not skip_1f1b_fusion and isinstance(schedule, (Std1F1B, Eager1F1B, InterleavedH1)):
+    if not skip_1f1b_fusion and isinstance(schedule, (Std1F1B, Eager1F1B, InterleavedH1, DualPipeV)):
         grid = fuse_1f1b_steady_state(grid)
     if isinstance(schedule, ZeroBubbleH1):
         grid = fuse_zerobubble_bwd_pair(grid)
@@ -1449,6 +1495,113 @@ def _transport_tuple(
     return tuple(jax.device_put(v, stage_shardings[dst_rank]) for v in vals)
 
 
+def _stage_axis_size(mesh: object, axis: object) -> int:
+    """Return the mesh size for one axis, treating unknown axes as replicated."""
+    if axis is None:
+        return 1
+    try:
+        return int(mesh.shape[axis])
+    except Exception:
+        return 1
+
+
+def _stage_axis_product(mesh: object, axis: object) -> int:
+    """Return the product of mesh sizes referenced by one PartitionSpec entry."""
+    if axis is None:
+        return 1
+    if isinstance(axis, tuple):
+        product = 1
+        for part in axis:
+            product *= _stage_axis_size(mesh, part)
+        return product
+    return _stage_axis_size(mesh, axis)
+
+
+def _spec_axis_factors(spec: object, mesh: object) -> tuple[int, ...]:
+    """Return per-dimension partition factors for diagnostics."""
+    try:
+        return tuple(_stage_axis_product(mesh, axis) for axis in tuple(spec))
+    except Exception:
+        return ()
+
+
+def _spec_axis_shape_mismatches(spec: object, mesh: object, shape: tuple[int, ...]) -> tuple[str, ...]:
+    """Return per-dimension shape/factor mismatches for an explicit edge spec."""
+    messages: list[str] = []
+    try:
+        parts = tuple(spec)
+    except Exception:
+        return ()
+    for dim, axis_entry in enumerate(parts):
+        axes = _axis_entry_names(axis_entry)
+        factor = _stage_axis_product(mesh, axis_entry)
+        if factor <= 1:
+            continue
+        axis_expr = "*".join(axes) if axes else "<replicated>"
+        if dim >= len(shape):
+            messages.append(f"dim{dim}:missing_shape_for_axes_{axis_expr}_product_{factor}")
+            continue
+        size = int(shape[dim])
+        if size % factor:
+            messages.append(f"dim{dim}:size_{size}_not_divisible_by_axes_{axis_expr}_product_{factor}")
+    return tuple(messages)
+
+
+def _axis_entry_names(axis: object) -> tuple[str, ...]:
+    """Return mesh-axis names referenced by one PartitionSpec entry."""
+    if axis is None:
+        return ()
+    if isinstance(axis, tuple):
+        return tuple(str(part) for part in axis if part is not None)
+    return (str(axis),)
+
+
+def _explicit_stage_mesh_and_spec(
+    spec: object,
+    *,
+    mesh: object,
+    shape: tuple[int, ...],
+    context: str,
+) -> tuple[object, jax.sharding.PartitionSpec]:
+    """Resolve an explicit edge spec, rejecting shape-incompatible ABIs."""
+    mesh_spec = sanitize_partition_spec_for_mesh_and_shape(spec, mesh=mesh, shape=None)
+    shape_spec = sanitize_partition_spec_for_mesh_and_shape(mesh_spec, mesh=mesh, shape=shape)
+    if shape_spec == mesh_spec and not _spec_axis_shape_mismatches(mesh_spec, mesh, shape):
+        return mesh, shape_spec
+    raise ValueError(
+        "SpectraX pscan explicit stage-edge sharding is incompatible with the value shape. "
+        f"context={context}, shape={shape}, requested_spec={mesh_spec}, "
+        f"shape_sanitized_spec={shape_spec}, mesh_axes={getattr(mesh, 'axis_names', None)}, "
+        f"axis_factors={_spec_axis_factors(mesh_spec, mesh)}, "
+        f"invalid_dims={_spec_axis_shape_mismatches(mesh_spec, mesh, shape)}. "
+        "Change the batch, microbatch count, or sharding policy so every "
+        "PartitionSpec dimension is divisible by the product of its mesh axes."
+    )
+
+
+def _strict_sanitize_explicit_stage_spec(
+    spec: object,
+    *,
+    mesh: object,
+    shape: tuple[int, ...],
+    context: str,
+) -> jax.sharding.PartitionSpec:
+    """Sanitize an explicit stage edge spec without silent shape relaxation."""
+    mesh_spec = sanitize_partition_spec_for_mesh_and_shape(spec, mesh=mesh, shape=None)
+    shape_spec = sanitize_partition_spec_for_mesh_and_shape(mesh_spec, mesh=mesh, shape=shape)
+    if shape_spec != mesh_spec:
+        raise ValueError(
+            "SpectraX pscan explicit stage-edge sharding is incompatible with the value shape. "
+            f"context={context}, shape={shape}, requested_spec={mesh_spec}, "
+            f"shape_sanitized_spec={shape_spec}, mesh_axes={getattr(mesh, 'axis_names', None)}, "
+            f"axis_factors={_spec_axis_factors(mesh_spec, mesh)}, "
+            f"invalid_dims={_spec_axis_shape_mismatches(mesh_spec, mesh, shape)}. "
+            "Change the batch, microbatch count, or sharding policy so every "
+            "PartitionSpec dimension is divisible by the product of its mesh axes."
+        )
+    return shape_spec
+
+
 def _edge_transfer_target(value: object, plan: PscanPlan, producer_logical: int, dst_rank: int) -> object:
     """Resolve a destination sharding for a marker-edge cross-rank transport.
 
@@ -1491,14 +1644,15 @@ def _edge_transfer_target(value: object, plan: PscanPlan, producer_logical: int,
         spec = sanitize_partition_spec_for_mesh_and_shape(
             edge_sharding,
             mesh=plan.mpmd_mesh,
-            shape=tuple(getattr(leaf, "shape", ())),
+            shape=None,
         )
-        spec = sanitize_partition_spec_for_mesh_and_shape(
+        edge_mesh, spec = _explicit_stage_mesh_and_spec(
             spec,
             mesh=dst_mesh,
             shape=tuple(getattr(leaf, "shape", ())),
+            context=f"sxstage_iter transport dst_rank={dst_rank}",
         )
-        return jax.sharding.NamedSharding(dst_mesh, spec)
+        return jax.sharding.NamedSharding(edge_mesh, spec)
 
     if hasattr(value, "shape"):
         return leaf_target(value)
@@ -1638,13 +1792,14 @@ def _accumulate_const_grads(
     """
     if accum is None:
         accum = [None] * n_total_consts
+    accum = cast(list[object | None], accum)
     for local_idx, const_idx in enumerate(const_indices):
         grad = g_consts[local_idx]
         if accum[const_idx] is None:
             accum[const_idx] = grad
         else:
             accum[const_idx] = jax.tree.map(_add_grad, accum[const_idx], grad)
-    return cast(list[object | None], accum)
+    return accum
 
 
 def _sum_rank_grads(grad_accums: list[list[object | None] | None], output_sharding: object) -> object | None:

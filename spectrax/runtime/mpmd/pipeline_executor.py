@@ -26,7 +26,9 @@ a normal forward ``sxjit`` call.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import logging
 import queue
 import threading
 import time
@@ -43,6 +45,9 @@ from .runtime import (
     _assemble_invars_from_plan,
     _assemble_outputs,
     _InvarAssemblyPlan,
+    _ordered_schedule_transport_scope,
+    _OrderedScheduleTransportGate,
+    _pipeline_transport_task_name,
     _prepare_invar_assembly_plan,
     _restore_result_treedef,
 )
@@ -57,6 +62,58 @@ StageOutputs: tp.TypeAlias = tuple[PyTree, ...]
 StageCallable: tp.TypeAlias = tp.Callable[..., StageOutputs]
 InvarSource: tp.TypeAlias = tuple[str, int] | tuple[str, int, int] | tuple[str, int, int, PyTree]
 InvarMap: tp.TypeAlias = list[InvarSource]
+_CompiledStage: tp.TypeAlias = tuple[tp.Any, ...]
+
+
+_PIPELINE_PROGRESS_DIAGNOSTICS: dict[str, int] = {}
+_PIPELINE_DISPATCH_DIAGNOSTICS: dict[str, int] = {}
+_PIPELINE_PROGRESS_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
+
+
+def _worker_jax_context() -> contextlib.AbstractContextManager[object]:
+    """Return the worker-side JAX context manager."""
+    return contextlib.nullcontext()
+
+
+def _unpack_compiled_stage(
+    entry: _CompiledStage,
+    default_rank: int,
+) -> tuple[StageCallable, Mesh, Sharding, Sharding | None, InvarMap, int]:
+    """Return the stable fields from legacy and current sxjit stage plans."""
+    if len(entry) >= 6:
+        stage_jit, submesh, my_sh, next_sharding, invar_map, physical_rank = entry[:6]
+        return (
+            tp.cast(StageCallable, stage_jit),
+            tp.cast(Mesh, submesh),
+            tp.cast(Sharding, my_sh),
+            tp.cast(Sharding | None, next_sharding),
+            tp.cast(InvarMap, invar_map),
+            int(physical_rank),
+        )
+    stage_jit, submesh, my_sh, next_sharding, invar_map = entry
+    return (
+        tp.cast(StageCallable, stage_jit),
+        tp.cast(Mesh, submesh),
+        tp.cast(Sharding, my_sh),
+        tp.cast(Sharding | None, next_sharding),
+        tp.cast(InvarMap, invar_map),
+        default_rank,
+    )
+
+
+def _compiled_stage_consts(entry: _CompiledStage) -> tuple[PyTree, ...] | None:
+    """Return runtime-passed stage constants for current plans, or ``None`` for legacy plans."""
+    if len(entry) > 8:
+        return tp.cast(tuple[PyTree, ...], entry[8])
+    return None
+
+
+def _stage_call_args(placed_consts: tuple[PyTree, ...] | None, invars: list[PyTree]) -> tuple[PyTree, ...]:
+    """Build positional arguments for legacy and current compiled stage ABIs."""
+    if placed_consts is None:
+        return tuple(invars)
+    return (placed_consts, *invars)
 
 
 class _MpmdState(tp.TypedDict, total=False):
@@ -78,10 +135,6 @@ class _MpmdState(tp.TypedDict, total=False):
     dynamic_flat_to_orig_flat: dict[int, int]
     out_shardings: PyTree
     result_treedef: PyTree
-
-
-_CompiledStage: tp.TypeAlias = tuple[StageCallable, Mesh, Sharding, Sharding | None, InvarMap]
-
 
 class _MpmdPreparedCallable(tp.Protocol):
     """Forward callable produced by ``sxjit`` with an exposed MPMD plan.
@@ -242,12 +295,30 @@ class _StageTask:
         stage_jit: Compiled JAX callable for one physical pipeline rank.
         submesh: Rank-local mesh context used while invoking ``stage_jit``.
         invars: Fully materialized positional inputs for the stage.
+    input_factory: Optional worker-side input assembly closure. Worker mode
+            uses this to keep inter-stage activation transport off the caller
+            thread while still serializing launches per physical rank.
+        dependencies: Futures that must be complete before the worker should
+            run ``input_factory``. Workers may receive tasks out of dependency
+            order when one physical rank owns multiple virtual stages; delaying
+            dequeue until dependencies are ready avoids head-of-line blocking.
+        transport_gate: Optional deterministic transport gate shared by this
+            dispatch.
+        transport_task_names: Ordered transport names the input factory may
+            issue while assembling this stage's inputs.
         future: Future completed by the worker with the stage's flat outputs.
     """
 
     stage_jit: StageCallable
     submesh: Mesh
-    invars: list[PyTree]
+    placed_consts: tuple[PyTree, ...] | None
+    invars: list[PyTree] | None
+    input_factory: tp.Callable[[], list[PyTree]] | None
+    microbatch_idx: int | None
+    stage_idx: int | None
+    dependencies: tuple[Future[StageOutputs], ...]
+    transport_gate: _OrderedScheduleTransportGate | None
+    transport_task_names: tuple[str, ...]
     future: Future[StageOutputs]
 
 
@@ -274,21 +345,87 @@ class _StageWorker:
         self._thread = threading.Thread(target=self._run, name=f"spx-mpmd-stage-{rank}", daemon=True)
         self._thread.start()
 
-    def submit(self, *, stage_jit: StageCallable, submesh: Mesh, invars: list[PyTree]) -> Future[StageOutputs]:
+    def submit(
+        self,
+        *,
+        stage_jit: StageCallable,
+        submesh: Mesh,
+        placed_consts: tuple[PyTree, ...] | None,
+        invars: list[PyTree] | None = None,
+        input_factory: tp.Callable[[], list[PyTree]] | None = None,
+        microbatch_idx: int | None = None,
+        stage_idx: int | None = None,
+        dependencies: tuple[Future[StageOutputs], ...] = (),
+        transport_gate: _OrderedScheduleTransportGate | None = None,
+        transport_task_names: tuple[str, ...] = (),
+    ) -> Future[StageOutputs]:
         """Queue one stage invocation and return its completion future.
 
         Args:
             stage_jit: Compiled per-rank executable.
             submesh: Mesh context to enter before calling ``stage_jit``.
             invars: Positional inputs already placed for the destination stage.
-
+            input_factory: Optional callable that materializes the positional
+                inputs inside this worker thread. Exactly one of ``invars`` or
+                ``input_factory`` must be supplied.
+            microbatch_idx: Optional microbatch index for diagnostics.
+            stage_idx: Optional logical stage index for diagnostics.
+            dependencies: Futures whose outputs feed this stage task.
+            transport_gate: Deterministic transport gate for multi-controller
+                pair collectives.
+            transport_task_names: Ordered transfer names this task may issue.
         Returns:
             A future that resolves to the stage's flat output tuple, or carries
             the raised exception from the worker thread.
         """
         future: Future[StageOutputs] = Future()
-        self._queue.put(_StageTask(stage_jit=stage_jit, submesh=submesh, invars=invars, future=future))
+        self._queue.put(
+            _StageTask(
+                stage_jit=stage_jit,
+                submesh=submesh,
+                placed_consts=placed_consts,
+                invars=invars,
+                input_factory=input_factory,
+                microbatch_idx=microbatch_idx,
+                stage_idx=stage_idx,
+                dependencies=dependencies,
+                transport_gate=transport_gate,
+                transport_task_names=transport_task_names,
+                future=future,
+            )
+        )
         return future
+
+    @staticmethod
+    def _task_dependencies_ready(task: _StageTask) -> bool:
+        """Return whether all upstream stage futures have completed."""
+        return all(dependency.done() for dependency in task.dependencies)
+
+    @staticmethod
+    def _task_transport_ready(task: _StageTask) -> bool:
+        """Return whether the task's first ordered transport is ready."""
+        if task.transport_gate is None:
+            return True
+        return task.transport_gate.ready_for(task.transport_task_names)
+
+    @staticmethod
+    def _ready_task_priority(task: _StageTask, queue_index: int) -> tuple[int, int, int, int]:
+        """Return a priority key for ready tasks sharing one physical worker."""
+        stage_idx = task.stage_idx if task.stage_idx is not None else -1
+        microbatch_idx = task.microbatch_idx if task.microbatch_idx is not None else 0
+        event_position = task.transport_gate.position_for(task.transport_task_names) if task.transport_gate else None
+        event_priority = -event_position if event_position is not None else -(10**12)
+        return (event_priority, stage_idx, -microbatch_idx, -queue_index)
+
+    def _maybe_log_timing(
+        self,
+        task: _StageTask,
+        *,
+        assemble_time: float,
+        execute_time: float,
+        total_time: float,
+    ) -> None:
+        del task, assemble_time, execute_time, total_time
 
     def shutdown(self) -> None:
         """Ask the worker to exit and wait briefly for its thread to finish."""
@@ -297,20 +434,71 @@ class _StageWorker:
 
     def _run(self) -> None:
         """Worker event loop that executes queued stage tasks under their submesh."""
+        pending: list[_StageTask] = []
         while True:
-            task = self._queue.get()
-            if task is None:
+            try:
+                item = self._queue.get(timeout=0.01)
+            except queue.Empty:
+                item = None
+                received_item = False
+            else:
+                received_item = True
+
+            if received_item:
+                if item is None:
+                    self._queue.task_done()
+                    for task in pending:
+                        task.future.cancel()
+                    return
+                pending.append(item)
                 self._queue.task_done()
-                return
+
+            ready_index: int | None = None
+            ready_priority: tuple[int, int, int] | None = None
+            for index, candidate in enumerate(pending):
+                if not self._task_dependencies_ready(candidate):
+                    continue
+                if not self._task_transport_ready(candidate):
+                    continue
+                priority = self._ready_task_priority(candidate, index)
+                if ready_priority is None or priority > ready_priority:
+                    ready_index = index
+                    ready_priority = priority
+            if ready_index is None:
+                continue
+            task = pending.pop(ready_index)
             if task.future.set_running_or_notify_cancel():
                 try:
+                    t_total = time.time()
                     with jax.named_scope(f"spectrax/mpmd/pipeline/worker/stage_{self.rank}"):
-                        with task.submesh:
-                            out = task.stage_jit(*task.invars)
+                        t_assemble = time.time()
+                        if task.input_factory is not None:
+                            invars = task.input_factory()
+                        elif task.invars is not None:
+                            invars = task.invars
+                        else:
+                            raise RuntimeError(
+                                f"internal error: worker stage {self.rank} received no input assembly source"
+                            )
+                        assemble_time = time.time() - t_assemble
+                        t_execute = time.time()
+                        with _worker_jax_context():
+                            with task.submesh:
+                                stage_jit = task.stage_jit
+                                placed_consts = task.placed_consts
+                                stage_invars = invars
+
+                                out = stage_jit(*_stage_call_args(placed_consts, stage_invars))
+                        execute_time = time.time() - t_execute
+                    self._maybe_log_timing(
+                        task,
+                        assemble_time=assemble_time,
+                        execute_time=execute_time,
+                        total_time=time.time() - t_total,
+                    )
                     task.future.set_result(out)
                 except BaseException as exc:
                     task.future.set_exception(exc)
-            self._queue.task_done()
 
 
 class MpmdPipelineExecutor:
@@ -357,12 +545,16 @@ class MpmdPipelineExecutor:
         """
         return self._last_stats
 
-    def shutdown(self) -> None:
-        """Stop resident workers and clear bucket-local prepare caches."""
+    def _shutdown_workers(self) -> None:
+        """Stop resident workers while preserving prepared-plan caches."""
         for worker in self._workers:
             worker.shutdown()
         self._workers = []
         self._worker_count = 0
+
+    def shutdown(self) -> None:
+        """Stop resident workers and clear bucket-local prepare caches."""
+        self._shutdown_workers()
         self._prepare_cache.clear()
 
     def clear_prepare_cache(self) -> None:
@@ -472,8 +664,6 @@ class MpmdPipelineExecutor:
             return []
 
         compiled: list[_CompiledStage] = prepared[0].state["compiled"]
-        if self.use_workers:
-            self._ensure_workers(len(compiled))
         for call in prepared[1:]:
             other = call.state["compiled"]
             if other is not compiled:
@@ -499,8 +689,28 @@ class MpmdPipelineExecutor:
                 invar_plans = resolved_plans
             elif invar_plans is not None:
                 runtime_static_plan_updates = [None] * len(invar_plans)
-        rank_submeshes = [stage[1] for stage in compiled]
+        if invar_plans is None:
+            invar_plans = self._make_invar_plans(prepared[0].state)
+        compiled_stage_info = [_unpack_compiled_stage(stage, idx) for idx, stage in enumerate(compiled)]
+        physical_ranks = [int(stage_info[5]) for stage_info in compiled_stage_info]
+        physical_rank_count = max(physical_ranks, default=-1) + 1
+        rank_submeshes: list[Mesh] = []
+        if physical_rank_count > 0:
+            by_physical: list[Mesh | None] = [None] * physical_rank_count
+            for stage_info in compiled_stage_info:
+                physical_rank = int(stage_info[5])
+                if by_physical[physical_rank] is None:
+                    by_physical[physical_rank] = stage_info[1]
+            rank_submeshes = [
+                submesh if submesh is not None else compiled_stage_info[rank][1]
+                for rank, submesh in enumerate(by_physical)
+            ]
         rank_device_sets = [set(submesh.devices.flat) for submesh in rank_submeshes]
+        use_worker_dispatch = self.use_workers
+        if use_worker_dispatch:
+            self._log_deterministic_worker_launch_if_needed(rank_device_sets)
+        if use_worker_dispatch:
+            self._ensure_workers(physical_rank_count)
         mpmd_mesh = self._resolve_mpmd_mesh(prepared[0].state, rank_submeshes, sxjit_fn=sxjit_fn)
         futures: list[list[Future[StageOutputs] | None]] = [[None] * len(compiled) for _ in prepared]
         cluster_outputs: list[list[StageOutputs | None]] = [[None] * len(compiled) for _ in prepared]
@@ -511,12 +721,17 @@ class MpmdPipelineExecutor:
         stage_assemble_times_ms = [0.0] * len(compiled)
         stage_execute_times_ms = [0.0] * len(compiled)
 
-        if not self.use_workers and len(prepared) == 1:
+        if not use_worker_dispatch and len(prepared) == 1:
             call = prepared[0]
-            cluster_outputs: list[StageOutputs | None] = [None] * len(compiled)
-            for stage_idx, (stage_jit, _submesh, my_sh, _, invar_map) in enumerate(compiled):
+            single_cluster_outputs: list[StageOutputs | None] = [None] * len(compiled)
+            for stage_idx, stage_entry in enumerate(compiled):
+                stage_jit, submesh, my_sh, _, invar_map, physical_rank = _unpack_compiled_stage(
+                    stage_entry,
+                    stage_idx,
+                )
+                placed_consts = _compiled_stage_consts(stage_entry)
                 t_submit = time.time()
-                prev_outputs = cluster_outputs[stage_idx - 1] if stage_idx > 0 else ()
+                prev_outputs = single_cluster_outputs[stage_idx - 1] if stage_idx > 0 else ()
                 if prev_outputs is None:
                     raise RuntimeError(f"internal error: missing previous output for stage {stage_idx}")
 
@@ -525,15 +740,17 @@ class MpmdPipelineExecutor:
                     invar_plan = invar_plans[stage_idx] if invar_plans is not None else None
                     invars = self._assemble_stage_invars(
                         call=call,
-                        stage_idx=stage_idx,
+                        stage_idx=physical_rank,
+                        logical_stage_idx=stage_idx,
+                        microbatch_idx=0,
                         invar_map=invar_map,
                         invar_plan=invar_plan,
                         my_sh=my_sh,
-                        rank_devices=rank_device_sets[stage_idx],
+                        rank_devices=rank_device_sets[physical_rank],
                         rank_submeshes=rank_submeshes,
                         mpmd_mesh=mpmd_mesh,
                         prev_outputs=prev_outputs,
-                        all_cluster_outputs=cluster_outputs,
+                        all_cluster_outputs=single_cluster_outputs,
                         runtime_static_flat_indices=runtime_static_flat_indices,
                         runtime_static_cache=runtime_static_cache,
                     )
@@ -552,8 +769,8 @@ class MpmdPipelineExecutor:
 
                 t_execute_stage = time.time()
                 with jax.named_scope(f"spectrax/mpmd/pipeline/single/stage_{stage_idx}/execute"):
-                    with _submesh:
-                        cluster_outputs[stage_idx] = stage_jit(*invars)
+                    with submesh:
+                        single_cluster_outputs[stage_idx] = stage_jit(*_stage_call_args(placed_consts, invars))
                 stage_execute_elapsed = time.time() - t_execute_stage
                 stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
 
@@ -562,7 +779,7 @@ class MpmdPipelineExecutor:
                 stage_submit_times_ms[stage_idx] += stage_submit_elapsed * 1000.0
 
             t_assemble = time.time()
-            result = self._assemble_result(call, cluster_outputs)
+            result = self._assemble_result(call, single_cluster_outputs)
             assemble_time = time.time() - t_assemble
             if (
                 cached_entry is not None
@@ -589,10 +806,11 @@ class MpmdPipelineExecutor:
 
         def wait_stage(mb_idx: int, stage_idx: int) -> StageOutputs:
             nonlocal stage_dispatch_time, queue_wait_time
-            ready = cluster_outputs[mb_idx][stage_idx]
+            with output_lock:
+                ready = cluster_outputs[mb_idx][stage_idx]
             if ready is not None:
-                return tp.cast(StageOutputs, ready)
-            if not self.use_workers:
+                return ready
+            if not use_worker_dispatch:
                 raise RuntimeError(f"internal error: stage {stage_idx} microbatch {mb_idx} was not dispatched")
             future = futures[mb_idx][stage_idx]
             if future is None:
@@ -600,13 +818,106 @@ class MpmdPipelineExecutor:
             t_wait = time.time()
             ready = future.result()
             elapsed = time.time() - t_wait
-            stage_dispatch_time += elapsed
-            queue_wait_time += max(0.0, elapsed)
-            cluster_outputs[mb_idx][stage_idx] = ready
+            with stats_lock:
+                stage_dispatch_time += elapsed
+                queue_wait_time += max(0.0, elapsed)
+            with output_lock:
+                if cluster_outputs[mb_idx][stage_idx] is None:
+                    cluster_outputs[mb_idx][stage_idx] = ready
             return ready
 
         num_microbatches = len(prepared)
         num_stages = len(compiled)
+        retained_outputs = self._retained_output_stages(prepared[0].state, num_stages)
+        output_ref_counts = self._output_ref_counts(
+            num_microbatches=num_microbatches,
+            num_stages=num_stages,
+            invar_plans=invar_plans,
+            carry_map=carry_map,
+            retained_outputs=retained_outputs,
+        )
+        output_lock = threading.Lock()
+        stats_lock = threading.Lock()
+        transport_gate = self._pipeline_transport_gate(
+            num_microbatches=num_microbatches,
+            num_stages=num_stages,
+            invar_plans=invar_plans,
+            rank_device_sets=rank_device_sets,
+            logical_physical_ranks=physical_ranks,
+            use_worker_dispatch=use_worker_dispatch,
+        )
+
+        def release_output(mb_idx: int, stage_idx: int, *, count: int = 1) -> None:
+            if count <= 0 or stage_idx < 0 or stage_idx >= num_stages:
+                return
+            key = (mb_idx, stage_idx)
+            with output_lock:
+                remaining = output_ref_counts.get(key)
+                if remaining is None:
+                    return
+                remaining -= count
+                if remaining > 0:
+                    output_ref_counts[key] = remaining
+                    return
+                output_ref_counts.pop(key, None)
+                if stage_idx not in retained_outputs:
+                    cluster_outputs[mb_idx][stage_idx] = None
+
+        def release_consumed_inputs(mb_idx: int, stage_idx: int, invar_plan: _InvarAssemblyPlan | None) -> None:
+            if invar_plan is None:
+                return
+            if invar_plan.prev_slots:
+                release_output(mb_idx, stage_idx - 1, count=len(invar_plan.prev_slots))
+            stage_uses: dict[int, int] = {}
+            for _out_pos, src_rank, _src_pos, _edge_sharding, _src_physical_rank in invar_plan.stage_slots:
+                stage_uses[src_rank] = stage_uses.get(src_rank, 0) + 1
+            for src_rank, count in stage_uses.items():
+                release_output(mb_idx, src_rank, count=count)
+
+        def stage_dependencies(
+            *,
+            mb_idx: int,
+            stage_idx: int,
+            invar_plan: _InvarAssemblyPlan | None,
+        ) -> tuple[Future[StageOutputs], ...]:
+            if not use_worker_dispatch:
+                return ()
+
+            dependencies: list[Future[StageOutputs]] = []
+            seen: set[tuple[int, int]] = set()
+
+            def add_dependency(dep_mb_idx: int, dep_stage_idx: int) -> None:
+                key = (dep_mb_idx, dep_stage_idx)
+                if key in seen:
+                    return
+                if dep_mb_idx < 0 or dep_mb_idx >= num_microbatches or dep_stage_idx < 0 or dep_stage_idx >= num_stages:
+                    raise RuntimeError(
+                        "internal error: pipeline stage dependency is out of range "
+                        f"(microbatch={mb_idx}, stage={stage_idx}, dependency={key})."
+                    )
+                future = futures[dep_mb_idx][dep_stage_idx]
+                if future is None:
+                    raise RuntimeError(
+                        "internal error: pipeline stage was submitted before an upstream dependency "
+                        f"(microbatch={mb_idx}, stage={stage_idx}, dependency={key})."
+                    )
+                seen.add(key)
+                dependencies.append(future)
+
+            if invar_plan is not None:
+                if invar_plan.prev_slots:
+                    add_dependency(mb_idx, stage_idx - 1)
+                for _out_pos, src_rank, _src_pos, _edge_sharding, _src_physical_rank in invar_plan.stage_slots:
+                    add_dependency(mb_idx, int(src_rank))
+            elif stage_idx > 0:
+                for src_stage in range(stage_idx):
+                    add_dependency(mb_idx, src_stage)
+
+            if carry_map.get(stage_idx) and mb_idx > 0:
+                add_dependency(mb_idx - 1, stage_idx)
+
+            return tuple(dependencies)
+
         for wave_idx in range(num_microbatches + num_stages - 1):
             hi_stage = min(wave_idx, num_stages - 1)
             for stage_idx in range(0, hi_stage + 1):
@@ -617,62 +928,110 @@ class MpmdPipelineExecutor:
                     continue
 
                 t_submit = time.time()
-                stage_jit, submesh, my_sh, _, invar_map = compiled[stage_idx]
-                rank_devices = rank_device_sets[stage_idx]
-                prev_outputs: StageOutputs = ()
-                if stage_idx > 0:
-                    prev_outputs = wait_stage(mb_idx, stage_idx - 1)
+                stage_entry = compiled[stage_idx]
+                stage_jit, submesh, my_sh, _, invar_map, physical_rank = _unpack_compiled_stage(
+                    stage_entry,
+                    stage_idx,
+                )
+                placed_consts = _compiled_stage_consts(stage_entry)
+                rank_devices = rank_device_sets[physical_rank]
 
-                call = prepared[mb_idx]
-                stage_carries = carry_map.get(stage_idx, {})
-                if stage_carries and mb_idx > 0:
-                    previous_stage_outputs = wait_stage(mb_idx - 1, stage_idx)
-                    flat_args = list(call.flat_args)
-                    for orig_flat_idx, stage_out_pos in stage_carries.items():
-                        flat_args[orig_flat_idx] = previous_stage_outputs[stage_out_pos]
-                    call = _PreparedCall(state=call.state, flat_args=flat_args)
+                invar_plan = invar_plans[stage_idx] if invar_plans is not None else None
 
-                t_assemble_stage = time.time()
-                with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/assemble"):
-                    invar_plan = invar_plans[stage_idx] if invar_plans is not None else None
-                    invars = self._assemble_stage_invars(
-                        call=call,
-                        stage_idx=stage_idx,
-                        invar_map=invar_map,
-                        invar_plan=invar_plan,
-                        my_sh=my_sh,
-                        rank_devices=rank_devices,
-                        rank_submeshes=rank_submeshes,
-                        mpmd_mesh=mpmd_mesh,
-                        prev_outputs=prev_outputs,
-                        all_cluster_outputs=cluster_outputs[mb_idx],
-                        runtime_static_flat_indices=runtime_static_flat_indices,
-                        runtime_static_cache=runtime_static_cache,
-                    )
-                    if (
-                        runtime_static_plan_updates is not None
-                        and mb_idx == 0
-                        and invar_plan is not None
-                        and runtime_static_flat_indices is not None
-                    ):
-                        runtime_static_plan_updates[stage_idx] = self._fold_runtime_static_slots_into_plan(
-                            invar_plan,
-                            invars,
-                            runtime_static_flat_indices,
-                        )
-                stage_assemble_elapsed = time.time() - t_assemble_stage
-                stage_assemble_times_ms[stage_idx] += stage_assemble_elapsed * 1000.0
+                def build_stage_invars(
+                    *,
+                    mb_idx: int = mb_idx,
+                    stage_idx: int = stage_idx,
+                    physical_rank: int = physical_rank,
+                    invar_map: InvarMap = invar_map,
+                    invar_plan: _InvarAssemblyPlan | None = invar_plan,
+                    my_sh: Sharding = my_sh,
+                    rank_devices: set[jax.Device] = rank_devices,
+                ) -> list[PyTree]:
+                    t_assemble_stage = time.time()
+                    prev_outputs: StageOutputs = ()
+                    if invar_plan is not None:
+                        if invar_plan.prev_slots:
+                            prev_outputs = wait_stage(mb_idx, stage_idx - 1)
+                        for _out_pos, src_rank, _src_pos, _edge_sharding, _src_physical_rank in invar_plan.stage_slots:
+                            wait_stage(mb_idx, src_rank)
+                    elif stage_idx > 0:
+                        prev_outputs = wait_stage(mb_idx, stage_idx - 1)
+                        for src_stage in range(stage_idx):
+                            wait_stage(mb_idx, src_stage)
+
+                    call = prepared[mb_idx]
+                    stage_carries = carry_map.get(stage_idx, {})
+                    if stage_carries and mb_idx > 0:
+                        previous_stage_outputs = wait_stage(mb_idx - 1, stage_idx)
+                        flat_args = list(call.flat_args)
+                        for orig_flat_idx, stage_out_pos in stage_carries.items():
+                            flat_args[orig_flat_idx] = previous_stage_outputs[stage_out_pos]
+                        call = _PreparedCall(state=call.state, flat_args=flat_args)
+                        release_output(mb_idx - 1, stage_idx, count=len(stage_carries))
+
+                    with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/assemble"):
+                        with _worker_jax_context():
+                            with _ordered_schedule_transport_scope(transport_gate):
+                                invars = self._assemble_stage_invars(
+                                    call=call,
+                                    stage_idx=physical_rank,
+                                    logical_stage_idx=stage_idx,
+                                    microbatch_idx=mb_idx,
+                                    invar_map=invar_map,
+                                    invar_plan=invar_plan,
+                                    my_sh=my_sh,
+                                    rank_devices=rank_devices,
+                                    rank_submeshes=rank_submeshes,
+                                    mpmd_mesh=mpmd_mesh,
+                                    prev_outputs=prev_outputs,
+                                    all_cluster_outputs=cluster_outputs[mb_idx],
+                                    runtime_static_flat_indices=runtime_static_flat_indices,
+                                    runtime_static_cache=runtime_static_cache,
+                                )
+                        release_consumed_inputs(mb_idx, stage_idx, invar_plan)
+                        if (
+                            runtime_static_plan_updates is not None
+                            and mb_idx == 0
+                            and invar_plan is not None
+                            and runtime_static_flat_indices is not None
+                        ):
+                            runtime_static_plan_updates[stage_idx] = self._fold_runtime_static_slots_into_plan(
+                                invar_plan,
+                                invars,
+                                runtime_static_flat_indices,
+                            )
+                    stage_assemble_elapsed = time.time() - t_assemble_stage
+                    with stats_lock:
+                        stage_assemble_times_ms[stage_idx] += stage_assemble_elapsed * 1000.0
+                    return invars
+
                 t_execute_stage = time.time()
-                if self.use_workers:
-                    futures[mb_idx][stage_idx] = self._workers[stage_idx].submit(
+                if use_worker_dispatch:
+                    futures[mb_idx][stage_idx] = self._workers[physical_rank].submit(
                         stage_jit=stage_jit,
                         submesh=submesh,
-                        invars=invars,
-                    )
+                        placed_consts=placed_consts,
+                        input_factory=build_stage_invars,
+                        microbatch_idx=mb_idx,
+                        stage_idx=stage_idx,
+                        dependencies=stage_dependencies(
+                            mb_idx=mb_idx,
+                            stage_idx=stage_idx,
+                            invar_plan=invar_plan,
+                        ),
+                        transport_gate=transport_gate,
+                        transport_task_names=self._pipeline_task_event_names(
+                            mb_idx=mb_idx,
+                            stage_idx=stage_idx,
+                            invar_plan=invar_plan,
+                        ),
+                )
                 else:
+                    invars = build_stage_invars()
                     with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/execute"):
                         with submesh:
-                            cluster_outputs[mb_idx][stage_idx] = stage_jit(*invars)
+                            cluster_outputs[mb_idx][stage_idx] = stage_jit(*_stage_call_args(placed_consts, invars))
                 stage_execute_elapsed = time.time() - t_execute_stage
                 stage_execute_times_ms[stage_idx] += stage_execute_elapsed * 1000.0
                 stage_submit_elapsed = time.time() - t_submit
@@ -940,6 +1299,56 @@ class MpmdPipelineExecutor:
             flat_args[start : start + expected_count] = leaves
         return flat_args
 
+    def _retained_output_stages(self, state: _MpmdState, num_stages: int) -> set[int]:
+        """Return stage outputs that must survive until result assembly."""
+        retained: set[int] = set()
+        for mapping in state.get("fn_outvar_map", ()):
+            if not isinstance(mapping, tuple) or not mapping:
+                continue
+            src_rank = mapping[0]
+            if isinstance(src_rank, int) and 0 <= src_rank < num_stages:
+                retained.add(src_rank)
+        return retained
+
+    def _output_ref_counts(
+        self,
+        *,
+        num_microbatches: int,
+        num_stages: int,
+        invar_plans: tuple[_InvarAssemblyPlan, ...] | None,
+        carry_map: dict[int, dict[int, int]],
+        retained_outputs: set[int],
+    ) -> dict[tuple[int, int], int]:
+        """Count non-result consumers of each stage output.
+
+        Forward-only pipeline dispatch used to keep every intermediate stage
+        output for every microbatch until the final pytree was assembled. On
+        large meshes those hidden activations dominate memory even though most
+        are consumed exactly once by the next stage. The ref-count here tracks
+        stage-input and carry consumers so the hot loop can clear intermediate
+        handles as soon as their last consumer has assembled its inputs.
+        """
+        if invar_plans is None:
+            return {}
+
+        counts: dict[tuple[int, int], int] = {}
+        for mb_idx in range(num_microbatches):
+            for stage_idx in range(num_stages):
+                count = 0
+                if stage_idx in retained_outputs:
+                    count += 1
+                if stage_idx in carry_map and mb_idx + 1 < num_microbatches:
+                    count += len(carry_map[stage_idx])
+                for dst_stage, plan in enumerate(invar_plans):
+                    if dst_stage == stage_idx + 1:
+                        count += len(plan.prev_slots)
+                    for _out_pos, src_rank, _src_pos, _edge_sharding, _src_physical_rank in plan.stage_slots:
+                        if src_rank == stage_idx:
+                            count += 1
+                if count:
+                    counts[(mb_idx, stage_idx)] = count
+        return counts
+
     def _runtime_static_flat_indices(
         self,
         entry: _PrepareCacheEntry | None,
@@ -968,11 +1377,154 @@ class MpmdPipelineExecutor:
             indices.update(range(start, start + count))
         return indices
 
+    def _pipeline_transport_gate(
+        self,
+        *,
+        num_microbatches: int,
+        num_stages: int,
+        invar_plans: tuple[_InvarAssemblyPlan, ...] | None,
+        rank_device_sets: list[set[jax.Device]],
+        logical_physical_ranks: tp.Sequence[int],
+        use_worker_dispatch: bool,
+    ) -> _OrderedScheduleTransportGate | None:
+        """Return a deterministic transport gate for multi-controller worker pipelines."""
+        if not use_worker_dispatch or invar_plans is None:
+            return None
+        try:
+            if jax.process_count() <= 1:
+                return None
+        except Exception:
+            return None
+        if len({frozenset(devices) for devices in rank_device_sets}) <= 1:
+            return None
+
+        task_order: list[str] = []
+        for wave_idx in range(num_microbatches + num_stages - 1):
+            hi_stage = min(wave_idx, num_stages - 1)
+            for stage_idx in range(0, hi_stage + 1):
+                mb_idx = wave_idx - stage_idx
+                if mb_idx < 0 or mb_idx >= num_microbatches:
+                    continue
+                plan = invar_plans[stage_idx]
+                dst_physical_rank = int(logical_physical_ranks[stage_idx])
+                for out_pos, src_logical_stage, _src_pos, _edge_sharding, src_physical_rank in plan.stage_slots:
+                    if int(src_physical_rank) == dst_physical_rank:
+                        continue
+                    name = _pipeline_transport_task_name(
+                        (mb_idx, stage_idx),
+                        src_logical_stage=int(src_logical_stage),
+                        input_pos=out_pos,
+                    )
+                    if name is not None:
+                        task_order.append(name)
+                for out_pos, _prev_idx in plan.prev_slots:
+                    src_logical_stage = stage_idx - 1
+                    if src_logical_stage < 0:
+                        continue
+                    src_physical_rank = int(logical_physical_ranks[src_logical_stage])
+                    if src_physical_rank == dst_physical_rank:
+                        continue
+                    name = _pipeline_transport_task_name(
+                        (mb_idx, stage_idx),
+                        src_logical_stage=src_logical_stage,
+                        input_pos=out_pos,
+                    )
+                    if name is not None:
+                        task_order.append(name)
+        if not task_order:
+            return None
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index == 0:
+            logger.warning(
+                "SpectraX MPMD pipeline executor using deterministic async transport ordering for %d "
+                "forward-pipeline transfer(s) across %d microbatch(es) and %d stage(s).",
+                len(task_order),
+                num_microbatches,
+                num_stages,
+            )
+        return _OrderedScheduleTransportGate(tuple(task_order))
+
+    def _log_deterministic_worker_launch_if_needed(self, rank_device_sets: list[set[jax.Device]]) -> None:
+        """Log when worker dispatch is protected by deterministic transport ordering.
+
+        Multi-controller TPU programs must enter JAX launches in the same order
+        on every controller. Resident Python stage workers are kept enabled, but
+        cross-rank pair-mesh transport launches are gated by the deterministic
+        task order built in :meth:`_pipeline_transport_gate`.
+        """
+        if not self.use_workers:
+            return
+        try:
+            if jax.process_count() <= 1:
+                return
+        except Exception:
+            return
+        if len({frozenset(devices) for devices in rank_device_sets}) <= 1:
+            return
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        with _PIPELINE_PROGRESS_LOCK:
+            logged = _PIPELINE_DISPATCH_DIAGNOSTICS.get("deterministic_host_launch", 0)
+            if process_index == 0 and logged < 1:
+                logger.warning(
+                    "SpectraX MPMD pipeline executor keeping worker dispatch enabled with deterministic "
+                    "transport ordering because multi-controller stage meshes use different device sets. "
+                    "This preserves JAX launch order while still relying on asynchronous device execution."
+                )
+            _PIPELINE_DISPATCH_DIAGNOSTICS["deterministic_host_launch"] = logged + 1
+        return None
+
+    def _pipeline_task_event_names(
+        self,
+        *,
+        mb_idx: int,
+        stage_idx: int,
+        invar_plan: _InvarAssemblyPlan | None,
+    ) -> tuple[str, ...]:
+        """Return ordered cross-rank transport names for one pipeline task."""
+        return self._pipeline_transport_task_names(mb_idx=mb_idx, stage_idx=stage_idx, invar_plan=invar_plan)
+
+    def _pipeline_transport_task_names(
+        self,
+        *,
+        mb_idx: int,
+        stage_idx: int,
+        invar_plan: _InvarAssemblyPlan | None,
+    ) -> tuple[str, ...]:
+        """Return ordered transport names issued while assembling a stage task."""
+        if invar_plan is None:
+            return ()
+        names: list[str] = []
+        for out_pos, src_rank, _src_pos, _edge_sharding, _src_physical_rank in invar_plan.stage_slots:
+            name = _pipeline_transport_task_name(
+                (mb_idx, stage_idx),
+                src_logical_stage=int(src_rank),
+                input_pos=out_pos,
+            )
+            if name is not None:
+                names.append(name)
+        for out_pos, _prev_idx in invar_plan.prev_slots:
+            name = _pipeline_transport_task_name(
+                (mb_idx, stage_idx),
+                src_logical_stage=stage_idx - 1,
+                input_pos=out_pos,
+            )
+            if name is not None:
+                names.append(name)
+        return tuple(names)
+
     def _assemble_stage_invars(
         self,
         *,
         call: _PreparedCall,
         stage_idx: int,
+        logical_stage_idx: int,
+        microbatch_idx: int,
         invar_map: InvarMap,
         invar_plan: _InvarAssemblyPlan | None,
         my_sh: Sharding,
@@ -1028,6 +1580,7 @@ class MpmdPipelineExecutor:
                 mpmd_mesh,
                 runtime_static_flat_indices=runtime_static_flat_indices,
                 runtime_static_cache=runtime_static_cache,
+                transport_context=(microbatch_idx, logical_stage_idx),
             )
         return _assemble_invars(
             invar_map,
@@ -1045,6 +1598,7 @@ class MpmdPipelineExecutor:
             dynamic_flat_to_orig_flat=state.get("dynamic_flat_to_orig_flat"),
             runtime_static_flat_indices=runtime_static_flat_indices,
             runtime_static_cache=runtime_static_cache,
+            transport_context=(microbatch_idx, logical_stage_idx),
         )
 
     def _make_invar_plans(self, state: _MpmdState) -> tuple[_InvarAssemblyPlan, ...]:
@@ -1067,10 +1621,11 @@ class MpmdPipelineExecutor:
                 invar_map,
                 state["placed"],
                 state["dynamic"],
-                stage_idx,
+                physical_rank,
                 dynamic_flat_to_orig_flat=state.get("dynamic_flat_to_orig_flat"),
             )
-            for stage_idx, (*_, invar_map) in enumerate(compiled)
+            for stage_idx, stage_entry in enumerate(compiled)
+            for _, _, _, _, invar_map, physical_rank in (_unpack_compiled_stage(stage_entry, stage_idx),)
         )
 
     def _assemble_result(self, call: _PreparedCall, outputs: list[StageOutputs | None]) -> PyTree:
@@ -1085,10 +1640,17 @@ class MpmdPipelineExecutor:
             The exact pytree shape that a direct ``sxjit`` call would return,
             with optional ``out_shardings`` applied by Spectrax's normal rules.
         """
+        required_stages = {
+            int(mapping[0])
+            for mapping in call.state["fn_outvar_map"]
+            if mapping and isinstance(mapping[0], int)
+        }
         ready_outputs: list[StageOutputs] = []
-        for idx, value in enumerate(outputs):
+        for stage_idx, value in enumerate(outputs):
             if value is None:
-                raise RuntimeError(f"internal error: missing output for stage {idx}")
+                if stage_idx in required_stages:
+                    raise RuntimeError(f"internal error: missing output for required stage {stage_idx}")
+                value = ()
             ready_outputs.append(value)
         result = _assemble_outputs(
             call.state["fn_outvar_map"],
@@ -1146,15 +1708,16 @@ class MpmdPipelineExecutor:
         """Create exactly one resident worker per physical pipeline stage.
 
         The worker pool is rebuilt when the stage count changes because each
-        worker is named and logically associated with one rank. Rebuilding also
-        clears the prepare cache through ``shutdown`` so a caller cannot
-        accidentally reuse state prepared for a different physical pipeline.
+        worker is named and logically associated with one rank. Prepared-plan
+        cache entries remain valid for their own cache keys; if a later call
+        reuses a different cached plan, this method will resize the workers to
+        that plan's physical pipeline before dispatch.
 
         Args:
             worker_count: Worker count value consumed by this operation.
         """
         if self._worker_count == worker_count and len(self._workers) == worker_count:
             return
-        self.shutdown()
+        self._shutdown_workers()
         self._workers = [_StageWorker(rank=rank) for rank in range(worker_count)]
         self._worker_count = worker_count

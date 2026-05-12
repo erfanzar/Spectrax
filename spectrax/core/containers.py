@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from ..sharding.mesh import current_mesh
-from .graph import GraphDef, ModuleNode, VarNode, iter_variables
+from .graph import GraphDef, ModuleNode, VarNode, iter_variables, strip_pipeline_stage_metadata
 from .module import Module, Opaque, _bump_graph_epoch, _graph_epoch
 from .paths import str_to_path
 from .registry import resolve_class
@@ -60,8 +60,8 @@ def _stack_module_states(items: list[Module], *, context: str) -> tuple[GraphDef
     if not items:
         raise ValueError(f"{context} requires at least one module")
     exports = [export(m) for m in items]
-    gdef = exports[0][0]
-    signature = _scan_graph_signature(gdef)
+    graph_defs = tuple(g for g, _state in exports)
+    signature = _scan_graph_signature(graph_defs[0])
     for index, (other_gdef, _state) in enumerate(exports[1:], start=1):
         if _scan_graph_signature(other_gdef) != signature:
             raise ValueError(
@@ -69,6 +69,7 @@ def _stack_module_states(items: list[Module], *, context: str) -> tuple[GraphDef
                 f"item 0 and item {index} differ. Use a Python loop for heterogeneous layers."
             )
     states = [s for _, s in exports]
+    gdef = _template_graphdef_without_mixed_stage_metadata(graph_defs)
     return gdef, jax.tree.map(lambda *vs: jnp.stack(vs, axis=0), *states)
 
 
@@ -125,24 +126,25 @@ def _scan_graph_signature(gdef: GraphDef) -> GraphDef:
     Returns:
         Return a graph signature suitable for repeated-layer scans.
     """
-    nodes = []
-    changed = False
-    for node in gdef.nodes:
-        if isinstance(node, VarNode):
-            metadata = tuple((k, v) for k, v in node.metadata if k != PIPELINE_STAGE_METADATA_KEY)
-            if metadata != node.metadata:
-                changed = True
-                node = VarNode(class_name=node.class_name, collection=node.collection, metadata=metadata)
-        nodes.append(node)
-    if not changed:
-        return gdef
-    return GraphDef(
-        nodes=tuple(nodes),
-        root=gdef.root,
-        var_refs=gdef.var_refs,
-        var_canonical=gdef.var_canonical,
-        shared_paths=gdef.shared_paths,
+    return strip_pipeline_stage_metadata(gdef)
+
+
+def _pipeline_stage_metadata_signature(gdef: GraphDef) -> tuple[tuple[tuple[str, object], ...], ...]:
+    """Return only the per-variable pipeline-stage metadata from ``gdef``."""
+    return tuple(
+        tuple((k, v) for k, v in node.metadata if k == PIPELINE_STAGE_METADATA_KEY)
+        for node in gdef.nodes
+        if isinstance(node, VarNode)
     )
+
+
+def _template_graphdef_without_mixed_stage_metadata(graph_defs: tuple[GraphDef, ...]) -> GraphDef:
+    """Use the first graph template, stripping stage metadata when it varies."""
+    template = graph_defs[0]
+    stage_signature = _pipeline_stage_metadata_signature(template)
+    if any(_pipeline_stage_metadata_signature(gdef) != stage_signature for gdef in graph_defs[1:]):
+        return strip_pipeline_stage_metadata(template)
+    return template
 
 
 def _scan_graph_topology_signature(gdef: GraphDef) -> tuple[object, ...]:
@@ -619,11 +621,11 @@ def _scan_static_template_signature(
     if len(graph_defs) == 1:
         return graph_defs[0]
     if family_keys is not None and all(key == family_keys[0] for key in family_keys[1:]):
-        return graph_defs[0]
+        return _template_graphdef_without_mixed_stage_metadata(graph_defs)
     key = _scan_graph_family_key(graph_defs[0])
     if any(_scan_graph_family_key(g) != key for g in graph_defs[1:]):
         return None
-    return graph_defs[0]
+    return _template_graphdef_without_mixed_stage_metadata(graph_defs)
 
 
 def _build_scan_plan_from_exports(exports: list[tuple[GraphDef, State]], *, context: str) -> _ScanPlan:

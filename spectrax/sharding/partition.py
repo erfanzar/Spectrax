@@ -56,7 +56,7 @@ import jax
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 
-from ..common_types import NOT_GIVEN
+from ..common_types import MODE_TRAIN, NOT_GIVEN
 from ..core._typing import Array, ArrayLike, Initializer
 from ..core.module import Module
 from ..core.selector import select
@@ -187,7 +187,8 @@ def get_partition_spec(module: Module) -> dict[str, dict[str, PartitionSpec | No
     Returns:
         Nested mapping ``{collection_name: {path: PartitionSpec | None}}``.
     """
-    rules = current_axis_rules()
+    rules = _semantic_axis_rules()
+    rules.update(current_axis_rules())
     out: dict[str, dict[str, PartitionSpec | None]] = {}
     for p, v in _iter_variables(module):
         col = v.kind
@@ -1551,6 +1552,66 @@ def _identity_mesh_axis_rules(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -
     return {name: name for name in axis_names}
 
 
+def _normalize_axis_rule_value(value: object) -> object:
+    """Coerce resolver outputs into values accepted by ``Sharding``.
+
+    ``PartitionAxis`` accepts lists for compound axes, while
+    :meth:`Sharding.to_partition_spec` expects tuples for fused mesh axes.
+    """
+    if isinstance(value, list):
+        return tuple(_normalize_axis_rule_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_normalize_axis_rule_value(item) for item in value)
+    return value
+
+
+def _semantic_axis_rules() -> dict[str, object]:
+    """Return SpectraX semantic-axis defaults for sharding metadata.
+
+    Variables often store symbolic axes from :mod:`spectrax.common_types`
+    (for example ``FSDP``/``SP``/``TP``) rather than raw mesh-axis names.
+    Resolve those symbols with the active :class:`PartitionManager` when one
+    exists, otherwise with SpectraX's default :class:`PartitionAxis`.
+    """
+    try:
+        from .manager import PartitionAxis, get_current_partition_manager, get_partition_manager
+    except Exception:
+        return {}
+
+    manager = get_current_partition_manager() or get_partition_manager()
+    paxis = getattr(manager, "paxis", None)
+    if paxis is None:
+        try:
+            paxis = PartitionAxis()
+        except Exception:
+            return {}
+
+    try:
+        registered = PartitionAxis.get_registered_axes()
+    except Exception:
+        registered = {}
+    names = set(getattr(PartitionAxis, "_SEMANTIC_MAP", ())) | set(registered)
+
+    rules: dict[str, object] = {}
+    for name in names:
+        try:
+            resolved = paxis.resolve_axis([name], mode=MODE_TRAIN)[0]
+        except Exception:
+            continue
+        if resolved is NOT_GIVEN:
+            continue
+        rules[name] = _normalize_axis_rule_value(resolved)
+    return rules
+
+
+def _axis_rules_for_mesh(base_mesh: "Mesh", mpmd_mesh: "MpMdMesh | None") -> dict[str, object]:
+    """Build the full logical/semantic axis rule map for one mesh."""
+    rules: dict[str, object] = _identity_mesh_axis_rules(base_mesh, mpmd_mesh)
+    rules.update(_semantic_axis_rules())
+    rules.update(current_axis_rules())
+    return rules
+
+
 def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMesh | MpMdMesh") -> NamedSharding | None:
     """Resolve raw variable-style ``metadata`` to a :class:`NamedSharding`.
 
@@ -1588,9 +1649,7 @@ def named_sharding_for_metadata(metadata: dict[str, object], mesh: "Mesh | SpxMe
         return None
 
     base_mesh, mpmd_mesh = _resolve_named_sharding_mesh(mesh)
-    mesh_map = _identity_mesh_axis_rules(base_mesh, mpmd_mesh)
-    mesh_map.update(current_axis_rules())
-    spec = sharding.to_partition_spec(mesh_map)
+    spec = sharding.to_partition_spec(_axis_rules_for_mesh(base_mesh, mpmd_mesh))
     if mpmd_mesh is not None:
         owner = resolve_stage_rank(metadata_stage_assignment(metadata), mpmd_mesh.mpmd_dim)
         if owner is not None:
@@ -1618,7 +1677,21 @@ def named_sharding_for_variable(var: Variable, mesh: "Mesh | SpxMesh | MpMdMesh"
         return resolved
 
     base_mesh, _ = _resolve_named_sharding_mesh(mesh)
-    return NamedSharding(base_mesh, Sharding().to_partition_spec(current_axis_rules() or None))
+    value = var._raw_get() if hasattr(var, "_raw_get") else var.value
+    existing = getattr(value, "sharding", None)
+    if isinstance(existing, NamedSharding) and hasattr(value, "shape"):
+        spec = sanitize_partition_spec_for_mesh_and_shape(
+            existing.spec,
+            mesh=base_mesh,
+            shape=tuple(getattr(value, "shape", ())),
+        )
+        named = NamedSharding(base_mesh, spec)
+        memory_kind = getattr(existing, "memory_kind", None)
+        if memory_kind is not None and hasattr(named, "with_memory_kind"):
+            return named.with_memory_kind(memory_kind)
+        return named
+
+    return NamedSharding(base_mesh, PartitionSpec())
 
 
 def get_named_sharding(module: Module, mesh: "Mesh | SpxMesh | MpMdMesh") -> dict[str, dict[str, NamedSharding]]:
@@ -1657,7 +1730,8 @@ def with_sharding_constraint_by_name(x: ArrayLike, axis_names: AxisNames) -> Arr
         Result described by this helper.
     """
 
-    rules = current_axis_rules()
+    rules = _semantic_axis_rules()
+    rules.update(current_axis_rules())
     resolved = _resolve_axis_names(tuple(axis_names), rules)
     spec = PartitionSpec(*resolved)
     return jax.lax.with_sharding_constraint(x, spec)

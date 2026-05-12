@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from ...core.graph import bind, export
+from ...core.graph import bind, export, strip_pipeline_stage_metadata
 from ...core.state import State
 from ...core.variable import Variable
 from ...nn.pipeline_sequential import PipelineSequential
@@ -103,17 +103,18 @@ def _extract_stages(container: PipelineSequential) -> tuple[object, tuple[State,
         raise TypeError(f"spmd_run expects a PipelineSequential, got {type(container).__name__}.")
     stages = container.stages
     gdef0, state0 = export(stages[0])
+    template_gdef = strip_pipeline_stage_metadata(gdef0) if len(stages) > 1 else gdef0
     states = [state0]
     for i, stage in enumerate(stages[1:], start=1):
         gdef_i, state_i = export(stage)
-        if gdef_i != gdef0:
+        if strip_pipeline_stage_metadata(gdef_i) != template_gdef:
             raise ValueError(
                 f"Stage {i} has a different GraphDef than stage 0. SPMD "
                 f"pipeline requires all stages to be structurally "
                 f"identical. For heterogeneous stages, use sxcall."
             )
         states.append(state_i)
-    return gdef0, tuple(states)
+    return template_gdef, tuple(states)
 
 
 def _stack_states(states: tuple[State, ...]) -> State:

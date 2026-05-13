@@ -53,6 +53,22 @@ def test_tree_leaves_are_arrays():
         assert hasattr(leaf, "dtype")
 
 
+def test_tree_map_with_path_emits_flat_key_paths():
+    """``tree_map_with_path`` reports ordinary flat JAX key paths."""
+    m = spx_nn.Linear(4, 4, rngs=spx.Rngs(0))
+    paths = []
+
+    mapped = jax.tree_util.tree_map_with_path(lambda path, leaf: paths.append(path) or leaf, m)
+    _path_leaves, path_treedef = jax.tree_util.tree_flatten_with_path(m)
+    _plain_leaves, plain_treedef = jax.tree_util.tree_flatten(m)
+
+    assert isinstance(mapped, spx_nn.Linear)
+    assert path_treedef == plain_treedef
+    assert all(not isinstance(path[0], tuple) for path in paths)
+    assert (jax.tree_util.DictKey("parameters"), jax.tree_util.DictKey("weight")) in paths
+    assert (jax.tree_util.DictKey("parameters"), jax.tree_util.DictKey("bias")) in paths
+
+
 def test_tree_map_produces_new_module_with_mapped_leaves():
     """``jax.tree.map`` threads a function through every Variable leaf.
 

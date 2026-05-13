@@ -1407,7 +1407,38 @@ registration; the set guards against that.
 """
 
 
-def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[object], ...], _ModuleAux]:
+def _module_collection_children(m: Module) -> tuple[dict[str, dict[str, object]], _ModuleAux]:
+    """Build collection subtrees and shared aux data for module pytree flattening."""
+    from .graph import export
+    from .paths import str_to_path
+    from .state import _nested_set
+
+    cache = m._spx_export_cache
+    if cache is None or cache[0] != _graph_epoch():
+        export(m)
+        cache = m._spx_export_cache
+    assert cache is not None
+    gdef = cache[1]
+    var_entries = cache[7] if len(cache) >= 8 else cache[2]
+    leaf_spec = cache[6] if len(cache) >= 7 else tuple((kind, path) for kind, path, _ in var_entries)
+
+    collection_children: dict[str, dict[str, object]] = {}
+    for (collection, path), (_kind, _path, var) in zip(leaf_spec, var_entries, strict=True):
+        _nested_set(collection_children.setdefault(collection, {}), str_to_path(path), var._raw_get())
+    aux = _ModuleAux(
+        gdef=gdef,
+        leaf_spec=leaf_spec,
+        training=m._spx_training,
+        fwd_hooks=m._spx_fwd_hooks,
+        pre_hooks=m._spx_pre_hooks,
+        contexts=m._spx_contexts,
+        policy=m._spx_policy,
+        opaque=m._spx_opaque,
+    )
+    return collection_children, aux
+
+
+def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[object, object], ...], _ModuleAux]:
     """Pytree flatten-with-keys for any :class:`Module` instance.
 
     Reads the hot :func:`spectrax.export` cache and returns the raw
@@ -1422,34 +1453,17 @@ def _module_flatten_with_keys(m: Module) -> tuple[tuple[tuple[object], ...], _Mo
     Returns:
         Result described by this helper.
     """
-    from .graph import export
+    from .state import _KeyedSubtree
 
-    cache = m._spx_export_cache
-    if cache is None or cache[0] != _graph_epoch():
-        export(m)
-        cache = m._spx_export_cache
-    assert cache is not None
-    gdef = cache[1]
-    var_entries = cache[7] if len(cache) >= 8 else cache[2]
-    leaf_spec = cache[6] if len(cache) >= 7 else tuple((kind, path) for kind, path, _ in var_entries)
-    key_leaves = []
-    for (collection, path), (_kind, _path, var) in zip(leaf_spec, var_entries, strict=True):
-        key = (jax.tree_util.DictKey(collection), *[jax.tree_util.DictKey(seg) for seg in path.split(".") if seg])
-        key_leaves.append((key, var._raw_get()))
-    aux = _ModuleAux(
-        gdef=gdef,
-        leaf_spec=leaf_spec,
-        training=m._spx_training,
-        fwd_hooks=m._spx_fwd_hooks,
-        pre_hooks=m._spx_pre_hooks,
-        contexts=m._spx_contexts,
-        policy=m._spx_policy,
-        opaque=m._spx_opaque,
+    collection_children, aux = _module_collection_children(m)
+    key_children = tuple(
+        (jax.tree_util.DictKey(collection), _KeyedSubtree(collection_children[collection]))
+        for collection in collection_children
     )
-    return tuple(key_leaves), aux
+    return key_children, aux
 
 
-def _module_flatten(m: Module) -> tuple[list[object], _ModuleAux]:
+def _module_flatten(m: Module) -> tuple[tuple[object, ...], _ModuleAux]:
     """Pytree flatten (no keys) — complement of :func:`_module_flatten_with_keys`.
 
     Needed by :func:`jax.tree_util.register_pytree_with_keys` so
@@ -1462,28 +1476,10 @@ def _module_flatten(m: Module) -> tuple[list[object], _ModuleAux]:
     Returns:
         Result described by this helper.
     """
-    from .graph import export
+    from .state import _KeyedSubtree
 
-    cache = m._spx_export_cache
-    if cache is None or cache[0] != _graph_epoch():
-        export(m)
-        cache = m._spx_export_cache
-    assert cache is not None
-    gdef = cache[1]
-    var_entries = cache[7] if len(cache) >= 8 else cache[2]
-    leaf_spec = cache[6] if len(cache) >= 7 else tuple((kind, path) for kind, path, _ in var_entries)
-    leaves = [var._raw_get() for _kind, _path, var in var_entries]
-    aux = _ModuleAux(
-        gdef=gdef,
-        leaf_spec=leaf_spec,
-        training=m._spx_training,
-        fwd_hooks=m._spx_fwd_hooks,
-        pre_hooks=m._spx_pre_hooks,
-        contexts=m._spx_contexts,
-        policy=m._spx_policy,
-        opaque=m._spx_opaque,
-    )
-    return list(leaves), aux
+    collection_children, aux = _module_collection_children(m)
+    return tuple(_KeyedSubtree(collection_children[collection]) for collection in collection_children), aux
 
 
 def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
@@ -1505,16 +1501,28 @@ def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
     """
     from .graph import bind
     from .paths import str_to_path
-    from .state import State, _nested_set
+    from .state import State, _KeyedSubtree, _nested_set
 
     state_data: dict[str, dict[str, object]] = {}
-    if len(aux.leaf_spec) != len(leaves):
+    collection_order: list[str] = []
+    for collection, _path in aux.leaf_spec:
+        if collection not in collection_order:
+            collection_order.append(collection)
+    if (
+        len(leaves) == len(collection_order)
+        and all(isinstance(collection_tree, _KeyedSubtree) for collection_tree in leaves)
+    ):
+        for collection, collection_tree in zip(collection_order, leaves, strict=True):
+            if isinstance(collection_tree, _KeyedSubtree):
+                state_data[collection] = collection_tree.data
+    elif len(aux.leaf_spec) != len(leaves):
         raise ValueError(
             "Module pytree leaf count mismatch during unflatten: "
             f"expected {len(aux.leaf_spec)} leaves from the auxiliary spec, got {len(leaves)}."
         )
-    for (collection, path), leaf in zip(aux.leaf_spec, leaves, strict=True):
-        _nested_set(state_data.setdefault(collection, {}), str_to_path(path), leaf)
+    else:
+        for (collection, path), leaf in zip(aux.leaf_spec, leaves, strict=True):
+            _nested_set(state_data.setdefault(collection, {}), str_to_path(path), leaf)
     state = State._from_raw(state_data)
     m = bind(aux.gdef, state)
     object.__setattr__(m, "_spx_training", aux.training)

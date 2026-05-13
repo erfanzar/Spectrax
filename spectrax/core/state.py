@@ -523,7 +523,7 @@ def _nested_to_flat(d: dict[str, object]) -> dict[str, object]:
     return out
 
 
-def _sort_key(k: str) -> tuple[bool, int | str]:
+def _sort_key(k: object) -> tuple[bool, int | str]:
     """Sort numeric-looking keys before others (so ``0`` < ``10`` < ``a``).
 
     Args:
@@ -534,8 +534,57 @@ def _sort_key(k: str) -> tuple[bool, int | str]:
     """
     try:
         return (True, int(k))
-    except ValueError:
-        return (False, k)
+    except (TypeError, ValueError):
+        return (False, str(k))
+
+
+class _KeyedSubtree:
+    """Private pytree wrapper for nested State/Module path dictionaries."""
+
+    __slots__ = ("data",)
+
+    def __init__(self, data: dict[str, object]):
+        self.data = data
+
+
+_KeyedSubtreeAux = tuple[tuple[object, bool], ...]
+
+
+def _keyed_subtree_children(
+    tree: _KeyedSubtree,
+) -> tuple[tuple[tuple[jax.tree_util.DictKey, object], ...], _KeyedSubtreeAux]:
+    key_children: list[tuple[jax.tree_util.DictKey, object]] = []
+    aux: list[tuple[object, bool]] = []
+    for key, value in sorted(tree.data.items(), key=lambda item: _sort_key(item[0])):
+        is_subtree = isinstance(value, dict) and bool(value)
+        child = _KeyedSubtree(value) if is_subtree else value
+        key_children.append((jax.tree_util.DictKey(key), child))
+        aux.append((key, is_subtree))
+    return tuple(key_children), tuple(aux)
+
+
+def _keyed_subtree_flatten_with_keys(tree: _KeyedSubtree):
+    return _keyed_subtree_children(tree)
+
+
+def _keyed_subtree_flatten(tree: _KeyedSubtree):
+    key_children, aux = _keyed_subtree_children(tree)
+    return tuple(child for _key, child in key_children), aux
+
+
+def _keyed_subtree_unflatten(aux: _KeyedSubtreeAux, children: tuple[object, ...]) -> _KeyedSubtree:
+    data: dict[str, object] = {}
+    for (key, is_subtree), child in zip(aux, children, strict=True):
+        data[key] = child.data if is_subtree and isinstance(child, _KeyedSubtree) else child
+    return _KeyedSubtree(data)
+
+
+jax.tree_util.register_pytree_with_keys(
+    _KeyedSubtree,
+    _keyed_subtree_flatten_with_keys,
+    _keyed_subtree_unflatten,
+    flatten_func=_keyed_subtree_flatten,
+)
 
 
 class State:
@@ -968,12 +1017,12 @@ class State:
 _StateAux = tuple[tuple[str, str], ...]
 
 
-def _state_flatten(s: State) -> tuple[tuple[object, ...], _StateAux]:
-    """Direct leaf flattener for :class:`State`.
+def _state_flatten(s: State) -> tuple[tuple[_KeyedSubtree, ...], _StateAux]:
+    """Pytree flattener for :class:`State`.
 
-    Avoids materializing sorted nested dict copies on the hot path by
-    emitting the leaves directly alongside a deterministic
-    ``(collection, dotted_path)`` leaf specification.
+    Emits one keyed-subtree child per non-empty collection plus a deterministic
+    ``(collection, dotted_path)`` leaf specification. The child layout matches
+    :func:`_state_flatten_with_keys`, as required by JAX.
 
     Args:
         s: S value consumed by this operation.
@@ -981,22 +1030,24 @@ def _state_flatten(s: State) -> tuple[tuple[object, ...], _StateAux]:
     Returns:
         Result described by this helper.
     """
-    leaves: list[object] = []
+    children: list[_KeyedSubtree] = []
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
-        for path_tuple, v in _nested_items(inner):
-            leaves.append(v)
+        if not inner:
+            continue
+        children.append(_KeyedSubtree(inner))
+        for path_tuple, _v in _nested_items(inner):
             spec.append((c, path_to_str(path_tuple)))
-    return tuple(leaves), tuple(spec)
+    return tuple(children), tuple(spec)
 
 
 def _state_flatten_with_keys(
     s: State,
-) -> tuple[tuple[tuple[tuple[jax.tree_util.DictKey, ...]], ...], _StateAux]:  # type: ignore
+) -> tuple[tuple[tuple[jax.tree_util.DictKey, _KeyedSubtree], ...], _StateAux]:  # type: ignore
     """JAX pytree flattener for :class:`State` with per-leaf keypaths.
 
-    Emits explicit :class:`DictKey` tuples for every leaf while sharing
-    the same leaf spec as :func:`_state_flatten`.
+    Emits collection subtrees under one :class:`DictKey` per collection so
+    JAX appends the nested dictionary path as ordinary key entries.
 
     Args:
         s: S value consumed by this operation.
@@ -1004,14 +1055,15 @@ def _state_flatten_with_keys(
     Returns:
         Result described by this helper.
     """
-    key_leaves: list[tuple[tuple[jax.tree_util.DictKey, ...]]] = []  # type: ignore
+    key_children: list[tuple[jax.tree_util.DictKey, _KeyedSubtree]] = []
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
-        for path_tuple, v in _nested_items(inner):
-            key = (jax.tree_util.DictKey(c), *[jax.tree_util.DictKey(seg) for seg in path_tuple])
-            key_leaves.append((key, v))
+        if not inner:
+            continue
+        key_children.append((jax.tree_util.DictKey(c), _KeyedSubtree(inner)))
+        for path_tuple, _v in _nested_items(inner):
             spec.append((c, path_to_str(path_tuple)))
-    return tuple(key_leaves), tuple(spec)
+    return tuple(key_children), tuple(spec)
 
 
 def _state_unflatten(aux: _StateAux, children: tuple[object, ...]) -> State:
@@ -1024,6 +1076,21 @@ def _state_unflatten(aux: _StateAux, children: tuple[object, ...]) -> State:
     Returns:
         Result described by this helper.
     """
+    collection_order: list[str] = []
+    for collection, _path in aux:
+        if collection not in collection_order:
+            collection_order.append(collection)
+    if (
+        len(children) == len(collection_order)
+        and all(isinstance(collection_tree, _KeyedSubtree) for collection_tree in children)
+    ):
+        return State._from_raw(
+            {
+                collection: collection_tree.data
+                for collection, collection_tree in zip(collection_order, children, strict=True)
+                if isinstance(collection_tree, _KeyedSubtree)
+            }
+        )
     if len(aux) != len(children):
         raise ValueError(
             "State pytree leaf count mismatch during unflatten: "

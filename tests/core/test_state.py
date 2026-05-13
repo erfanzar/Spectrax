@@ -266,6 +266,39 @@ def test_pytree_flatten_unflatten_roundtrip():
     assert rebuilt["b"]["q"] == 2.0
 
 
+def test_tree_map_with_path_emits_flat_key_paths():
+    """``tree_map_with_path`` reports collection/path entries as a flat tuple."""
+    s = State({"parameters": {"layer": {7: {"weight": jnp.ones(())}}}})
+    paths = []
+
+    mapped = jax.tree_util.tree_map_with_path(lambda path, leaf: paths.append(path) or leaf, s)
+    _path_leaves, path_treedef = jax.tree_util.tree_flatten_with_path(s)
+    _plain_leaves, plain_treedef = jax.tree_util.tree_flatten(s)
+
+    assert isinstance(mapped, State)
+    assert path_treedef == plain_treedef
+    assert paths == [
+        (
+            jax.tree_util.DictKey("parameters"),
+            jax.tree_util.DictKey("layer"),
+            jax.tree_util.DictKey(7),
+            jax.tree_util.DictKey("weight"),
+        )
+    ]
+
+
+def test_tree_map_with_path_skips_empty_collections_like_tree_flatten():
+    """Empty collections should not create phantom keyed children."""
+    s = State({"parameters": {"weight": jnp.ones(())}, "empty": {}})
+    paths = []
+
+    mapped = jax.tree_util.tree_map_with_path(lambda path, leaf: paths.append(path) or leaf, s)
+
+    assert isinstance(mapped, State)
+    assert paths == [(jax.tree_util.DictKey("parameters"), jax.tree_util.DictKey("weight"))]
+    assert "empty" not in mapped
+
+
 def test_pytree_treedef_preserves_keys():
     """``tree_unflatten`` restores the original ``(collection, path)`` shape."""
     original = State({"parameters": {"w": jnp.zeros(2)}, "buffers": {"mu": jnp.ones(2)}})

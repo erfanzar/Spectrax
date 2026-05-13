@@ -443,13 +443,21 @@ def _ref_forward(w0, b0, w1, b1, x, y):
     return ((h - y) ** 2).mean()
 
 
-def _make_pipe_forward(mpmd_mesh, schedule_cls, static_argnums=(0, 1, 2, 3), microbatches=_M, **schedule_kwargs):
+def _make_pipe_forward(
+    mpmd_mesh,
+    schedule_cls,
+    static_argnums=(),
+    batch_argnums=(4, 5),
+    microbatches=_M,
+    **schedule_kwargs,
+):
     """Build a decorated ``pipe_forward`` for schedule-driven sxjit tests."""
 
     @sxjit(
         mesh=mpmd_mesh,
         schedule=schedule_cls(microbatches=microbatches, **schedule_kwargs),
         static_argnums=static_argnums,
+        batch_argnums=batch_argnums,
     )
     def pipe_forward(w0, b0, w1, b1, x, y):
         """Pipelined forward implementation."""
@@ -470,13 +478,22 @@ def _ref_forward_4stage(w0, b0, w1, b1, w2, b2, w3, b3, x, y):
     return ((h - y) ** 2).mean()
 
 
-def _make_pipe_forward_4stage(mpmd_mesh, schedule_cls, *, microbatches=_M, **schedule_kwargs):
+def _make_pipe_forward_4stage(
+    mpmd_mesh,
+    schedule_cls,
+    *,
+    static_argnums=(),
+    batch_argnums=(8, 9),
+    microbatches=_M,
+    **schedule_kwargs,
+):
     """Create pipelined 4-stage forward."""
 
     @sxjit(
         mesh=mpmd_mesh,
         schedule=schedule_cls(microbatches=microbatches, **schedule_kwargs),
-        static_argnums=tuple(range(8)),
+        static_argnums=static_argnums,
+        batch_argnums=batch_argnums,
     )
     def pipe_forward(w0, b0, w1, b1, w2, b2, w3, b3, x, y):
         """Pipelined forward implementation."""
@@ -896,7 +913,7 @@ def test_mpmd_jit_schedule_profiler_records_tasks(mpmd_mesh, pipe_args):
 
 
 def test_mpmd_jit_schedule_profiler_records_fused_tasks(mpmd_mesh, pipe_args):
-    """Non-terminal ``FusedTask`` cells dispatch as one fused stage call."""
+    """Non-terminal ``FusedTask`` cells are preserved in schedule stats."""
     pipe_forward = _make_pipe_forward(mpmd_mesh, Std1F1B, microbatches=4)
     _ = pipe_forward(*pipe_args)
 
@@ -906,7 +923,10 @@ def test_mpmd_jit_schedule_profiler_records_fused_tasks(mpmd_mesh, pipe_args):
 
     ref_loss = _ref_forward(*pipe_args)
     assert jnp.allclose(loss, ref_loss, atol=1e-2, rtol=1e-2)
-    assert any("_fused_fwd" in name for name in times)
+    stats = pipe_forward._mpmd_state["schedule_plan"]["last_schedule_runtime_stats"]
+    assert stats["fused_count"] >= 1
+    assert any("_fwd_mb" in name for name in times)
+    assert any("_bwd_mb" in name for name in times)
 
 
 def test_mpmd_schedule_default_uses_fused_async(mpmd_mesh, pipe_args):

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import logging
 import queue
 import threading
 import time
@@ -38,6 +37,7 @@ from concurrent.futures import Future
 import jax
 from jax.sharding import Mesh, Sharding
 
+from ..._internal.logging import get_logger
 from ..types import MpMdMesh
 from .runtime import (
     _apply_out_shardings,
@@ -68,7 +68,7 @@ _CompiledStage: tp.TypeAlias = tuple[tp.Any, ...]
 _PIPELINE_PROGRESS_DIAGNOSTICS: dict[str, int] = {}
 _PIPELINE_DISPATCH_DIAGNOSTICS: dict[str, int] = {}
 _PIPELINE_PROGRESS_LOCK = threading.Lock()
-logger = logging.getLogger(__name__)
+logger = get_logger("MPMD-Pipeline-Executor")
 
 
 def _worker_jax_context() -> contextlib.AbstractContextManager[object]:

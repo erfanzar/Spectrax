@@ -16,12 +16,29 @@ import spectrax as spx
 from spectrax.runtime.mpmd.compiler import compile_ranked_executables, run_ranked_pipeline
 from spectrax.runtime.mpmd.pscan_compiler import PscanPlan, _pack_grad_tree
 from spectrax.runtime.mpmd.runtime import (
+    _build_schedule_unit_dependencies,
+    _build_schedule_units_from_plan,
+    _dependency_topological_schedule_units,
     _infer_schedule_static_argnums,
     _normalize_argnums,
     _resolve_explicit_shardings,
     sxcall,
 )
-from spectrax.runtime.schedules import Action, GPipe, Phase, Schedule
+from spectrax.runtime.schedules import (
+    Action,
+    DualPipeV,
+    Eager1F1B,
+    FusedTask,
+    GPipe,
+    Interleaved1F1BPlusOne,
+    InterleavedGPipe,
+    InterleavedH1,
+    KimiK2,
+    Phase,
+    Schedule,
+    Std1F1B,
+    ZeroBubbleH1,
+)
 
 
 @dataclass
@@ -206,3 +223,237 @@ def test_sxvalue_and_grad_argnums_validation_happens_at_call_time():
 
     with pytest.raises(ValueError, match="argnum"):
         sxvalue_and_grad(plain, argnums=2)(jnp.ones((2,)))
+
+
+def test_dualpipev_build_units_preserves_mixed_fused_logicals():
+    """Mixed DualPipeV FWD+BWD cells stay fused and route each half to its own logical stage."""
+    grid = DualPipeV(microbatches=4).build(n_stages=2)
+    plan = {
+        "logical_for_loc": {(0, 0): 0, (1, 0): 1, (1, 1): 2, (0, 1): 3},
+        "n_logical": 4,
+        "schedule_n_logical": 4,
+        "terminal_logical": 3,
+        "grid": grid,
+    }
+
+    units = _build_schedule_units_from_plan(plan)
+    fused_units = [unit for unit in units if unit.kind == "fused"]
+
+    assert fused_units
+    assert any(
+        isinstance(unit.payload, FusedTask)
+        and unit.fwd_logical != unit.bwd_logical
+        and unit.payload.fwd.phase is Phase.FWD
+        and unit.payload.bwd.phase is Phase.BWD
+        for unit in fused_units
+    )
+    assert not any(unit.bwd_logical == 3 for unit in units)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "n_stages"),
+    [
+        (GPipe(microbatches=8), 4),
+        (Std1F1B(microbatches=8), 4),
+        (Eager1F1B(microbatches=8), 4),
+        (ZeroBubbleH1(microbatches=8), 4),
+        (InterleavedH1(microbatches=8, virtual_stages=2), 4),
+        (Interleaved1F1BPlusOne(microbatches=8, virtual_stages=2), 4),
+        (InterleavedGPipe(microbatches=8, virtual_stages=2), 4),
+        (KimiK2(microbatches=8, virtual_stages=2, extra_warmup=1), 4),
+        (DualPipeV(microbatches=8), 4),
+    ],
+)
+def test_schedule_unit_lowering_preserves_scheduler_work(schedule, n_stages):
+    """Runtime unit lowering must keep each scheduler's non-terminal work assigned correctly."""
+    grid = schedule.build(n_stages)
+    v = schedule.virtual_stages_per_rank()
+    logical_for_loc = {
+        (rank, virt): schedule.logical_at(rank, virt, n_stages) for rank in range(n_stages) for virt in range(v)
+    }
+    n_logical = n_stages * v
+    terminal_rank, terminal_virt = schedule.terminal_loc(n_stages)
+    terminal_logical = schedule.logical_at(terminal_rank, terminal_virt, n_stages)
+    plan = {
+        "logical_for_loc": logical_for_loc,
+        "n_logical": n_logical,
+        "schedule_n_logical": n_logical,
+        "terminal_logical": terminal_logical,
+        "grid": grid,
+    }
+
+    expected: dict[tuple[int, Phase, int], int] = {}
+    for row in grid:
+        for rank, cell in enumerate(row):
+            actions = cell.split() if isinstance(cell, FusedTask) else (() if cell is None else (cell,))
+            for action in actions:
+                logical = logical_for_loc[(rank, action.virtual_stage)]
+                if logical == terminal_logical and action.phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
+                    continue
+                key = (logical, action.phase, action.microbatch)
+                expected[key] = expected.get(key, 0) + 1
+
+    observed: dict[tuple[int, Phase, int], int] = {}
+    for unit in _build_schedule_units_from_plan(plan):
+        if unit.fwd_logical is not None:
+            key = (unit.fwd_logical, Phase.FWD, unit.fwd_mb)
+            observed[key] = observed.get(key, 0) + 1
+        if unit.bwd_logical is not None:
+            key = (unit.bwd_logical, unit.bwd_phase, unit.bwd_mb)
+            observed[key] = observed.get(key, 0) + 1
+
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    ("schedule", "n_stages"),
+    [
+        (GPipe(microbatches=8), 4),
+        (Std1F1B(microbatches=8), 4),
+        (Eager1F1B(microbatches=8), 4),
+        (ZeroBubbleH1(microbatches=8), 4),
+        (InterleavedH1(microbatches=8, virtual_stages=2), 4),
+        (Interleaved1F1BPlusOne(microbatches=8, virtual_stages=2), 4),
+        (InterleavedGPipe(microbatches=8, virtual_stages=2), 4),
+        (KimiK2(microbatches=8, virtual_stages=2, extra_warmup=1), 4),
+        (DualPipeV(microbatches=8), 4),
+        (DualPipeV(microbatches=8, zero_bubble=False), 4),
+    ],
+)
+def test_schedule_unit_dependencies_make_scheduler_work_executable(schedule, n_stages):
+    """The async runtime DAG must make every scheduler's grid dependency-legal."""
+    grid = schedule.build(n_stages)
+    v = schedule.virtual_stages_per_rank()
+    logical_for_loc = {
+        (rank, virt): schedule.logical_at(rank, virt, n_stages) for rank in range(n_stages) for virt in range(v)
+    }
+    n_logical = n_stages * v
+    terminal_rank, terminal_virt = schedule.terminal_loc(n_stages)
+    terminal_logical = schedule.logical_at(terminal_rank, terminal_virt, n_stages)
+    plan = {
+        "logical_for_loc": logical_for_loc,
+        "n_logical": n_logical,
+        "schedule_n_logical": n_logical,
+        "terminal_logical": terminal_logical,
+        "grid": grid,
+        "m": schedule.microbatches,
+        "invar_sources": [() if logical == 0 else (("cluster_out", logical - 1, 0),) for logical in range(n_logical)],
+    }
+
+    units = _build_schedule_units_from_plan(plan)
+    deps = _build_schedule_unit_dependencies(plan, units)
+    ordered = _dependency_topological_schedule_units(units, deps)
+    order = {unit.index: pos for pos, unit in enumerate(ordered)}
+    fwd_pos: dict[tuple[int, int], int] = {}
+    bwd_cot_pos: dict[tuple[int, int], int] = {}
+    bwd_w_pos: dict[tuple[int, int], int] = {}
+
+    for unit in ordered:
+        pos = order[unit.index]
+        if unit.fwd_logical is not None and unit.fwd_mb is not None:
+            fwd_pos[(unit.fwd_logical, unit.fwd_mb)] = pos
+            if unit.fwd_logical == terminal_logical:
+                bwd_cot_pos[(unit.fwd_logical, unit.fwd_mb)] = pos
+        if unit.bwd_logical is not None and unit.bwd_mb is not None:
+            key = (unit.bwd_logical, unit.bwd_mb)
+            if unit.bwd_phase is Phase.BWD_W:
+                bwd_w_pos[key] = pos
+            else:
+                bwd_cot_pos[key] = pos
+
+    for logical in range(n_logical):
+        for mb in range(schedule.microbatches):
+            if logical > 0 and (logical, mb) in fwd_pos:
+                assert fwd_pos[(logical, mb)] > fwd_pos[(logical - 1, mb)]
+            if logical != terminal_logical and (logical, mb) in bwd_cot_pos:
+                assert bwd_cot_pos[(logical, mb)] > fwd_pos[(logical, mb)]
+                if logical + 1 < n_logical:
+                    assert bwd_cot_pos[(logical, mb)] > bwd_cot_pos[(logical + 1, mb)]
+            if (logical, mb) in bwd_w_pos:
+                assert bwd_w_pos[(logical, mb)] > bwd_cot_pos[(logical, mb)]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "n_stages", "expects_fwd_bwd_overlap"),
+    [
+        (GPipe(microbatches=8), 4, False),
+        (Std1F1B(microbatches=8), 4, True),
+        (Eager1F1B(microbatches=8), 4, True),
+        (ZeroBubbleH1(microbatches=8), 4, True),
+        (InterleavedH1(microbatches=8, virtual_stages=2), 4, True),
+        (Interleaved1F1BPlusOne(microbatches=8, virtual_stages=2), 4, True),
+        (InterleavedGPipe(microbatches=8, virtual_stages=2), 4, False),
+        (KimiK2(microbatches=8, virtual_stages=2, extra_warmup=1), 4, True),
+        (DualPipeV(microbatches=8), 4, True),
+    ],
+)
+def test_schedulers_expose_parallel_runtime_work(schedule, n_stages, expects_fwd_bwd_overlap):
+    """Every scheduler must expose multi-rank work; 1F1B-like schedulers also overlap FWD/BWD-family phases."""
+    grid = schedule.build(n_stages)
+    v = schedule.virtual_stages_per_rank()
+    logical_for_loc = {
+        (rank, virt): schedule.logical_at(rank, virt, n_stages) for rank in range(n_stages) for virt in range(v)
+    }
+    n_logical = n_stages * v
+    terminal_rank, terminal_virt = schedule.terminal_loc(n_stages)
+    terminal_logical = schedule.logical_at(terminal_rank, terminal_virt, n_stages)
+    plan = {
+        "logical_for_loc": logical_for_loc,
+        "n_logical": n_logical,
+        "schedule_n_logical": n_logical,
+        "terminal_logical": terminal_logical,
+        "grid": grid,
+        "m": schedule.microbatches,
+        "invar_sources": [() if logical == 0 else (("cluster_out", logical - 1, 0),) for logical in range(n_logical)],
+    }
+
+    def actions(cell):
+        if cell is None:
+            return ()
+        return cell.split() if isinstance(cell, FusedTask) else (cell,)
+
+    row_widths = [sum(cell is not None for cell in row) for row in grid]
+    fwd_bwd_rows = 0
+    for row in grid:
+        phases = {action.phase for cell in row for action in actions(cell)}
+        if Phase.FWD in phases and phases.intersection({Phase.BWD, Phase.BWD_I, Phase.BWD_W}):
+            fwd_bwd_rows += 1
+
+    units = _build_schedule_units_from_plan(plan)
+    deps = _build_schedule_unit_dependencies(plan, units)
+    dependents: dict[int, set[int]] = {unit.index: set() for unit in units}
+    remaining = {idx: set(unit_deps) for idx, unit_deps in deps.items()}
+    unit_by_index = {unit.index: unit for unit in units}
+    for idx, unit_deps in deps.items():
+        for dep in unit_deps:
+            dependents.setdefault(dep, set()).add(idx)
+    ready = sorted(
+        (idx for idx, unit_deps in remaining.items() if not unit_deps), key=lambda idx: (unit_by_index[idx].row, idx)
+    )
+    max_runtime_width = 0
+    emitted: set[int] = set()
+    while ready:
+        wave: list[int] = []
+        deferred: list[int] = []
+        used_ranks: set[int] = set()
+        for idx in ready:
+            rank = unit_by_index[idx].rank
+            if rank in used_ranks:
+                deferred.append(idx)
+                continue
+            wave.append(idx)
+            used_ranks.add(rank)
+        assert wave
+        max_runtime_width = max(max_runtime_width, len(wave))
+        for idx in wave:
+            emitted.add(idx)
+            for dependent in dependents.get(idx, ()):
+                remaining[dependent].discard(idx)
+                if not remaining[dependent] and dependent not in emitted and dependent not in deferred:
+                    deferred.append(dependent)
+        ready = sorted(deferred, key=lambda idx: (unit_by_index[idx].row, idx))
+
+    assert max(row_widths) > 1
+    assert sum(width > 1 for width in row_widths) > 0
+    assert max_runtime_width > 1
+    assert (fwd_bwd_rows > 0) is expects_fwd_bwd_overlap

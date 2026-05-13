@@ -17,9 +17,9 @@ This module exposes:
 * :class:`InterleavedGPipe` — the GPipe-style ordering analogue.
 * :class:`Interleaved1F1BPlusOne` — :class:`InterleavedH1` with a
   single warmup forward prepended (instructional building block).
-* :class:`KimiK2` — Moonshot AI's 2024 variant: bumps each logical
-  stage's warmup count by ``extra_warmup`` and folds the bump into
-  the steady state (no extra time-step row).
+* :class:`KimiK2` — Kimi K2 public-report schedule knob: interleaved
+  1F1B with increased warm-up microbatches, with optional decoupled
+  W-grad chunks for runtimes where split backward is profitable.
 
 Plus the internal :func:`_build_physical_virtual_1f1b` list scheduler
 that handles dependency-correct emission for any
@@ -460,7 +460,14 @@ class Interleaved1F1BPlusOne(InterleavedH1):
         return [first_row, *new_base]
 
 
-def _warmup_bumped_1f1b_queue(logical: int, n_logical: int, microbatches: int, *, extra_warmup: int) -> list[Action]:
+def _warmup_bumped_1f1b_queue(
+    logical: int,
+    n_logical: int,
+    microbatches: int,
+    *,
+    extra_warmup: int,
+    split_bwd: bool = False,
+) -> list[Action]:
     """Build one logical stage's 1F1B action queue with optional warmup bump.
 
     Standard 1F1B emits ``min(n_logical - logical, microbatches)``
@@ -482,6 +489,7 @@ def _warmup_bumped_1f1b_queue(logical: int, n_logical: int, microbatches: int, *
         alternation, then any remaining backward drain.
     """
     warmup = min(min(n_logical - logical, microbatches) + extra_warmup, microbatches)
+    bwd_phase = Phase.BWD_I if split_bwd else Phase.BWD
     queue: list[Action] = [Action(Phase.FWD, mb) for mb in range(warmup)]
     fwd_head = warmup
     bwd_head = 0
@@ -490,7 +498,7 @@ def _warmup_bumped_1f1b_queue(logical: int, n_logical: int, microbatches: int, *
             queue.append(Action(Phase.FWD, fwd_head))
             fwd_head += 1
         if bwd_head < microbatches:
-            queue.append(Action(Phase.BWD, bwd_head))
+            queue.append(Action(bwd_phase, bwd_head))
             bwd_head += 1
     return queue
 
@@ -501,6 +509,7 @@ def _build_physical_virtual_1f1b(
     virtual_stages: int,
     microbatches: int,
     extra_warmup: int,
+    split_bwd: bool = False,
     logical_at,
 ) -> list[list[Action | None]]:
     """List-schedule virtual 1F1B directly on physical ranks.
@@ -559,9 +568,14 @@ def _build_physical_virtual_1f1b(
         raise ValueError(f"virtual schedule did not assign logical stages {missing}.")
 
     queues = [
-        _warmup_bumped_1f1b_queue(logical, n_logical, m, extra_warmup=extra_warmup) for logical in range(n_logical)
+        _warmup_bumped_1f1b_queue(logical, n_logical, m, extra_warmup=extra_warmup, split_bwd=split_bwd)
+        for logical in range(n_logical)
     ]
-    task_keys = [(logical, action.phase, action.microbatch) for logical, queue in enumerate(queues) for action in queue]
+    queue_task_keys = [
+        (logical, action.phase, action.microbatch) for logical, queue in enumerate(queues) for action in queue
+    ]
+    w_task_keys = [(logical, Phase.BWD_W, mb) for logical in range(n_logical) for mb in range(m)] if split_bwd else []
+    task_keys = [*queue_task_keys, *w_task_keys]
     predecessors: dict[tuple[int, Phase, int], set[tuple[int, Phase, int]]] = {key: set() for key in task_keys}
     successors: dict[tuple[int, Phase, int], set[tuple[int, Phase, int]]] = {key: set() for key in task_keys}
 
@@ -590,12 +604,15 @@ def _build_physical_virtual_1f1b(
     for logical in range(n_logical):
         for mb in range(m):
             fwd = (logical, Phase.FWD, mb)
-            bwd = (logical, Phase.BWD, mb)
+            bwd_phase = Phase.BWD_I if split_bwd else Phase.BWD
+            bwd = (logical, bwd_phase, mb)
             add_dep(bwd, fwd)
             if logical > 0:
                 add_dep(fwd, (logical - 1, Phase.FWD, mb))
             if logical + 1 < n_logical:
-                add_dep(bwd, (logical + 1, Phase.BWD, mb))
+                add_dep(bwd, (logical + 1, bwd_phase, mb))
+            if split_bwd:
+                add_dep((logical, Phase.BWD_W, mb), bwd)
 
     critical_cache: dict[tuple[int, Phase, int], int] = {}
 
@@ -617,7 +634,12 @@ def _build_physical_virtual_1f1b(
         cached = critical_cache.get(task)
         if cached is not None:
             return cached
-        action_latency = 4 if task[1] is Phase.BWD else 2
+        if task[1] is Phase.BWD:
+            action_latency = 4
+        elif task[1] in (Phase.BWD_I, Phase.BWD_W):
+            action_latency = 2
+        else:
+            action_latency = 2
         value = action_latency + max((critical_path(dep) for dep in successors.get(task, ())), default=0)
         critical_cache[task] = value
         return value
@@ -628,7 +650,7 @@ def _build_physical_virtual_1f1b(
     positions = [0] * n_logical
     done: set[tuple[int, Phase, int]] = set()
     rows: list[list[Action | None]] = []
-    total_actions = sum(len(queue) for queue in queues)
+    total_actions = sum(len(queue) for queue in queues) + len(w_task_keys)
     max_rows = 4 * (total_actions + n_logical) + 10
 
     while len(done) < total_actions:
@@ -636,22 +658,33 @@ def _build_physical_virtual_1f1b(
         selected: list[tuple[int, Phase, int]] = []
         for rank in range(n):
             candidates: list[tuple[int, Phase, int]] = []
+            w_candidates: list[tuple[int, Phase, int]] = []
             for virt in range(v):
                 logical = logical_at(rank, virt, n)
                 pos = positions[logical]
                 if pos >= len(queues[logical]):
-                    continue
-                action = queues[logical][pos]
-                task = (logical, action.phase, action.microbatch)
-                if predecessors.get(task, set()).issubset(done):
-                    candidates.append(task)
+                    action = None
+                else:
+                    action = queues[logical][pos]
+                    task = (logical, action.phase, action.microbatch)
+                    if predecessors.get(task, set()).issubset(done):
+                        candidates.append(task)
+                if split_bwd:
+                    for mb in range(m):
+                        task = (logical, Phase.BWD_W, mb)
+                        if task in done:
+                            continue
+                        if predecessors.get(task, set()).issubset(done):
+                            w_candidates.append(task)
+            if not candidates:
+                candidates = w_candidates
             if not candidates:
                 continue
             chosen = max(
                 candidates,
                 key=lambda task: (
                     critical_path(task),
-                    1 if task[1] is Phase.BWD else 0,
+                    1 if task[1] in (Phase.BWD, Phase.BWD_I) else 0,
                     -task[2],
                     -task[0],
                 ),
@@ -672,7 +705,8 @@ def _build_physical_virtual_1f1b(
             raise RuntimeError(f"virtual 1F1B scheduler made no progress; blocked={blocked!r}")
 
         for logical, phase, mb in selected:
-            positions[logical] += 1
+            if phase is not Phase.BWD_W:
+                positions[logical] += 1
             done.add((logical, phase, mb))
         rows.append(row)
         if len(rows) > max_rows:
@@ -683,20 +717,19 @@ def _build_physical_virtual_1f1b(
 
 @dataclass
 class KimiK2(InterleavedH1):
-    """Kimi-K2 schedule (Moonshot AI training infra, 2024).
+    """Kimi K2 warmup-bumped interleaved 1F1B schedule.
 
     Variant of :class:`InterleavedH1` that bumps the per-logical-stage
     warmup forward count by 1, folded into the steady-state 1F1B walk
     so no extra time-step row is wasted. The +1 warmup gives every
     physical rank one more forward in flight before the first
-    backward fires, which trims the cooldown tail at large
-    microbatch counts.
+    backward fires.
 
-    The +1 warmup matches the Kimi-K2 paper's design intent. In a
-    Python-driven runtime the gain is small (the schedule does the
-    same total ops) and may be invisible against dispatch noise; the
-    win shows up most clearly in compiler-aware runtimes that can use
-    the longer warmup to overlap stages more aggressively.
+    The default emits full ``BWD`` chunks because SpectraX's current
+    Python/JAX async runtime has measurable dispatch overhead for split
+    backward. Set :attr:`split_backward` to ``True`` to emit decoupled
+    ``BWD_I``/``BWD_W`` chunks for experiments where that runtime cost
+    is lower than the bubble it fills.
 
     Compare to:
 
@@ -708,9 +741,11 @@ class KimiK2(InterleavedH1):
     Attributes:
         virtual_stages: Virtual stages per physical rank (vp).
         extra_warmup: Additional per-logical-stage forward warmup.
+        split_backward: Emit ``BWD_I``/``BWD_W`` instead of full ``BWD``.
     """
 
     extra_warmup: int = 1
+    split_backward: bool = False
 
     def __post_init__(self) -> None:
         """Validate that :attr:`extra_warmup` is non-negative.
@@ -723,11 +758,13 @@ class KimiK2(InterleavedH1):
             raise ValueError(f"KimiK2.extra_warmup must be >= 0, got {self.extra_warmup}.")
 
     def build(self, n_stages: int) -> list[list[Action | None]]:
-        """Emit the Kimi-K2 grid: interleaved 1F1B with bumped warmup.
+        """Emit the Kimi-K2 grid: warmup-bumped interleaved 1F1B.
 
         Same logical-to-physical remap as :class:`InterleavedH1` but
         the underlying per-logical-stage 1F1B queue uses
-        ``extra_warmup`` additional forwards (default ``1``).
+        ``extra_warmup`` additional forwards (default ``1``). When
+        :attr:`split_backward` is true, backward is split into
+        critical-path ``BWD_I`` plus reorderable ``BWD_W``.
 
         Args:
             n_stages: Number of physical pipeline ranks.
@@ -740,5 +777,6 @@ class KimiK2(InterleavedH1):
             virtual_stages=self.virtual_stages,
             microbatches=self.microbatches,
             extra_warmup=self.extra_warmup,
+            split_bwd=self.split_backward,
             logical_at=self.logical_at,
         )

@@ -80,7 +80,6 @@ import concurrent.futures
 import contextlib
 import contextvars
 import functools
-import logging
 import math
 import threading
 import time
@@ -96,6 +95,7 @@ from jax.experimental import multihost_utils
 from jax.extend.core import Jaxpr, Var
 from jax.extend.core import Literal as JaxLiteral
 
+from ..._internal.logging import get_logger
 from ...core._weakcache import weak_invalidate
 from ...core.graph import bind, export, live_variables
 from ...core.module import Module
@@ -145,7 +145,7 @@ from .pscan_compiler import (
     has_pscan,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger("MPMD-Runtime")
 
 if TYPE_CHECKING:
     from ...sharding.mesh import SpxMesh
@@ -299,6 +299,8 @@ class _ScheduleStatsCollector:
         fused_count: int | None = None,
         window_count: int | None = None,
         fallback_reason: str | None = None,
+        terminal_logical: int | None = None,
+        eager_terminal_bwd: bool = False,
     ) -> None:
         """Initialize an empty stats collector for one ``sxcall`` invocation.
 
@@ -324,6 +326,8 @@ class _ScheduleStatsCollector:
         self.fused_count = fused_count
         self.window_count = window_count
         self.fallback_reason = fallback_reason
+        self.terminal_logical = terminal_logical
+        self.eager_terminal_bwd = bool(eager_terminal_bwd)
         self.transfer_count = 0
         self.transfer_skipped_count = 0
         self.transfer_cache_hit_count = 0
@@ -482,6 +486,12 @@ class _ScheduleStatsCollector:
                 """
                 if unit.kind == "fused":
                     return unit.kind
+                if (
+                    self.eager_terminal_bwd
+                    and self.terminal_logical is not None
+                    and unit.fwd_logical == self.terminal_logical
+                ):
+                    return "terminal"
                 if unit.fwd_logical is not None:
                     return "fwd"
                 if unit.bwd_phase is not None:
@@ -508,7 +518,13 @@ class _ScheduleStatsCollector:
                 phase = unit_phase(unit)
                 loc = f"r{unit.rank}/v{unit.virt}"
                 if unit.kind == "fused":
-                    return f"{loc} fused L{unit.fwd_logical}:fwd_mb{unit.fwd_mb}+bwd_mb{unit.bwd_mb}"
+                    return f"{loc} fused L{unit.fwd_logical}:fwd_mb{unit.fwd_mb}+L{unit.bwd_logical}:bwd_mb{unit.bwd_mb}"
+                if (
+                    self.eager_terminal_bwd
+                    and self.terminal_logical is not None
+                    and unit.fwd_logical == self.terminal_logical
+                ):
+                    return f"{loc} terminal L{unit.fwd_logical}:fwd+bwd_mb{unit.fwd_mb}"
                 if unit.fwd_logical is not None:
                     return f"{loc} fwd L{unit.fwd_logical}:mb{unit.fwd_mb}"
                 return f"{loc} {phase} L{unit.bwd_logical}:mb{unit.bwd_mb}"
@@ -5538,12 +5554,15 @@ def _schedule_fused_unit(
     fused: FusedTask,
     logical_for_loc: dict[tuple[int, int], int],
     logical_override: int | None = None,
+    fwd_logical_override: int | None = None,
+    bwd_logical_override: int | None = None,
 ) -> _ScheduleUnit:
     """Wrap a paired FWD+BWD :class:`FusedTask` as a single :class:`_ScheduleUnit`.
 
-    Both halves share the same physical ``(rank, virt)`` location so
-    the unit carries one logical-stage index but two microbatch
-    indices (one for the forward half, one for the backward half).
+    The two halves always share the same physical rank, but DualPipe-V
+    can pair different virtual stages on that rank. Carry separate
+    logical-stage indices so the dispatcher routes each half through
+    the correct stage state.
 
     Args:
         index: Stable global ordering key.
@@ -5557,7 +5576,16 @@ def _schedule_fused_unit(
         A :class:`_ScheduleUnit` with ``kind="fused"``.
     """
     virt = fused.virtual_stage
-    logical = logical_for_loc[(rank, virt)] if logical_override is None else logical_override
+    if logical_override is not None:
+        fwd_logical = logical_override
+        bwd_logical = logical_override
+    else:
+        fwd_logical = (
+            logical_for_loc[(rank, fused.fwd.virtual_stage)] if fwd_logical_override is None else fwd_logical_override
+        )
+        bwd_logical = (
+            logical_for_loc[(rank, fused.bwd.virtual_stage)] if bwd_logical_override is None else bwd_logical_override
+        )
     return _ScheduleUnit(
         index=index,
         row=row,
@@ -5565,9 +5593,9 @@ def _schedule_fused_unit(
         rank=rank,
         virt=virt,
         payload=fused,
-        fwd_logical=logical,
+        fwd_logical=fwd_logical,
         fwd_mb=fused.fwd.microbatch,
-        bwd_logical=logical,
+        bwd_logical=bwd_logical,
         bwd_mb=fused.bwd.microbatch,
         bwd_phase=fused.bwd.phase,
     )
@@ -5704,6 +5732,12 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
     terminal_logical = plan.get("terminal_logical", n_logical - 1)
     eager_terminal_bwd = True
     grid = plan["grid"]
+
+    def _is_eager_terminal_bwd(action: object, logical: int) -> bool:
+        return (
+            eager_terminal_bwd and logical == terminal_logical and action.phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W)
+        )
+
     if serial_region_plan:
 
         def emit_action(
@@ -5714,7 +5748,7 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
             action: object,
         ) -> None:
             nonlocal next_index
-            if eager_terminal_bwd and action.phase is Phase.BWD and logical == terminal_logical:
+            if _is_eager_terminal_bwd(action, logical):
                 return
             units.append(
                 _schedule_action_unit(
@@ -5760,7 +5794,7 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                 for rank, cell in enumerate(row):
                     if cell is None:
                         continue
-                    bwd_actions = (cell.bwd,) if isinstance(cell, FusedTask) else (cell,)
+                    bwd_actions = (cell.fwd, cell.bwd) if isinstance(cell, FusedTask) else (cell,)
                     for bwd_action in bwd_actions:
                         if bwd_action.phase not in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
                             continue
@@ -5788,7 +5822,15 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                     continue
                 synthetic_row = row_offset + row_idx
                 if isinstance(cell, FusedTask):
-                    if cell.fwd.phase is Phase.FWD and cell.bwd.phase is Phase.BWD and logical != terminal_logical:
+                    fwd_logical = logical_offset + logical_for_loc[(rank, cell.fwd.virtual_stage)]
+                    bwd_logical = logical_offset + logical_for_loc[(rank, cell.bwd.virtual_stage)]
+                    if (
+                        cell.fwd.phase is Phase.FWD
+                        and cell.bwd.phase is Phase.BWD
+                        and fwd_logical < n_logical
+                        and bwd_logical < n_logical
+                        and not _is_eager_terminal_bwd(cell.bwd, bwd_logical)
+                    ):
                         units.append(
                             _schedule_fused_unit(
                                 index=next_index,
@@ -5796,16 +5838,20 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                                 rank=rank,
                                 fused=cell,
                                 logical_for_loc=logical_for_loc,
-                                logical_override=logical,
+                                fwd_logical_override=fwd_logical,
+                                bwd_logical_override=bwd_logical,
                             )
                         )
                         next_index += 1
                         continue
 
-                    actions = (cell.fwd,)
-                    if not (eager_terminal_bwd and cell.bwd.phase is Phase.BWD and logical == terminal_logical):
-                        actions += (cell.bwd,)
+                    actions = (cell.fwd, cell.bwd)
                     for action in actions:
+                        action_logical = logical_offset + logical_for_loc[(rank, action.virtual_stage)]
+                        if action_logical >= n_logical:
+                            continue
+                        if _is_eager_terminal_bwd(action, action_logical):
+                            continue
                         units.append(
                             _schedule_action_unit(
                                 index=next_index,
@@ -5813,12 +5859,12 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                                 rank=rank,
                                 action=action,
                                 logical_for_loc=logical_for_loc,
-                                logical_override=logical,
+                                logical_override=action_logical,
                             )
                         )
                         next_index += 1
                 else:
-                    if eager_terminal_bwd and cell.phase is Phase.BWD and logical == terminal_logical:
+                    if _is_eager_terminal_bwd(cell, logical):
                         continue
                     units.append(
                         _schedule_action_unit(
@@ -6118,6 +6164,7 @@ def _dispatch_schedule_fused_async(
     placed_dynamic_invars: dict[tuple[int, int, int], object] = {}
     stats_collector: _ScheduleStatsCollector | None = None
     transfer_executor: concurrent.futures.Executor | None = None
+    fused_pair_executor: concurrent.futures.Executor | None = None
     consumers_by_producer: dict[int, set[int]] = {logical: set() for logical in range(n_logical)}
     producer_output_use_counts: dict[int, int] = {logical: 0 for logical in range(n_logical)}
     for consumer_logical, sources in enumerate(invar_sources):
@@ -6809,38 +6856,63 @@ def _dispatch_schedule_fused_async(
         _release_consumed_backward_state(logical, mb, phase)
         _progress("run-bwd-exit", logical=logical, rank=rank, virt=virt, mb=mb, phase=phase.name)
 
-    def _run_fused(logical: int, rank: int, virt: int, fused: FusedTask) -> None:
+    def _run_fused(fwd_logical: int, bwd_logical: int, rank: int, fused: FusedTask) -> None:
         """Execute a paired schedule cell as scheduler-ordered FWD then BWD.
 
         The schedule still owns the row/unit ordering, but the runtime no
         longer hides a second fused executable behind an environment flag.
 
         Args:
-            logical: Logical value consumed by this operation.
+            fwd_logical: Logical stage for the forward half.
+            bwd_logical: Logical stage for the backward half.
             rank: Rank value consumed by this operation.
-            virt: Virt value consumed by this operation.
             fused: Fused value consumed by this operation.
         """
         fwd_action = fused.fwd
         bwd_action = fused.bwd
+        fwd_virt = fwd_action.virtual_stage
+        bwd_virt = bwd_action.virtual_stage
         fwd_mb = fwd_action.microbatch
         bwd_mb = bwd_action.microbatch
         _progress(
             "run-fused-enter",
-            logical=logical,
+            fwd_logical=fwd_logical,
+            bwd_logical=bwd_logical,
             rank=rank,
-            virt=virt,
+            fwd_virt=fwd_virt,
+            bwd_virt=bwd_virt,
             fwd_mb=fwd_mb,
             bwd_mb=bwd_mb,
             bwd_phase=bwd_action.phase.name,
         )
-        _run_fwd(logical, rank, virt, fwd_action)
-        _run_bwd(logical, rank, virt, bwd_action)
+        if fwd_logical != bwd_logical:
+            fwd_ctx = contextvars.copy_context()
+            bwd_ctx = contextvars.copy_context()
+            if fused_pair_executor is not None:
+                futures = (
+                    fused_pair_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
+                    fused_pair_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
+                )
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as local_executor:
+                    futures = (
+                        local_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
+                        local_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
+                    )
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+        else:
+            _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
+            _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
         _progress(
             "run-fused-split-exit",
-            logical=logical,
+            fwd_logical=fwd_logical,
+            bwd_logical=bwd_logical,
             rank=rank,
-            virt=virt,
+            fwd_virt=fwd_virt,
+            bwd_virt=bwd_virt,
             fwd_mb=fwd_mb,
             bwd_mb=bwd_mb,
             bwd_phase=bwd_action.phase.name,
@@ -6905,7 +6977,8 @@ def _dispatch_schedule_fused_async(
             Result described by this helper.
         """
         virt = fused.virtual_stage
-        logical = logical_for_loc[(rank, virt)]
+        fwd_logical = logical_for_loc[(rank, fused.fwd.virtual_stage)]
+        bwd_logical = logical_for_loc[(rank, fused.bwd.virtual_stage)]
         return _ScheduleUnit(
             index=index,
             row=row,
@@ -6913,9 +6986,9 @@ def _dispatch_schedule_fused_async(
             rank=rank,
             virt=virt,
             payload=fused,
-            fwd_logical=logical,
+            fwd_logical=fwd_logical,
             fwd_mb=fused.fwd.microbatch,
-            bwd_logical=logical,
+            bwd_logical=bwd_logical,
             bwd_mb=fused.bwd.microbatch,
             bwd_phase=fused.bwd.phase,
         )
@@ -7013,7 +7086,7 @@ def _dispatch_schedule_fused_async(
         )
         try:
             if unit.kind == "fused":
-                _run_fused(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
+                _run_fused(unit.fwd_logical, unit.bwd_logical, unit.rank, unit.payload)
             elif unit.kind == "apply":
                 _run_apply(unit.rank, unit.virt, unit.payload)
             elif unit.payload.phase is Phase.FWD:
@@ -7138,7 +7211,7 @@ def _dispatch_schedule_fused_async(
             units: Units value consumed by this operation.
             deps: Deps value consumed by this operation.
         """
-        nonlocal transfer_executor
+        nonlocal transfer_executor, fused_pair_executor
         by_index = {unit.index: unit for unit in units}
         dependents: dict[int, set[int]] = {unit.index: set() for unit in units}
         remaining = {idx: set(unit_deps) for idx, unit_deps in deps.items()}
@@ -7152,8 +7225,10 @@ def _dispatch_schedule_fused_async(
         with (
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(rank_submeshes))) as executor,
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(rank_submeshes))) as tx_executor,
+            concurrent.futures.ThreadPoolExecutor(max_workers=max(2, 2 * len(rank_submeshes))) as pair_executor,
         ):
             transfer_executor = tx_executor
+            fused_pair_executor = pair_executor
             try:
                 while ready or future_to_index:
                     launched = False
@@ -7202,6 +7277,7 @@ def _dispatch_schedule_fused_async(
                             ready.sort(key=lambda i: (by_index[i].row, i))
             finally:
                 transfer_executor = None
+                fused_pair_executor = None
 
     def _run_units_deterministic_nonblocking(units: list[_ScheduleUnit], deps: dict[int, set[int]]) -> None:
         """Topologically enqueue schedule units in one deterministic host order.
@@ -7280,7 +7356,13 @@ def _dispatch_schedule_fused_async(
         for unit in units:
             if unit.kind == "fused" and unit.fwd_logical is not None:
                 logical = unit.fwd_logical
-                if logical != terminal_logical:
+                fused = unit.payload
+                can_use_stage_fused_jit = (
+                    isinstance(fused, FusedTask)
+                    and unit.bwd_logical == unit.fwd_logical
+                    and fused.fwd.virtual_stage == fused.bwd.virtual_stage == fused.virtual_stage
+                )
+                if logical != terminal_logical and can_use_stage_fused_jit:
                     needed_fused.add(tuple(int(x) for x in _stage_key(logical)))
                 continue
             phase = getattr(unit.payload, "phase", None)
@@ -7596,6 +7678,8 @@ def _dispatch_schedule_fused_async(
         fused_count=fused_count,
         window_count=None,
         fallback_reason=plan.get("last_schedule_runtime_stats", {}).get("fallback_reason"),
+        terminal_logical=terminal_logical,
+        eager_terminal_bwd=eager_terminal_bwd,
     )
     _warm_compile_schedule(units)
     if use_ordered_threaded_async:
@@ -7665,7 +7749,7 @@ def _dispatch_schedule_fused_async(
         except Exception:
             process_index = -1
         if process_index == 0:
-            logger.info(
+            logger.debug(
                 "SpectraX MPMD schedule runtime stats; dispatcher=%s units=%s actions=%s fused=%s "
                 "transfers=%s skipped=%s cache_hits=%s transfer_gib=%.3f total_launch_ms=%s "
                 "total_unit_ms=%s critical_path_ms=%s per_phase_ms=%s per_rank_ms=%s top_units=%s.",

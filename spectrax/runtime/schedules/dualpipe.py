@@ -26,7 +26,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .base import Action, FusedTask, Phase, Schedule
-from .one_f_one_b import Std1F1B
 
 
 @dataclass
@@ -52,29 +51,33 @@ class DualPipeV(Schedule):
     * Requires ``n_stages`` pipeline ranks for ``2 * n_stages``
       logical stages — callers must structure the model as
       ``2 * n_stages`` :class:`PipelineSequential` entries.
-    * Currently emits a naive V-shape (no zero-bubble W-grad
-      filling); for finer overlap use :class:`ZeroBubbleH1`.
+    * Requires runtime support for mixed-virtual FWD+BWD cells to
+      overlap the paired work; otherwise those cells are serialized
+      and the schedule loses much of its intended benefit.
 
     Reference: DeepSeek-V3 technical report; DeepSeek
     ``dualpipev.py``.
 
     Attributes:
         microbatches: see :class:`Schedule`.
+        zero_bubble: When ``True``, emit the DeepSeek split
+            ``BWD_I``/``BWD_W`` slots. Set ``False`` to keep the same
+            V-shaped FWD/BWD pairing while using full backward chunks
+            for runtimes where split VJPs are slower than bubble fill.
     """
 
-    def build(self, n_stages: int) -> list[list[Action | None]]:
-        """Emit the V-shape grid.
+    zero_bubble: bool = True
 
-        Implementation: build a dependency-correct 1F1B schedule over
-        ``2 * n_stages`` *logical* stages, then fold each logical
-        stage onto its physical rank using the V mapping::
+    def build(self, n_stages: int) -> list[list[Action | FusedTask | None]]:
+        """Emit the DeepSeek-style per-rank DualPipe-V task grid.
 
-                    logical l  ->  (phys, virt) = (l, 0)              if l < n
-                               ->  (2n - 1 - l, 1)                    if l >= n
-
-                When two virtual stages on the same physical rank want to run
-                at the same time step, we extend the grid with an extra row
-                to serialize them (mirrors :class:`InterleavedH1`).
+        The reference DualPipe-V algorithm is rank-centric rather than
+        global-time-step-centric: each physical rank runs an eight-section
+        task list containing warmup forwards, split ``BWD_I``/``BWD_W``
+        work, and forward/backward overlap points.  Build that per-rank
+        sequence with :func:`dualpipev_tasks`, then pad the ragged lists
+        into SpectraX's grid representation.  The MPMD runtime preserves
+        same-rank order and adds data dependencies between ranks.
 
         Args:
             n_stages: N stages value consumed by this operation.
@@ -84,28 +87,17 @@ class DualPipeV(Schedule):
         """
         n = n_stages
         m = self.microbatches
-        n_logical = 2 * n
+        if m < 2 * n:
+            raise ValueError(
+                "DualPipeV requires microbatches >= 2 * n_stages to match the reference schedule; "
+                f"got microbatches={m}, n_stages={n}."
+            )
 
-        logical = Std1F1B(m).build(n_logical)
-
-        grid: list[list[Action | None]] = []
-        for row in logical:
-            new_row: list[Action | None] = [None] * n
-            for l_stage, action in enumerate(row):
-                if action is None:
-                    continue
-                if l_stage < n:
-                    phys, virt = l_stage, 0
-                else:
-                    phys, virt = 2 * n - 1 - l_stage, 1
-                if new_row[phys] is not None:
-                    grid.append(new_row)
-                    new_row = [None] * n
-                new_row[phys] = Action(action.phase, action.microbatch, virt)
-            grid.append(new_row)
-
-        while grid and all(c is None for c in grid[-1]):
-            grid.pop()
+        per_rank_tasks = [dualpipev_tasks(n, rank, m, zero_bubble=self.zero_bubble) for rank in range(n)]
+        max_len = max((len(tasks) for tasks in per_rank_tasks), default=0)
+        grid: list[list[Action | FusedTask | None]] = []
+        for row_idx in range(max_len):
+            grid.append([tasks[row_idx] if row_idx < len(tasks) else None for tasks in per_rank_tasks])
         return grid
 
     def virtual_stages_per_rank(self) -> int:
@@ -188,7 +180,13 @@ class DualPipeV(Schedule):
         return 2 * n_stages
 
 
-def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Action | FusedTask]:
+def dualpipev_tasks(
+    mpmd_dim: int,
+    mpmd_idx: int,
+    n_mubatches: int,
+    *,
+    zero_bubble: bool = True,
+) -> list[Action | FusedTask]:
     """Per-rank task list for DualPipe-V (DeepSeek-V3).
 
     Returns the ordered task sequence a single physical rank
@@ -220,6 +218,9 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
         mpmd_dim: Number of physical pipeline ranks.
         mpmd_idx: Index of the rank whose task list to build.
         n_mubatches: Number of microbatches per step.
+        zero_bubble: Emit split BWD-I/BWD-W chunks for the zero-bubble
+            sections. When false, those chunks become ordinary full BWD
+            tasks and W-flush slots are omitted.
 
     Returns:
         A list of :class:`Action` / :class:`FusedTask` entries in
@@ -229,28 +230,33 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
         instead — this function is for building custom per-rank
         executors or experimental schedule runners.
     """
-    stage_counts: dict[tuple[int, Phase], int] = {}
+    fwd_counts: dict[int, int] = {}
+    bwd_counts: dict[int, int] = {}
+    pending_w: list[tuple[int, int]] = []
 
-    def _next_mb(stage_id: int, phase: Phase) -> int:
-        """Return the next microbatch index for ``(stage_id, phase)`` and bump the counter.
+    def _virt(stage_id: int) -> int:
+        return 0 if stage_id < mpmd_dim else 1
 
-        Each ``(logical_stage, phase)`` pair gets its own
-        monotonically increasing microbatch counter so the same
-        logical stage produces microbatches 0, 1, 2, ... in the order
-        the schedule emits them.
-
-        Args:
-            stage_id: Logical-stage index (``0 .. 2 * mpmd_dim - 1``).
-            phase: Which phase counter to advance.
-
-        Returns:
-            The microbatch index for this action; counter is
-            incremented for the next call.
-        """
-        key = (stage_id, phase)
-        mb = stage_counts.get(key, 0)
-        stage_counts[key] = mb + 1
+    def _next_fwd_mb(stage_id: int) -> int:
+        """Return the next forward microbatch index for ``stage_id``."""
+        mb = fwd_counts.get(stage_id, 0)
+        fwd_counts[stage_id] = mb + 1
         return mb
+
+    def _next_bwd_mb(stage_id: int) -> int:
+        """Return the next backward microbatch index for ``stage_id``.
+
+        Full ``BWD`` and split ``BWD_I`` share this stream: DeepSeek's
+        ``_backward_chunk`` always consumes exactly one backward
+        microbatch, with ``enable_zb`` deciding whether weight-gradient
+        work runs now or is queued for a later ``W`` slot.
+        """
+        mb = bwd_counts.get(stage_id, 0)
+        bwd_counts[stage_id] = mb + 1
+        return mb
+
+    def _bwd_w_action(stage_id: int, mb: int) -> Action:
+        return Action(Phase.BWD_W, mb, _virt(stage_id))
 
     def fwd(stage_id: int) -> Action:
         """Build a forward :class:`Action` for ``stage_id`` at its next microbatch.
@@ -266,74 +272,50 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
         Returns:
             A FWD :class:`Action` with the right virtual-stage tag.
         """
-        return Action(Phase.FWD, _next_mb(stage_id, Phase.FWD), 0 if stage_id < mpmd_dim else 1)
+        return Action(Phase.FWD, _next_fwd_mb(stage_id), _virt(stage_id))
 
-    def bwd_a(stage_id: int) -> Action:
-        """Build a BWD_I (input-grad) :class:`Action` for ``stage_id``.
+    def bwd(stage_id: int, *, enable_zb: bool = False) -> Action:
+        """Build one DeepSeek backward chunk.
 
-        Args:
-            stage_id: Logical-stage index.
-
-        Returns:
-            A :attr:`Phase.BWD_I` :class:`Action` for the next
-            microbatch on this stage.
+        DeepSeek only splits backward when ``enable_zb`` is set. Normal
+        backward chunks compute input and weight gradients together as
+        ``BWD``. Zero-bubble chunks compute ``BWD_I`` now and queue the
+        matching ``BWD_W`` for a later ``weight_chunk`` slot.
         """
-        return Action(Phase.BWD_I, _next_mb(stage_id, Phase.BWD_I), 0 if stage_id < mpmd_dim else 1)
+        mb = _next_bwd_mb(stage_id)
+        if zero_bubble and enable_zb:
+            pending_w.append((stage_id, mb))
+            return Action(Phase.BWD_I, mb, _virt(stage_id))
+        return Action(Phase.BWD, mb, _virt(stage_id))
 
-    def bwd_w(stage_id: int) -> Action:
-        """Build a BWD_W (weight-grad) :class:`Action` for ``stage_id``.
-
-        Args:
-            stage_id: Logical-stage index.
-
-        Returns:
-            A :attr:`Phase.BWD_W` :class:`Action` for the next
-            microbatch on this stage.
-        """
-        return Action(Phase.BWD_W, _next_mb(stage_id, Phase.BWD_W), 0 if stage_id < mpmd_dim else 1)
-
-    def bwd(stage_id: int) -> FusedTask:
-        """Build a fused (BWD_I + BWD_W) task on the same microbatch.
-
-        Returned as a :class:`FusedTask` whose ``fwd`` slot holds the
-        BWD_I action and ``bwd`` slot holds the BWD_W action; this is
-        a deliberate repurposing of the field names for the DualPipe
-        pairing convention (a single backward dispatched as one
-        kernel that produces both input- and weight-gradients).
-
-        Args:
-            stage_id: Logical-stage index.
-
-        Returns:
-            A :class:`FusedTask` packing the two backward halves.
-        """
-        a = bwd_a(stage_id)
-        w = bwd_w(stage_id)
-        return FusedTask(fwd=a, bwd=w, virtual_stage=a.virtual_stage)
+    def weight_chunk() -> Action:
+        """Pop the next queued zero-bubble W-grad task."""
+        if not pending_w:
+            raise RuntimeError("DualPipeV internal schedule error: W slot had no queued BWD_W task.")
+        stage_id, mb = pending_w.pop(0)
+        return _bwd_w_action(stage_id, mb)
 
     def fwd_bwd(fwd_stage: int, bwd_stage: int) -> FusedTask:
-        """Build a fused (FWD on ``fwd_stage``, BWD_I on ``bwd_stage``) task.
+        """Build a paired (FWD on ``fwd_stage``, full BWD on ``bwd_stage``) task.
 
-        The BWD_W half is allocated by side-effect (advancing its
-        microbatch counter) but not packed into the returned task —
-        DualPipe-V emits the weight-grad later in the schedule, which
-        keeps it free to slot into bubble time and is what makes the
-        schedule "near zero-bubble" in steady state.
+        In the DeepSeek loop, ``_forward_backward_chunk`` uses the
+        module's custom ``overlapped_forward_backward`` implementation
+        when available; otherwise it executes a forward followed by a
+        normal full backward. It is not a zero-bubble W-grad deferral
+        point.
 
         Args:
             fwd_stage: Logical stage to forward on.
-            bwd_stage: Logical stage to BWD_I on (typically the
+            bwd_stage: Logical stage to backward on (typically the
                 mirror partner of ``fwd_stage``).
 
         Returns:
             A :class:`FusedTask` whose ``fwd`` is the forward action
-            and ``bwd`` is the BWD_I action; the deferred BWD_W is
-            counted but not emitted here.
+            and whose ``bwd`` is the full backward action.
         """
         f = fwd(fwd_stage)
-        a = bwd_a(bwd_stage)
-        _ = bwd_w(bwd_stage)
-        return FusedTask(fwd=f, bwd=a, virtual_stage=f.virtual_stage)
+        b = bwd(bwd_stage)
+        return FusedTask(fwd=f, bwd=b, virtual_stage=f.virtual_stage)
 
     stage0 = mpmd_idx
     stage1 = mpmd_dim * 2 - mpmd_idx - 1
@@ -349,8 +331,9 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
 
     section_3 = mpmd_dim - mpmd_idx - 1
     for _ in range(section_3):
-        tasks.append(bwd_a(stage1))
-        tasks.append(bwd_w(stage1))
+        tasks.append(bwd(stage1, enable_zb=True))
+        if zero_bubble:
+            tasks.append(weight_chunk())
         tasks.append(fwd(stage1))
 
     section_4 = n_mubatches - mpmd_dim * 2 + mpmd_idx + 1
@@ -372,29 +355,31 @@ def dualpipev_tasks(mpmd_dim: int, mpmd_idx: int, n_mubatches: int) -> list[Acti
 
     section_6 = mpmd_idx + 1
     enable_zb_at = section_6 // 2
+    enable_zb = False
     for idx in range(section_6):
-        if idx >= enable_zb_at and mpmd_idx % 2 == 1:
-            tasks.append(bwd_a(stage1))
-        else:
-            tasks.append(bwd(stage1))
-        if stage0 != 0 and idx >= enable_zb_at and mpmd_idx % 2 == 0:
-            tasks.append(bwd_a(stage0))
-        else:
-            tasks.append(bwd(stage0))
+        if idx == enable_zb_at and mpmd_idx % 2 == 1:
+            enable_zb = True
+        tasks.append(bwd(stage1, enable_zb=enable_zb))
+        if idx == enable_zb_at and mpmd_idx % 2 == 0:
+            enable_zb = True
+        tasks.append(bwd(stage0, enable_zb=enable_zb))
 
     section_7 = mpmd_dim - mpmd_idx - 1
     for _ in range(section_7):
-        if stage0 == 0:
-            tasks.append(bwd(stage0))
-        else:
-            tasks.append(bwd_a(stage0))
+        if zero_bubble:
+            tasks.append(weight_chunk())
+        tasks.append(bwd(stage0, enable_zb=True))
 
-    remaining_w = [(stage_id, stage_counts.get((stage_id, Phase.BWD_W), 0)) for stage_id in (stage0, stage1)]
-    remaining_w_tasks: list[Action] = []
-    for stage_id, done_mb in remaining_w:
-        for _mb in range(done_mb, n_mubatches):
-            remaining_w_tasks.append(bwd_w(stage_id))
-    remaining_w_tasks.sort(key=lambda a: (a.microbatch, a.virtual_stage))
-    tasks.extend(remaining_w_tasks)
+    if zero_bubble:
+        section_8 = mpmd_idx + 1
+        for _ in range(section_8):
+            tasks.append(weight_chunk())
+
+    expected = {stage0: n_mubatches, stage1: n_mubatches}
+    if any(bwd_counts.get(stage_id, 0) != count for stage_id, count in expected.items()) or pending_w:
+        raise RuntimeError(
+            "DualPipeV internal schedule error: backward/W queues did not drain "
+            f"for rank={mpmd_idx}, bwd_counts={bwd_counts}, pending_w={pending_w}."
+        )
 
     return tasks

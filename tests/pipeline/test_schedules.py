@@ -297,12 +297,16 @@ class TestDualPipeV:
     def test_fwd_count_matches_two_virtuals_per_rank(self):
         """Each physical rank hosts 2 virtual stages, giving ``2*M`` forwards per rank."""
         g = DualPipeV(microbatches=8).build(n_stages=4)
-        assert _count_phase(g, 4, Phase.FWD) == [16, 16, 16, 16]
+        assert _count_phase_including_fused(g, 4, Phase.FWD) == [16, 16, 16, 16]
 
-    def test_bwd_count_matches_two_virtuals_per_rank(self):
-        """Each physical rank hosts 2 virtual stages, giving ``2*M`` backwards per rank."""
+    def test_split_bwd_counts_match_two_virtuals_per_rank(self):
+        """Full BWD plus split BWD_I covers ``2*M`` backward chunks per rank."""
         g = DualPipeV(microbatches=8).build(n_stages=4)
-        assert _count_phase(g, 4, Phase.BWD) == [16, 16, 16, 16]
+        full = _count_phase_including_fused(g, 4, Phase.BWD)
+        split_i = _count_phase_including_fused(g, 4, Phase.BWD_I)
+        split_w = _count_phase_including_fused(g, 4, Phase.BWD_W)
+        assert [a + b for a, b in zip(full, split_i, strict=True)] == [16, 16, 16, 16]
+        assert split_i == split_w
 
     def test_peak_activations_double_n_stages(self):
         """Peak activations equal ``2 * n_stages`` (two virtuals per rank)."""
@@ -310,7 +314,7 @@ class TestDualPipeV:
 
     def test_rejects_short_logical_1f1b_grid(self):
         """DualPipeV has ``2*n`` logical stages, so a real 1F1B grid needs ``M >= 2*n``."""
-        with pytest.raises(ValueError, match="microbatches >= n_stages"):
+        with pytest.raises(ValueError, match=r"microbatches >= 2 \* n_stages"):
             DualPipeV(microbatches=4).build(n_stages=4)
 
     def test_virtual_stages_seen(self):
@@ -319,8 +323,8 @@ class TestDualPipeV:
         virtuals_seen: set[int] = set()
         for row in g:
             for cell in row:
-                if cell is not None:
-                    virtuals_seen.add(cell.virtual_stage)
+                for action in _iter_actions_in_cell(cell):
+                    virtuals_seen.add(action.virtual_stage)
         assert virtuals_seen == {0, 1}
 
     def test_no_collisions_at_same_rank_time(self):
@@ -329,7 +333,27 @@ class TestDualPipeV:
         for row in g:
             assert len(row) == 4
             for cell in row:
-                assert cell is None or isinstance(cell, Action)
+                assert cell is None or isinstance(cell, (Action, FusedTask))
+
+    def test_steady_state_pairs_fwd_with_full_bwd_across_virtuals(self):
+        """DualPipeV contains the DeepSeek steady-state FWD+BWD pair across V legs."""
+        g = DualPipeV(microbatches=8).build(n_stages=4)
+        assert any(
+            isinstance(cell, FusedTask)
+            and cell.fwd.phase is Phase.FWD
+            and cell.bwd.phase is Phase.BWD
+            and cell.fwd.virtual_stage != cell.bwd.virtual_stage
+            for row in g
+            for cell in row
+        )
+
+    def test_zero_bubble_can_be_disabled_for_full_bwd_chunks(self):
+        """The V pairing can run without split BWD-I/BWD-W slots on runtimes where split VJPs are costly."""
+        g = DualPipeV(microbatches=8, zero_bubble=False).build(n_stages=4)
+        assert _count_phase_including_fused(g, 4, Phase.FWD) == [16, 16, 16, 16]
+        assert _count_phase_including_fused(g, 4, Phase.BWD) == [16, 16, 16, 16]
+        assert _count_phase_including_fused(g, 4, Phase.BWD_I) == [0, 0, 0, 0]
+        assert _count_phase_including_fused(g, 4, Phase.BWD_W) == [0, 0, 0, 0]
 
 
 class TestInterleavedGPipe:
@@ -416,10 +440,20 @@ class TestKimiK2:
         assert _count_phase(kimi, 4, Phase.FWD) == _count_phase(base, 4, Phase.FWD)
 
     def test_bwd_count_preserved(self):
-        """KimiK2 keeps total BWD count = ``M*V`` per rank (same as InterleavedH1)."""
+        """KimiK2 keeps full BWD chunks by default for the fast runtime path."""
         kimi = KimiK2(microbatches=4, virtual_stages=2).build(n_stages=4)
         base = InterleavedH1(microbatches=4, virtual_stages=2).build(n_stages=4)
         assert _count_phase(kimi, 4, Phase.BWD) == _count_phase(base, 4, Phase.BWD)
+        assert _count_phase(kimi, 4, Phase.BWD_I) == [0, 0, 0, 0]
+        assert _count_phase(kimi, 4, Phase.BWD_W) == [0, 0, 0, 0]
+
+    def test_split_backward_is_explicit(self):
+        """KimiK2 can opt into BWD_I/BWD_W chunks for split-backward experiments."""
+        split = KimiK2(microbatches=4, virtual_stages=2, split_backward=True).build(n_stages=4)
+        base = InterleavedH1(microbatches=4, virtual_stages=2).build(n_stages=4)
+        assert _count_phase(split, 4, Phase.BWD_I) == _count_phase(base, 4, Phase.BWD)
+        assert _count_phase(split, 4, Phase.BWD_W) == _count_phase(base, 4, Phase.BWD)
+        assert _count_phase(split, 4, Phase.BWD) == [0, 0, 0, 0]
 
     def test_extra_warmup_is_explicit(self):
         """KimiK2 warmup is an explicit constructor field, not an env switch."""
@@ -471,7 +505,7 @@ class TestKimiK2:
         (Interleaved1F1BPlusOne(microbatches=8, virtual_stages=2), 4, 8, 2, (Phase.BWD,)),
         (InterleavedGPipe(microbatches=8, virtual_stages=2), 4, 8, 2, (Phase.BWD,)),
         (KimiK2(microbatches=8, virtual_stages=2, extra_warmup=1), 4, 8, 2, (Phase.BWD,)),
-        (DualPipeV(microbatches=8), 4, 8, 2, (Phase.BWD,)),
+        (DualPipeV(microbatches=8), 4, 8, 2, (Phase.BWD, Phase.BWD_I)),
     ],
 )
 def test_all_schedulers_emit_expected_physical_work(schedule, n_stages, microbatches, virtual_stages, bwd_phases):
@@ -480,8 +514,15 @@ def test_all_schedulers_emit_expected_physical_work(schedule, n_stages, microbat
     expected = [microbatches * virtual_stages] * n_stages
 
     assert _count_phase_including_fused(grid, n_stages, Phase.FWD) == expected
-    for phase in bwd_phases:
-        assert _count_phase_including_fused(grid, n_stages, phase) == expected
+    if isinstance(schedule, DualPipeV):
+        full = _count_phase_including_fused(grid, n_stages, Phase.BWD)
+        split_i = _count_phase_including_fused(grid, n_stages, Phase.BWD_I)
+        split_w = _count_phase_including_fused(grid, n_stages, Phase.BWD_W)
+        assert [a + b for a, b in zip(full, split_i, strict=True)] == expected
+        assert split_i == split_w
+    else:
+        for phase in bwd_phases:
+            assert _count_phase_including_fused(grid, n_stages, phase) == expected
 
 
 class TestFusedTask:

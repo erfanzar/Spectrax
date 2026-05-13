@@ -57,7 +57,7 @@ __all__ = [
     "sxstage_region",
 ]
 
-logger = get_logger(__name__)
+logger = get_logger(name="MPMD-Markers")
 _CLUSTER_PRUNE_DIAGNOSTICS = {"logged": 0}
 
 
@@ -1316,7 +1316,7 @@ def _normalize_marker_flows(jaxpr: Jaxpr) -> Jaxpr:
     except Exception:
         _proc = 0
     if _proc == 0:
-        logger.info(
+        logger.debug(
             "SpectraX MPMD: folded marker layout normalized -- %d raw sxstage_iter markers across "
             "%d flow(s) collapsed to %d pipeline-stage boundaries.",
             len(marker_idxs),

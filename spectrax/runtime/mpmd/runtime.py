@@ -116,6 +116,7 @@ from ..schedules import (
 from ..types.array import StagesArray
 from ..types.mesh import MpMdMesh, resolve_mpmd_mesh
 from .markers import (
+    _normalize_marker_flows,
     cluster_jaxpr_by_markers,
     has_stage_regions,
     marker_edge_shardings,
@@ -201,41 +202,76 @@ _ScheduleJitMap = dict[_ScheduleStageKey, Callable[..., object] | None]
 
 
 @dataclass(frozen=True)
+class _ApplyPayload:
+    """Payload for an APPLY unit (per-rank optimizer-apply step).
+
+    APPLY is a *runtime* concept, not a schedule concept -- the schedule
+    grid never contains APPLY entries. ``_build_schedule_units_from_plan``
+    synthesizes one APPLY unit per ``(rank, virt)`` at the end of the unit
+    list when the plan has compiled apply jits (see ``apply_jits`` in the
+    plan dict). Each APPLY unit depends on every backward unit on its rank
+    (so all that rank's local gradients are settled before the optimizer
+    update fires), and is independent of backward work on other ranks --
+    that's where the overlap with the rank-0 bwd tail comes from.
+
+    The payload is intentionally small: the per-rank work (which jit to
+    call, which leaves to update, which submesh) lives in the plan dict
+    and is keyed by ``(rank, virt)`` at dispatch time.
+
+    Attributes:
+        rank: Physical pipeline rank whose stage-local leaves this apply
+            unit updates.
+        virt: Virtual sub-stage on ``rank`` (0 for flat / DualPipeV
+            schedules where apply is per-rank, not per-virtual-stage).
+    """
+
+    rank: int
+    virt: int
+
+
+@dataclass(frozen=True)
 class _ScheduleUnit:
     """One executable unit in a schedule-driven MPMD dispatch.
 
     A unit is the smallest granularity the schedule dispatcher fires:
-    either a single :class:`Action` (``kind == "action"``) or a fused
-    forward+backward pair (``kind == "fused"``) on the same physical
-    rank. Units are produced by walking ``schedule.build(n)`` and form
-    the nodes of the dependency DAG used by the async dispatcher.
+    either a single :class:`Action` (``kind == "action"``), a fused
+    forward+backward pair (``kind == "fused"``), or an optimizer-apply
+    step (``kind == "apply"``) on a specific physical rank. Units are
+    produced by walking ``schedule.build(n)`` (for fwd/bwd) and then
+    appending one APPLY unit per ``(rank, virt)`` (when the plan has
+    compiled apply jits). They form the nodes of the dependency DAG
+    used by the async dispatcher.
 
     Attributes:
         index: Stable global ordering key (insertion order in the unit
             list). Used as the dependency-graph node id.
         row: Source row in the schedule grid; mostly diagnostic.
-        kind: Either ``"action"`` (a single :class:`Action`) or
-            ``"fused"`` (a :class:`FusedTask`).
+            APPLY units use a synthetic row at ``len(grid)`` so they
+            sort after every fwd/bwd unit in deterministic dispatch.
+        kind: Either ``"action"`` (a single :class:`Action`),
+            ``"fused"`` (a :class:`FusedTask`), or ``"apply"`` (a
+            stage-local optimizer-apply step).
         rank: Physical pipeline rank that owns this unit.
         virt: Virtual sub-stage on ``rank`` (always 0 for flat
             schedules with ``V == 1``).
-        payload: The underlying :class:`Action` or :class:`FusedTask`.
+        payload: The underlying :class:`Action`, :class:`FusedTask`, or
+            :class:`_ApplyPayload`.
         fwd_logical: Logical stage index of the forward half (None for
-            pure-backward units).
+            pure-backward and apply units).
         fwd_mb: Microbatch index of the forward half (None for
-            pure-backward units).
+            pure-backward and apply units).
         bwd_logical: Logical stage index of the backward half (None
-            for pure-forward units).
+            for pure-forward and apply units).
         bwd_mb: Microbatch index of the backward half (None for
-            pure-forward units).
+            pure-forward and apply units).
         bwd_phase: Specific backward phase (``Phase.BWD``,
             ``Phase.BWD_I``, or ``Phase.BWD_W``) or ``None`` for
-            forward-only units.
+            forward-only and apply units.
     """
 
     index: int
     row: int
-    kind: Literal["action", "fused"]
+    kind: Literal["action", "fused", "apply"]
     rank: int
     virt: int
     payload: object
@@ -1438,7 +1474,9 @@ def _target_shard_nbytes(value: object, sharding: object) -> tuple[int, ...]:
     )
 
 
-def _ordered_sharding_index_abi(sharding: object, shape: tuple[int, ...]) -> tuple[tuple[object, tuple[int, ...]], ...] | None:
+def _ordered_sharding_index_abi(
+    sharding: object, shape: tuple[int, ...]
+) -> tuple[tuple[object, tuple[int, ...]], ...] | None:
     """Return the shard-index ABI for ``sharding`` in mesh-device order.
 
     The physical devices may differ across pipeline ranks, so the device ids are
@@ -1635,9 +1673,7 @@ def _pair_transport_mesh_and_sharding(
         actual_stage_grid_shape = tuple(int(pair_mesh_shape[axis]) for axis in stage_axes)
     except Exception:
         try:
-            actual_stage_grid_shape = tuple(
-                int(dim) for dim in np.asarray(pair_mesh.devices, dtype=object).shape[1:]
-            )
+            actual_stage_grid_shape = tuple(int(dim) for dim in np.asarray(pair_mesh.devices, dtype=object).shape[1:])
         except Exception:
             actual_stage_grid_shape = tuple(int(dim) for dim in source_grid_shape)
     if math.prod(actual_stage_grid_shape) != int(source_devices_raw.size):
@@ -1827,15 +1863,11 @@ def _try_pair_ppermute_transport_leaf(
     try:
         pair_map = pair_sharding.addressable_devices_indices_map(pair_shape)
     except Exception as exc:
-        raise ValueError(
-            "SpectraX MPMD pair-mesh runtime transport could not inspect pair-sharding indices."
-        ) from exc
+        raise ValueError("SpectraX MPMD pair-mesh runtime transport could not inspect pair-sharding indices.") from exc
     try:
         target_map = target_sharding.addressable_devices_indices_map(shape)
     except Exception as exc:
-        raise ValueError(
-            "SpectraX MPMD pair-mesh runtime transport could not inspect target-sharding indices."
-        ) from exc
+        raise ValueError("SpectraX MPMD pair-mesh runtime transport could not inspect target-sharding indices.") from exc
     if not pair_map and not target_map:
         try:
             return jax.make_array_from_single_device_arrays(shape, target_sharding, [], dtype=dtype)
@@ -3699,18 +3731,19 @@ def _build_schedule_plan(
 
     mb_dynamic_args = tuple(_make_mb_arg(i) for i in dynamic_argnums)
     closed_jaxpr = jax.make_jaxpr(_wrapper)(*mb_dynamic_args)
-    has_regions = has_stage_regions(closed_jaxpr.jaxpr)
+    body_jaxpr = _normalize_marker_flows(closed_jaxpr.jaxpr)
+    has_regions = has_stage_regions(body_jaxpr)
 
     if has_regions:
-        extra_boundaries = stage_region_cluster_boundaries(closed_jaxpr.jaxpr)
+        extra_boundaries = stage_region_cluster_boundaries(body_jaxpr)
         edge_shardings = []
         clusters = cluster_jaxpr_by_markers(
-            closed_jaxpr.jaxpr,
+            body_jaxpr,
             extra_boundary_positions=extra_boundaries,
         )
     else:
-        edge_shardings = marker_edge_shardings(closed_jaxpr.jaxpr)
-        clusters = cluster_jaxpr_by_markers(closed_jaxpr.jaxpr)
+        edge_shardings = marker_edge_shardings(body_jaxpr)
+        clusters = cluster_jaxpr_by_markers(body_jaxpr)
     serial_region_plan = has_regions and len(clusters) != n_logical
     if serial_region_plan and (len(clusters) < n_logical or len(clusters) % n_logical != 0):
         raise ValueError(
@@ -3734,9 +3767,9 @@ def _build_schedule_plan(
     )
     terminal_logical = len(clusters) - 1
     terminal_loc = loc_for_logical[terminal_logical]
-    invar_sources = _build_invar_sources(closed_jaxpr.jaxpr, clusters)
+    invar_sources = _build_invar_sources(body_jaxpr, clusters)
 
-    all_constvars = list(closed_jaxpr.jaxpr.constvars)
+    all_constvars = list(body_jaxpr.constvars)
     concrete_consts = tuple(closed_jaxpr.consts)
     all_const_idx_by_id = {id(v): i for i, v in enumerate(all_constvars)}
 
@@ -4056,7 +4089,7 @@ def _build_schedule_plan(
                     n_invars,
                     sum(1 for active in bwd_i_invar_mask if active),
                     sum(1 for active in bwd_w_invar_mask if active),
-            )
+                )
             bwd_jits[stage_key] = _make_bwd_jit(
                 rebased_cluster,
                 n_invars,
@@ -4285,7 +4318,9 @@ def _schedule_grad_accum_targets(plan: dict[str, object], args: tuple[object, ..
         if owner is not None and owner < len(leaf_shardings):
             target = leaf_shardings[owner].get(flat_idx)
             if target is not None and owner < len(rank_submeshes):
-                template = value if hasattr(value, "shape") or flat_idx >= len(flat_templates) else flat_templates[flat_idx]
+                template = (
+                    value if hasattr(value, "shape") or flat_idx >= len(flat_templates) else flat_templates[flat_idx]
+                )
                 target = _canonical_stage_sharding(template, target, rank_submeshes[owner]) or target
         if target is None:
             target = getattr(value, "sharding", None)
@@ -5538,6 +5573,91 @@ def _schedule_fused_unit(
     )
 
 
+def _schedule_apply_unit(
+    *,
+    index: int,
+    row: int,
+    rank: int,
+    virt: int = 0,
+) -> _ScheduleUnit:
+    """Wrap a per-rank optimizer-apply step as a :class:`_ScheduleUnit`.
+
+    APPLY units are not present in the schedule grid -- they are
+    synthesized at unit-build time by ``_build_schedule_units_from_plan``
+    when the plan has compiled apply jits. Each unit owns one rank's
+    stage-local parameter update, and depends on every backward unit on
+    its rank (the dependency edges are added in
+    :func:`_build_schedule_unit_dependencies`). The ``row`` slot is set
+    to a synthetic value past every real grid row so deterministic
+    dispatch fires the apply units after all fwd/bwd work on the same
+    rank has been issued.
+
+    Args:
+        index: Stable global ordering key.
+        row: Synthetic row index (past every real grid row).
+        rank: Physical pipeline rank whose stage-local leaves this unit
+            will update.
+        virt: Virtual sub-stage index (unused for apply; kept for
+            symmetry with fwd/bwd units).
+
+    Returns:
+        A :class:`_ScheduleUnit` with ``kind="apply"`` and an
+        :class:`_ApplyPayload` payload.
+    """
+    return _ScheduleUnit(
+        index=index,
+        row=row,
+        kind="apply",
+        rank=rank,
+        virt=virt,
+        payload=_ApplyPayload(rank=rank, virt=virt),
+        fwd_logical=None,
+        fwd_mb=None,
+        bwd_logical=None,
+        bwd_mb=None,
+        bwd_phase=None,
+    )
+
+
+def _append_apply_units(
+    plan: dict[str, object],
+    units: list[_ScheduleUnit],
+    next_index: int,
+) -> int:
+    """Append one APPLY unit per physical rank when the plan has apply jits.
+
+    No-op when the plan does not contain compiled ``apply_jits`` -- this
+    keeps the legacy ``sxvalue_and_grad`` path (no fused apply) byte-for-
+    byte unchanged. When ``apply_jits`` is present, emits exactly one
+    APPLY unit per ``rank`` (``virt=0``), placed after every real grid
+    unit in row-major order so deterministic dispatch issues them last
+    on each rank but other ranks can fire theirs in parallel with rank-0
+    bwd tail.
+
+    Args:
+        plan: Dispatch plan from :func:`_build_schedule_plan`.
+        units: Unit list to append onto.
+        next_index: Next stable global ordering key to assign.
+
+    Returns:
+        The updated ``next_index`` after appending.
+    """
+    apply_jits = plan.get("apply_jits")
+    if not apply_jits:
+        return next_index
+    n_rank = int(plan.get("n", 0))
+    if n_rank <= 0:
+        return n_rank
+    grid = plan.get("grid", ())
+    synthetic_row = len(grid) + 1
+    for rank in range(n_rank):
+        if (rank, 0) not in apply_jits:
+            continue
+        units.append(_schedule_apply_unit(index=next_index, row=synthetic_row, rank=rank, virt=0))
+        next_index += 1
+    return next_index
+
+
 def _fuse_cross_virtual_schedule_units(plan: dict[str, object], units: list[_ScheduleUnit]) -> list[_ScheduleUnit]:
     """Return schedule units without hidden env-gated fusion.
 
@@ -5652,6 +5772,7 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                                 rank=rank,
                                 action=bwd_action,
                             )
+        next_index = _append_apply_units(plan, units, next_index)
         return _fuse_cross_virtual_schedule_units(plan, units)
 
     for group in range(region_groups):
@@ -5667,11 +5788,7 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                     continue
                 synthetic_row = row_offset + row_idx
                 if isinstance(cell, FusedTask):
-                    if (
-                        cell.fwd.phase is Phase.FWD
-                        and cell.bwd.phase is Phase.BWD
-                        and logical != terminal_logical
-                    ):
+                    if cell.fwd.phase is Phase.FWD and cell.bwd.phase is Phase.BWD and logical != terminal_logical:
                         units.append(
                             _schedule_fused_unit(
                                 index=next_index,
@@ -5714,6 +5831,7 @@ def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUn
                         )
                     )
                     next_index += 1
+    next_index = _append_apply_units(plan, units, next_index)
     return _fuse_cross_virtual_schedule_units(plan, units)
 
 
@@ -5835,11 +5953,7 @@ def _dependency_topological_schedule_units(
         ready.sort(key=lambda item: (by_index[item].row, item))
 
     if len(ordered) != len(units):
-        blocked = {
-            idx: sorted(unit_deps)
-            for idx, unit_deps in remaining.items()
-            if idx not in emitted and unit_deps
-        }
+        blocked = {idx: sorted(unit_deps) for idx, unit_deps in remaining.items() if idx not in emitted and unit_deps}
         raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
     return ordered
 
@@ -6179,9 +6293,7 @@ def _dispatch_schedule_fused_async(
                         remaining -= 1
                         if remaining <= 0:
                             remaining_output_uses.pop(producer_key, None)
-                            pretransfer_keys_to_drop = [
-                                key for key in pretransferred_outputs if key[1] == producer_key
-                            ]
+                            pretransfer_keys_to_drop = [key for key in pretransferred_outputs if key[1] == producer_key]
                         else:
                             remaining_output_uses[producer_key] = remaining
                     for pretransfer_key in pretransfer_keys_to_drop:
@@ -6385,9 +6497,7 @@ def _dispatch_schedule_fused_async(
                         Returns:
                             Result described by this helper.
                         """
-                        transfer_task_name = (
-                            f"transfer_{phase_label}_stage{src_logical}_to_stage{dst_logical}_mb{mb}"
-                        )
+                        transfer_task_name = f"transfer_{phase_label}_stage{src_logical}_to_stage{dst_logical}_mb{mb}"
                         _validate_scheduled_boundary_microbatch(value, task_name=transfer_task_name)
                         _progress(
                             "transfer-bwd-cotangent-enter",
@@ -6535,9 +6645,7 @@ def _dispatch_schedule_fused_async(
                     saved_inputs[key] = tuple(invars)
                 if eager_terminal_bwd:
                     if g_consts is None:
-                        raise ValueError(
-                            "Cannot run eager terminal backward when terminal gradients were not computed."
-                        )
+                        raise ValueError("Cannot run eager terminal backward when terminal gradients were not computed.")
                     scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
                     _accumulate_bwd_result(
                         loc=loc,
@@ -6843,6 +6951,46 @@ def _dispatch_schedule_fused_async(
                     next_index += 1
         return units
 
+    def _run_apply(rank: int, virt: int, payload: object) -> None:
+        """Dispatch one stage-local optimizer-apply unit on ``rank``.
+
+        Reads the apply context attached to the plan
+        (``plan["apply_context"]``, set up by
+        :func:`sxvalue_and_grad_and_apply` before dispatch fires) and runs
+        rank-local optimizer transformations on the leaves owned by this
+        rank. The function is intentionally tolerant of "no apply context"
+        -- in that case the apply unit was emitted but never wired up,
+        which is a logic bug worth surfacing as a clear error.
+
+        The actual rank-local update is performed by the user-provided
+        ``apply_fn`` callable, which receives the rank index, the params /
+        grads / opt-state flat-index lookups for this rank's leaves, and
+        a learning-rate scalar. It returns the new flat params / new
+        flat opt-state for those leaves, which this function scatters
+        back into the shared ``new_params_flat`` / ``new_opt_state``
+        buffers.
+
+        Args:
+            rank: Physical pipeline rank this apply unit owns.
+            virt: Virtual sub-stage (unused for apply; kept for symmetry).
+            payload: An :class:`_ApplyPayload` carrying rank/virt (already
+                expanded by the caller).
+        """
+        del virt, payload
+        apply_context = plan.get("apply_context")
+        if apply_context is None:
+            raise RuntimeError(
+                "SpectraX MPMD apply unit fired without an apply_context attached to the plan. "
+                "Use sxvalue_and_grad_and_apply instead of sxvalue_and_grad when emitting apply units."
+            )
+        apply_fn = apply_context["apply_fn"]
+        with rank_submeshes[rank]:
+            apply_fn(
+                rank=rank,
+                grad_accums=grad_accums,
+                state=apply_context,
+            )
+
     def _run_unit(unit: _ScheduleUnit) -> None:
         """Dispatch one unit through the right runner and record its enqueue time.
 
@@ -6866,6 +7014,8 @@ def _dispatch_schedule_fused_async(
         try:
             if unit.kind == "fused":
                 _run_fused(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
+            elif unit.kind == "apply":
+                _run_apply(unit.rank, unit.virt, unit.payload)
             elif unit.payload.phase is Phase.FWD:
                 _run_fwd(unit.fwd_logical, unit.rank, unit.virt, unit.payload)
             else:
@@ -7031,10 +7181,7 @@ def _dispatch_schedule_fused_async(
                                 }
                                 for idx in ready[:8]
                             ]
-                            raise RuntimeError(
-                                "schedule executor has no launchable ready unit; "
-                                f"ready={ready_preview}."
-                            )
+                            raise RuntimeError(f"schedule executor has no launchable ready unit; ready={ready_preview}.")
                         blocked = {idx: sorted(unit_deps) for idx, unit_deps in remaining.items() if unit_deps}
                         raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
 
@@ -7094,9 +7241,7 @@ def _dispatch_schedule_fused_async(
 
         if len(launched) != len(units):
             blocked = {
-                idx: sorted(unit_deps)
-                for idx, unit_deps in remaining.items()
-                if idx not in launched and unit_deps
+                idx: sorted(unit_deps) for idx, unit_deps in remaining.items() if idx not in launched and unit_deps
             }
             raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
 
@@ -7317,8 +7462,7 @@ def _dispatch_schedule_fused_async(
         if process_index == 0:
             elapsed = time.perf_counter() - started_at
             logger.debug(
-                "SpectraX MPMD warm-compiled %d scheduled stage executable(s) in %.2fs "
-                "using %d worker thread(s).",
+                "SpectraX MPMD warm-compiled %d scheduled stage executable(s) in %.2fs using %d worker thread(s).",
                 lowered_count,
                 elapsed,
                 worker_count,
@@ -7438,9 +7582,7 @@ def _dispatch_schedule_fused_async(
         )
 
     use_threaded_async = _active_profiler() is None
-    use_ordered_threaded_async = _active_profiler() is None and (
-        ordered_collective_transport or not use_threaded_async
-    )
+    use_ordered_threaded_async = _active_profiler() is None and (ordered_collective_transport or not use_threaded_async)
     action_count = sum(2 if unit.kind == "fused" else 1 for unit in units)
     fused_count = sum(1 for unit in units if unit.kind == "fused")
     stats_collector = _ScheduleStatsCollector(
@@ -7517,13 +7659,13 @@ def _dispatch_schedule_fused_async(
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     schedule_stats = stats_collector.as_dict(deps, units)
     plan["last_schedule_runtime_stats"] = schedule_stats
-    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("runtime_stats_logged", 0) < 4:
+    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("runtime_stats_logged", 0) < 8:
         try:
             process_index = jax.process_index()
         except Exception:
             process_index = -1
         if process_index == 0:
-            logger.debug(
+            logger.info(
                 "SpectraX MPMD schedule runtime stats; dispatcher=%s units=%s actions=%s fused=%s "
                 "transfers=%s skipped=%s cache_hits=%s transfer_gib=%.3f total_launch_ms=%s "
                 "total_unit_ms=%s critical_path_ms=%s per_phase_ms=%s per_rank_ms=%s top_units=%s.",
@@ -7765,7 +7907,11 @@ def _ensure_schedule_plan(
         return cached_plan
 
     plan = fn._mpmd_state.get("schedule_plan")
-    if plan is not None and plan.get("grad_argnums_key") == grad_key and fn._mpmd_state.get("__shape_signature__") == sig:
+    if (
+        plan is not None
+        and plan.get("grad_argnums_key") == grad_key
+        and fn._mpmd_state.get("__shape_signature__") == sig
+    ):
         plan_cache[cache_key] = plan
         return plan
     build = getattr(fn, "_mpmd_build", None)
@@ -8258,8 +8404,7 @@ def sxjit(
                 if process_index == 0:
                     elapsed = time.perf_counter() - started_at
                     logger.debug(
-                        "SpectraX MPMD warm-compiled %d forward stage executable(s) in %.2fs "
-                        "using %d worker thread(s).",
+                        "SpectraX MPMD warm-compiled %d forward stage executable(s) in %.2fs using %d worker thread(s).",
                         lowered_count,
                         elapsed,
                         worker_count,
@@ -10070,11 +10215,11 @@ class _OrderedScheduleTransportSlot:
         self._gate._release(self._task_name)
 
 
-_ORDERED_SCHEDULE_TRANSPORT_GATE: contextvars.ContextVar[_OrderedScheduleTransportGate | None] = (
-    contextvars.ContextVar("spectrax_ordered_schedule_transport_gate", default=None)
+_ORDERED_SCHEDULE_TRANSPORT_GATE: contextvars.ContextVar[_OrderedScheduleTransportGate | None] = contextvars.ContextVar(
+    "spectrax_ordered_schedule_transport_gate", default=None
 )
-_ORDERED_SCHEDULE_TRANSPORT_SLOT: contextvars.ContextVar[_OrderedScheduleTransportSlot | None] = (
-    contextvars.ContextVar("spectrax_ordered_schedule_transport_slot", default=None)
+_ORDERED_SCHEDULE_TRANSPORT_SLOT: contextvars.ContextVar[_OrderedScheduleTransportSlot | None] = contextvars.ContextVar(
+    "spectrax_ordered_schedule_transport_slot", default=None
 )
 
 
@@ -10235,8 +10380,7 @@ def _transport(
                     return jax.device_put(x, target_sharding)
                 except (TypeError, ValueError):
                     logger.debug(
-                        "Single-controller direct MPMD runtime transfer failed; "
-                        "falling back to compiled transport.",
+                        "Single-controller direct MPMD runtime transfer failed; falling back to compiled transport.",
                         exc_info=True,
                     )
 
@@ -12228,7 +12372,9 @@ def sxcall(
         outputs = saved_outputs.get(terminal_loc, {})
         if outputs:
             output_stack = jnp.stack([outputs[mb_i] for mb_i in sorted(outputs.keys())], axis=0)
-            return cast(jax.Array, _flatten_microbatch_stack(output_stack, m, context="sxcall_forward_only_output_stack"))
+            return cast(
+                jax.Array, _flatten_microbatch_stack(output_stack, m, context="sxcall_forward_only_output_stack")
+            )
         return jnp.zeros(())
 
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)

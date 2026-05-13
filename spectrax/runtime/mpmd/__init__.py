@@ -52,6 +52,7 @@ from .runtime import (
     sxjit,
     sxvalue_and_grad,
 )
+from .training_step import sxvalue_and_grad_and_apply
 from .treduce import (
     Add,
     Concat,
@@ -94,6 +95,7 @@ __all__ = [
     "sxstage_iter",
     "sxstage_region",
     "sxvalue_and_grad",
+    "sxvalue_and_grad_and_apply",
     "treduce",
     "treduce_i",
 ]

@@ -1151,6 +1151,188 @@ def has_stage_regions(jaxpr: Jaxpr) -> bool:
     return bool(_stage_region_spans(jaxpr))
 
 
+def _normalize_marker_flows(jaxpr: Jaxpr) -> Jaxpr:
+    """Coalesce a multi-flow marker layout into one single-flow boundary set.
+
+    When one traced function contains two (or more) model forward passes that
+    each emit ``sxstage_iter(stage=0..n-1)`` -- e.g. a *folded* distillation
+    step that runs the frozen teacher and the trainable student inside the same
+    scheduled loss -- the raw equation order is
+    ``[teacher stage 0..n-1, student stage 0..n-1, loss]`` and the
+    position-based clusterer would emit ``2n + 1`` pipeline stages instead of
+    ``n + 1``.
+
+    This pass recognises the repeated ``stage=`` annotations and rebuilds the
+    jaxpr so the two flows interleave per logical stage:
+
+    * Every equation is assigned a data-flow stage index -- an ordinary
+      equation inherits ``max(stage of its Var inputs)``; an ``sxstage_iter``
+      marker takes its declared ``stage=`` and its outputs become ``stage + 1``;
+      the jaxpr's invars/constvars are stage ``0``.
+    * Equations are stably re-sorted by ``(stage, is_marker, original_index)``
+      so each flow's stage-``K`` body becomes adjacent and the per-flow
+      stage-``K`` markers form one contiguous run at the end of that block.
+    * Each run of consecutive same-stage markers is fused into a single
+      ``sxstage_iter_p`` equation whose invars/outvars are the concatenation of
+      every per-flow activation crossing that boundary (so the runtime
+      transports both the teacher and the student activation on that edge).
+
+    The result is an ordinary single-flow jaxpr with exactly ``n`` markers that
+    the rest of the MPMD compiler -- :func:`cluster_jaxpr_by_markers`,
+    :func:`marker_edge_shardings`, the pscan planner -- handles unchanged.
+
+    Single-flow jaxprs are returned untouched: this is a no-op unless the
+    ``stage=`` parameters contain a repeat (and every marker carries an integer
+    ``stage=``). Jaxprs that use :func:`sxstage_region` spans are also returned
+    unchanged.
+
+    Args:
+        jaxpr: The traced loss/forward :class:`Jaxpr`.
+
+    Returns:
+        Either ``jaxpr`` unchanged, or an equivalent jaxpr with the multi-flow
+        markers reordered and fused.
+    """
+    eqns = list(jaxpr.eqns)
+    n_eqns = len(eqns)
+    marker_idxs = [i for i, e in enumerate(eqns) if e.primitive is sxstage_iter_p]
+    if len(marker_idxs) < 2:
+        return jaxpr
+    if _stage_region_spans(jaxpr):
+        return jaxpr
+    raw_stage_params = [eqns[i].params.get("stage") for i in marker_idxs]
+    if any(s is None for s in raw_stage_params):
+        return jaxpr
+    try:
+        stage_of_marker_idx = {idx: int(s) for idx, s in zip(marker_idxs, raw_stage_params, strict=False)}
+    except (TypeError, ValueError):
+        return jaxpr
+    stage_values = list(stage_of_marker_idx.values())
+    if len(set(stage_values)) == len(stage_values):
+        return jaxpr  # already a single, distinct-stage flow -- nothing to merge
+
+    constvar_ids = {id(v) for v in jaxpr.constvars if isinstance(v, Var)}
+    var_stage: dict[int, int] = {}
+    for v in (*jaxpr.invars, *jaxpr.constvars):
+        if isinstance(v, Var):
+            var_stage[id(v)] = 0
+    const_derived_ids: set[int] = set(constvar_ids)
+    consumers_by_var_id: dict[int, list[int]] = {}
+    eqn_stage = [0] * n_eqns
+    const_pure = [False] * n_eqns
+    is_marker = [e.primitive is sxstage_iter_p for e in eqns]
+    for i, eqn in enumerate(eqns):
+        for v in eqn.invars:
+            if isinstance(v, Var):
+                consumers_by_var_id.setdefault(id(v), []).append(i)
+        if i in stage_of_marker_idx:
+            s = stage_of_marker_idx[i]
+            out_s = s + 1
+        else:
+            in_stages = [var_stage[id(v)] for v in eqn.invars if isinstance(v, Var) and id(v) in var_stage]
+            s = max(in_stages) if in_stages else 0
+            out_s = s
+            pure = not getattr(eqn, "effects", core.no_effects) and all(
+                (not isinstance(v, Var)) or id(v) in const_derived_ids for v in eqn.invars
+            )
+            const_pure[i] = pure
+            if pure:
+                for ov in eqn.outvars:
+                    if isinstance(ov, Var):
+                        const_derived_ids.add(id(ov))
+        eqn_stage[i] = s
+        for ov in eqn.outvars:
+            if isinstance(ov, Var):
+                var_stage[id(ov)] = out_s
+
+    max_stage = max(stage_values)
+    terminal_stage = max_stage + 1
+    jaxpr_outvar_ids = {id(v) for v in jaxpr.outvars if isinstance(v, Var)}
+    for i in range(n_eqns - 1, -1, -1):  # reverse: consumers resolved before producers
+        if not const_pure[i]:
+            continue
+        candidates: list[int] = []
+        for ov in eqns[i].outvars:
+            if not isinstance(ov, Var):
+                continue
+            if id(ov) in jaxpr_outvar_ids:
+                candidates.append(terminal_stage)
+            for c in consumers_by_var_id.get(id(ov), ()):
+                candidates.append(eqn_stage[c])
+        if candidates:
+            eqn_stage[i] = min(candidates)
+        # else: dead const-pure eqn -- leave at stage 0; _prune_stage_jaxpr drops it.
+
+    order = sorted(range(n_eqns), key=lambda i: (eqn_stage[i], 1 if is_marker[i] else 0, i))
+    reordered = [eqns[i] for i in order]
+
+    # -- fuse runs of consecutive same-stage markers -------------------------
+    new_eqns: list[JaxprEqn] = []
+    mixed_sharding_warned = False
+    j = 0
+    while j < len(reordered):
+        eqn = reordered[j]
+        if eqn.primitive is not sxstage_iter_p:
+            new_eqns.append(eqn)
+            j += 1
+            continue
+        run_stage = int(eqn.params.get("stage"))
+        run = [eqn]
+        k = j + 1
+        while (
+            k < len(reordered)
+            and reordered[k].primitive is sxstage_iter_p
+            and int(reordered[k].params.get("stage")) == run_stage
+        ):
+            run.append(reordered[k])
+            k += 1
+        if len(run) == 1:
+            new_eqns.append(eqn)
+            j = k
+            continue
+        fused_invars: list = []
+        fused_outvars: list = []
+        for m in run:
+            fused_invars.extend(m.invars)
+            fused_outvars.extend(m.outvars)
+        run_shardings = [m.params.get("sharding") for m in run if m.params.get("sharding") is not None]
+        if len(set(run_shardings)) > 1 and not mixed_sharding_warned:
+            logger.warning(
+                "SpectraX MPMD: folded flows declare differing sxstage_iter edge shardings at "
+                "stage %s (%r); using the first.",
+                run_stage,
+                run_shardings[0],
+            )
+            mixed_sharding_warned = True
+        fused_params = dict(eqn.params)
+        fused_params["sharding"] = run_shardings[0] if run_shardings else None
+        fused_params["treedef"] = jax.tree_util.tree_structure(list(range(len(fused_invars))))
+        new_eqns.append(eqn.replace(invars=fused_invars, outvars=fused_outvars, params=fused_params))
+        j = k
+
+    n_markers_after = sum(1 for e in new_eqns if e.primitive is sxstage_iter_p)
+    try:
+        _proc = jax.process_index()
+    except Exception:
+        _proc = 0
+    if _proc == 0:
+        logger.info(
+            "SpectraX MPMD: folded marker layout normalized -- %d raw sxstage_iter markers across "
+            "%d flow(s) collapsed to %d pipeline-stage boundaries.",
+            len(marker_idxs),
+            len(marker_idxs) // max(1, len(set(stage_values))),
+            n_markers_after,
+        )
+    return Jaxpr(
+        constvars=list(jaxpr.constvars),
+        invars=list(jaxpr.invars),
+        outvars=list(jaxpr.outvars),
+        eqns=new_eqns,
+        effects=jaxpr.effects,
+        debug_info=jaxpr.debug_info,
+    )
+
+
 def cluster_jaxpr_by_markers(
     jaxpr: Jaxpr,
     *,

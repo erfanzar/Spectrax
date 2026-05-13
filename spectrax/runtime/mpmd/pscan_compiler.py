@@ -66,7 +66,12 @@ from ..schedules import (
     fuse_zerobubble_bwd_pair,
 )
 from ..types.mesh import MpMdMesh
-from .markers import cluster_jaxpr_by_markers, marker_edge_shardings, sxstage_iter_p
+from .markers import (
+    _normalize_marker_flows,
+    cluster_jaxpr_by_markers,
+    marker_edge_shardings,
+    sxstage_iter_p,
+)
 from .treduce import Op, _unwrap_ops, _unwrap_schedule, pscan_p
 
 __all__ = [
@@ -816,9 +821,7 @@ def _make_bwd_i_jit(
     if invar_grad_mask is None:
         invar_grad_mask = (True,) * n_invars
     elif len(invar_grad_mask) != n_invars:
-        raise ValueError(
-            f"bwd_i invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}."
-        )
+        raise ValueError(f"bwd_i invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}.")
     active_invar_positions = tuple(i for i, active in enumerate(invar_grad_mask) if active)
 
     def bwd_i(consts: tuple[object, ...], *invars_and_cotangents: object) -> tuple[object, ...]:
@@ -906,9 +909,7 @@ def _make_bwd_w_jit(
     if invar_grad_mask is None:
         invar_grad_mask = (False,) * n_invars
     elif len(invar_grad_mask) != n_invars:
-        raise ValueError(
-            f"bwd_w invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}."
-        )
+        raise ValueError(f"bwd_w invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}.")
     active_invar_positions = tuple(i for i, active in enumerate(invar_grad_mask) if active)
 
     def bwd_w(consts: tuple[object, ...], *invars_and_cotangents: object) -> object:
@@ -1890,8 +1891,13 @@ def build_pscan_plan(
     n_logical = n * v
     loc_for_logical, logical_for_loc, terminal_loc = _build_logical_locs(schedule, n, v)
 
-    edge_shardings = marker_edge_shardings(loss_closed.jaxpr)
-    clusters = cluster_jaxpr_by_markers(loss_closed.jaxpr)
+    # Folded multi-flow steps (e.g. teacher + student inside one distillation
+    # loss) emit each model's sxstage_iter(stage=0..n-1) sequence; normalize
+    # them into a single coalesced boundary set so the position-based clusterer
+    # below produces n_logical stages instead of (n_flows * n_logical) - ...).
+    loss_jaxpr = _normalize_marker_flows(loss_closed.jaxpr)
+    edge_shardings = marker_edge_shardings(loss_jaxpr)
+    clusters = cluster_jaxpr_by_markers(loss_jaxpr)
     if len(clusters) != n_logical:
         raise ValueError(
             f"pscan body has {len(clusters)} stages "
@@ -1901,7 +1907,7 @@ def build_pscan_plan(
             f"function passed to treduce for {type(schedule).__name__}."
         )
 
-    all_constvars = list(loss_closed.jaxpr.constvars)
+    all_constvars = list(loss_jaxpr.constvars)
     concrete_consts, const_flat_arg_indices = _resolve_concrete_consts(
         outer_jaxpr,
         outer_flat_args,
@@ -1970,11 +1976,11 @@ def build_pscan_plan(
 
     assert terminal_jit is not None
 
-    invar_sources = _build_invar_sources(loss_closed.jaxpr, clusters)
+    invar_sources = _build_invar_sources(loss_jaxpr, clusters)
 
     grid = _build_schedule_grid(schedule, n)
 
-    init_state_template = [ops[0].state(loss_closed.jaxpr.outvars[0].aval)]
+    init_state_template = [ops[0].state(loss_jaxpr.outvars[0].aval)]
 
     return PscanPlan(
         n=n,

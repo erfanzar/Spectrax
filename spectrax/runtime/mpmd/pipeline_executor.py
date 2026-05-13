@@ -136,6 +136,7 @@ class _MpmdState(tp.TypedDict, total=False):
     out_shardings: PyTree
     result_treedef: PyTree
 
+
 class _MpmdPreparedCallable(tp.Protocol):
     """Forward callable produced by ``sxjit`` with an exposed MPMD plan.
 
@@ -1026,7 +1027,7 @@ class MpmdPipelineExecutor:
                             stage_idx=stage_idx,
                             invar_plan=invar_plan,
                         ),
-                )
+                    )
                 else:
                     invars = build_stage_invars()
                     with jax.named_scope(f"spectrax/mpmd/pipeline/microbatch_{mb_idx}/stage_{stage_idx}/execute"):
@@ -1641,9 +1642,7 @@ class MpmdPipelineExecutor:
             with optional ``out_shardings`` applied by Spectrax's normal rules.
         """
         required_stages = {
-            int(mapping[0])
-            for mapping in call.state["fn_outvar_map"]
-            if mapping and isinstance(mapping[0], int)
+            int(mapping[0]) for mapping in call.state["fn_outvar_map"] if mapping and isinstance(mapping[0], int)
         }
         ready_outputs: list[StageOutputs] = []
         for stage_idx, value in enumerate(outputs):

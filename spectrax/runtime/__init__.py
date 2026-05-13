@@ -54,6 +54,7 @@ from .mpmd import (
     sxstage_iter,
     sxstage_region,
     sxvalue_and_grad,
+    sxvalue_and_grad_and_apply,
 )
 from .schedules import (
     Action,
@@ -102,4 +103,5 @@ __all__ = (
     "sxstage_iter",
     "sxstage_region",
     "sxvalue_and_grad",
+    "sxvalue_and_grad_and_apply",
 )

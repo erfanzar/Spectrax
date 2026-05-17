@@ -1080,9 +1080,8 @@ def _state_unflatten(aux: _StateAux, children: tuple[object, ...]) -> State:
     for collection, _path in aux:
         if collection not in collection_order:
             collection_order.append(collection)
-    if (
-        len(children) == len(collection_order)
-        and all(isinstance(collection_tree, _KeyedSubtree) for collection_tree in children)
+    if len(children) == len(collection_order) and all(
+        isinstance(collection_tree, _KeyedSubtree) for collection_tree in children
     ):
         return State._from_raw(
             {

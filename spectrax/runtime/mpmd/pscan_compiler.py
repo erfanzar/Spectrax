@@ -45,6 +45,7 @@ from typing import cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax._src import compilation_cache as _jax_compilation_cache
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Var
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -715,6 +716,7 @@ def _make_bwd_jit(
     donate_argnums: tuple[int, ...] = (),
     out_shardings: object | None = None,
     stage_mesh: object | None = None,
+    invar_grad_mask: tuple[bool, ...] | None = None,
 ) -> Callable[..., tuple[object, tuple[object, ...]]]:
     """Return ``@jax.jit`` VJP callable for a non-terminal cluster.
 
@@ -737,6 +739,12 @@ def _make_bwd_jit(
     if stage_mesh is not None:
         cluster_jaxpr = _rebase_jaxpr_mesh_params(cluster_jaxpr, stage_mesh)
 
+    if invar_grad_mask is None:
+        invar_grad_mask = (True,) * n_invars
+    elif len(invar_grad_mask) != n_invars:
+        raise ValueError(f"bwd invar_grad_mask length {len(invar_grad_mask)} does not match n_invars={n_invars}.")
+    active_invar_positions = tuple(i for i, active in enumerate(invar_grad_mask) if active)
+
     def bwd(consts: tuple[object, ...], *invars_and_cotangents: object) -> tuple[object, tuple[object, ...]]:
         """Run ``jax.vjp`` on the cluster and return ``(g_consts, g_invars)``.
 
@@ -758,8 +766,9 @@ def _make_bwd_jit(
         with jax.named_scope("spectrax/mpmd/schedule/stage_backward"):
             invars = invars_and_cotangents[:n_invars]
             cotangents = invars_and_cotangents[n_invars:]
+            active_invars = tuple(invars[i] for i in active_invar_positions)
 
-            def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
+            def pure(c: tuple[object, ...], *active_xs: object) -> tuple[object, ...]:
                 """Closed-over jaxpr evaluator with ``consts`` as the first VJP argument.
 
                 Args:
@@ -770,12 +779,17 @@ def _make_bwd_jit(
                     Result described by this helper.
                 """
                 with jax.named_scope("spectrax/mpmd/schedule/stage_backward/pure_forward"):
+                    xs = list(invars)
+                    for pos, value in zip(active_invar_positions, active_xs, strict=True):
+                        xs[pos] = value
                     return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
 
-            _, vjp_fn = jax.vjp(pure, consts, *invars)
+            _, vjp_fn = jax.vjp(pure, consts, *active_invars)
             grads = vjp_fn(tuple(cotangents))
             g_consts = grads[0]
-            g_invars = tuple(grads[1:])
+            active_grads = grads[1:]
+            active_by_pos = dict(zip(active_invar_positions, active_grads, strict=True))
+            g_invars = tuple(active_by_pos.get(i) for i in range(n_invars))
             return g_consts, g_invars
 
     jit_kwargs: dict[str, object] = {}
@@ -1685,21 +1699,44 @@ def _materialize_cotangents(
         A complete cotangent tuple aligned with ``outputs``.
     """
     if partial is None:
-        return tuple(jnp.zeros_like(out) for out in outputs)
+        return tuple(_zero_cotangent_like(out) for out in outputs)
     full: list[object] = []
     for slot, out in zip(partial, outputs, strict=True):
-        result = getattr(slot, "result", None)
-        if callable(result):
-            slot = result()
         if slot is None:
-            full.append(jnp.zeros_like(out))
+            full.append(_zero_cotangent_like(out))
         elif getattr(slot, "dtype", None) == jax.dtypes.float0:
-            full.append(slot)
-        elif hasattr(slot, "astype") and hasattr(out, "dtype") and getattr(slot, "dtype", None) != out.dtype:
-            full.append(slot.astype(out.dtype))
+            full.append(_zero_cotangent_like(out))
+        elif not _has_inexact_dtype(out):
+            full.append(_zero_cotangent_like(out))
         else:
-            full.append(slot)
+            result = getattr(slot, "result", None)
+            if callable(result):
+                slot = result()
+            if slot is None:
+                full.append(_zero_cotangent_like(out))
+            elif getattr(slot, "dtype", None) == jax.dtypes.float0:
+                full.append(_zero_cotangent_like(out))
+            elif hasattr(slot, "astype") and hasattr(out, "dtype") and getattr(slot, "dtype", None) != out.dtype:
+                full.append(slot.astype(out.dtype))
+            else:
+                full.append(slot)
     return tuple(full)
+
+
+def _has_inexact_dtype(value: object) -> bool:
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        return False
+    try:
+        return bool(jnp.issubdtype(jnp.dtype(dtype), jnp.inexact))
+    except TypeError:
+        return False
+
+
+def _zero_cotangent_like(value: object) -> object:
+    if not _has_inexact_dtype(value):
+        return np.zeros(getattr(value, "shape", ()), dtype=np.dtype(getattr(value, "dtype", np.float32)))
+    return jnp.zeros_like(value)
 
 
 def _cast_cotangent_like(cotangent: object, primal: object) -> object:

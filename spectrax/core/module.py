@@ -1508,9 +1508,8 @@ def _module_unflatten(aux: _ModuleAux, leaves: object) -> Module:
     for collection, _path in aux.leaf_spec:
         if collection not in collection_order:
             collection_order.append(collection)
-    if (
-        len(leaves) == len(collection_order)
-        and all(isinstance(collection_tree, _KeyedSubtree) for collection_tree in leaves)
+    if len(leaves) == len(collection_order) and all(
+        isinstance(collection_tree, _KeyedSubtree) for collection_tree in leaves
     ):
         for collection, collection_tree in zip(collection_order, leaves, strict=True):
             if isinstance(collection_tree, _KeyedSubtree):

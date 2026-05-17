@@ -102,7 +102,6 @@ class InterleavedH1(Schedule):
         * ``"loop"``: zig-zag layout that flips direction every
           virtual chunk so adjacent logical stages share a rank when
           possible — good middle ground.
-
         Args:
             rank: Physical rank index.
             virt: Virtual-stage index on this rank.
@@ -740,10 +739,15 @@ class KimiK2(InterleavedH1):
 
     Attributes:
         virtual_stages: Virtual stages per physical rank (vp).
+        stage_layout: Logical-to-physical layout. Defaults to
+            ``"contiguous"`` for KimiK2 because the measured TPU v5p
+            MPMD path is transfer-sensitive and this layout keeps
+            adjacent virtual stages local more often.
         extra_warmup: Additional per-logical-stage forward warmup.
         split_backward: Emit ``BWD_I``/``BWD_W`` instead of full ``BWD``.
     """
 
+    stage_layout: Literal["contiguous", "interleaved", "loop"] = "contiguous"
     extra_warmup: int = 1
     split_backward: bool = False
 

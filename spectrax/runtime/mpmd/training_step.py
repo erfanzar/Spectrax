@@ -156,12 +156,14 @@ def sxvalue_and_grad_and_apply(
         n_rank = int(plan.get("n", 0))
         plan["apply_jits"] = {(rank, 0): True for rank in range(n_rank)}
         plan["apply_context"] = apply_context
+        plan["apply_requires_all_grads"] = bool(apply_context_extras.get("apply_requires_all_grads", False))
 
         try:
             loss, grads_flat = _dispatch_schedule_faithful(plan, args, return_loss=True)
         finally:
             plan.pop("apply_context", None)
             plan.pop("apply_jits", None)
+            plan.pop("apply_requires_all_grads", None)
 
         leaf_ranges = _arg_leaf_ranges(args)
         grads_for_log: list[object] = []

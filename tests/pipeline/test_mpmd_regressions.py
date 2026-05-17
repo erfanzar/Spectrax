@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +54,74 @@ class _FwdOnly(Schedule):
     def peak_activations(self, n_stages: int) -> int:
         """Peak activation helper."""
         return self.microbatches
+
+
+def _runtime_source_ast() -> ast.Module:
+    """Parse the local MPMD runtime source without importing private helpers."""
+    root = Path(__file__).resolve().parents[2]
+    return ast.parse((root / "spectrax/runtime/mpmd/runtime.py").read_text())
+
+
+def _find_function(root: ast.AST, name: str) -> ast.FunctionDef:
+    """Find a function definition by name in an AST tree."""
+    for node in ast.walk(root):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"function {name!r} was not found")
+
+
+def _default_name_bindings(fn: ast.FunctionDef) -> dict[str, str]:
+    """Return ``argument_name -> default_name`` for simple name defaults."""
+    args = fn.args.posonlyargs + fn.args.args
+    defaults = fn.args.defaults
+    defaulted_args = args[len(args) - len(defaults) :]
+    return {
+        arg.arg: default.id
+        for arg, default in zip(defaulted_args, defaults, strict=True)
+        if isinstance(default, ast.Name)
+    }
+
+
+def _loaded_names_in_body(fn: ast.FunctionDef) -> set[str]:
+    """Collect names loaded by a function body, excluding argument defaults."""
+    names: set[str] = set()
+    for statement in fn.body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+    return names
+
+
+def test_routed_transport_closures_bind_current_hop_values():
+    """Async routed transfers must not late-bind loop values from a later hop/source."""
+    module = _runtime_source_ast()
+    routed = _find_function(module, "_routed_stage_edge_transport")
+    move_one_hop = _find_function(routed, "move_one_hop")
+
+    assert {
+        "transfer_value": "current",
+        "transfer_target": "target",
+        "transfer_task_name": "hop_task_name",
+        "transfer_src_rank": "current_rank",
+        "transfer_dst_rank": "hop_rank",
+    }.items() <= _default_name_bindings(move_one_hop).items()
+    assert not ({"current", "target", "hop_task_name", "current_rank", "hop_rank"} & _loaded_names_in_body(move_one_hop))
+
+    collect_fwd_invars = _find_function(module, "_collect_fwd_invars")
+    do_transfer = next(
+        fn
+        for fn in ast.walk(collect_fwd_invars)
+        if isinstance(fn, ast.FunctionDef)
+        and fn.name == "do_transfer"
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_routed_stage_edge_transport"
+            for call in ast.walk(fn)
+        )
+    )
+    assert _default_name_bindings(do_transfer)["producer_key_for_transfer"] == "producer_key"
+    assert "producer_key" not in _loaded_names_in_body(do_transfer)
 
 
 def test_infer_schedule_static_argnums_keeps_plain_arrays_dynamic():

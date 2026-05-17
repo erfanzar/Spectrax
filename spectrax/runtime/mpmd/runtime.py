@@ -77,13 +77,14 @@ threads stay independent.
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
 import contextvars
 import functools
 import math
+import os
+import re
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -97,11 +98,10 @@ from jax.extend.core import Literal as JaxLiteral
 
 from ..._internal.logging import get_logger
 from ...core._weakcache import weak_invalidate
-from ...core.graph import bind, export, live_variables
+from ...core.graph import GraphDef, VarNode, export, live_variables
 from ...core.module import Module
 from ...core.stage_assignment import metadata_stage_assignment, resolve_stage_rank
 from ...core.state import State
-from ...core.variable import Variable
 from ...nn.pipeline_sequential import PipelineSequential
 from ...sharding.partition import get_named_sharding, sanitize_partition_spec_for_mesh_and_shape
 from ..primitives.split import auto_split
@@ -115,6 +115,15 @@ from ..schedules import (
 )
 from ..types.array import StagesArray
 from ..types.mesh import MpMdMesh, resolve_mpmd_mesh
+from .grad_core import (
+    _accumulate_grad_tree_donate,
+    _accumulate_state,
+    _get_fused_fwd_bwd_jit,
+    _get_loss_and_g_y,
+    _scale_grad_tree,
+    _scale_state,
+    _zeros_like_state,
+)
 from .markers import (
     _normalize_marker_flows,
     cluster_jaxpr_by_markers,
@@ -124,6 +133,7 @@ from .markers import (
     sxstage_iter,
     sxstage_iter_p,
 )
+from .profiling import _active_profiler, _time_call, collect_task_times_ms
 from .pscan_compiler import (
     _build_invar_sources,
     _build_logical_locs,
@@ -144,6 +154,63 @@ from .pscan_compiler import (
     dispatch_pscan,
     has_pscan,
 )
+from .schedule_types import _ScheduleStatsCollector, _ScheduleUnit
+from .schedule_units import (
+    _build_schedule_unit_dependencies,
+    _build_schedule_units_from_plan,
+    _dependency_topological_schedule_units,
+)
+from .stage_callables import _build_stage_callables
+from .transport.inspection import (
+    _addressable_shard_nbytes,
+    _array_device_set,
+    _array_payload,
+    _device_id_preview,
+    _device_id_tuple,
+    _index_key,
+    _index_shape,
+    _leading_index_axis_start,
+    _mesh_axis_names,
+    _mesh_device_id_grid,
+    _mesh_shape_key,
+    _ordered_sharding_index_abi,
+    _same_dtype,
+    _same_index_sharding_abi,
+    _same_sharding,
+    _sharding_device_set,
+    _sharding_mesh_signature,
+    _target_shard_nbytes,
+    _target_shard_nbytes_for_shape_dtype,
+    _tree_nbytes,
+    _value_sharding,
+)
+from .transport_gate import (
+    _ORDERED_SCHEDULE_TRANSPORT_GATE,
+    _ORDERED_SCHEDULE_TRANSPORT_SLOT,
+    _ordered_schedule_transport_scope,
+    _OrderedScheduleTransportGate,
+)
+from .utils.microbatch import (
+    _flatten_microbatch_stack,
+    _has_microbatch_axis,
+    _microbatch,
+    _microbatch_sample,
+    _named_sharding_with_memory_kind,
+)
+from .utils.sharding import (
+    _spec_axis_factors,
+    _spec_axis_shape_mismatches,
+    _stage_axis_size,
+    _trim_trailing_replicated_stage_axes,
+)
+from .utils.tree import (
+    _add_grad,
+    _cast_cotangent_like,
+    _delete_if_possible,
+    _is_float0,
+    _is_leaf,
+    _scale_grad,
+)
 
 logger = get_logger("MPMD-Runtime")
 
@@ -153,8 +220,6 @@ if TYPE_CHECKING:
 
 __all__ = ["collect_task_times_ms", "sxcall", "sxgrad", "sxjit", "sxvalue_and_grad"]
 
-_PROFILER_STATE = threading.local()
-_STAGE_CALLABLE_CACHE: dict[int, tuple[Callable[..., object], Callable[..., object]]] = {}
 _MPMD_SETUP_CACHE: dict[
     tuple[int, int, int],
     tuple[
@@ -169,10 +234,6 @@ _MPMD_SETUP_CACHE: dict[
 _INV_M_CACHE: dict[tuple[int, int], jax.Array] = {}
 _GPIPE_VMAP_CACHE: dict[int, tuple[Callable[..., object], Callable[..., object]]] = {}
 _GPIPE_TERM_CACHE: dict[tuple[int, int, str], Callable[..., object]] = {}
-_VMAP_LOSS_CACHE: dict[int, Callable[..., object]] = {}
-_FUSED_FWDBWD_CACHE: dict[tuple[int, int], Callable[..., object]] = {}
-_SCHEDULE_FUSED_FWDBWD_CACHE: dict[tuple[int, ...], Callable[..., object]] = {}
-_SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE: dict[tuple[int, int], Callable[..., object]] = {}
 _TRANSFER_SHARDING_DECISION_CACHE: dict[tuple[object, object, tuple[int, ...] | None], bool] = {}
 _RESHARD_IDENTITY_CACHE: dict[tuple[object, ...], Callable[..., object]] = {}
 _PAIR_TRANSPORT_FN_CACHE: dict[tuple[object, ...], Callable[[object], object]] = {}
@@ -181,7 +242,9 @@ _PAIR_TRANSPORT_DUMMY_BUFFER_CACHE: dict[tuple[object, ...], object] = {}
 _TRANSFER_SHARDING_DECISION_LOCK = threading.Lock()
 _RESHARD_IDENTITY_CACHE_LOCK = threading.Lock()
 _PAIR_TRANSPORT_CACHE_LOCK = threading.Lock()
-_LOSS_JIT_CACHE: dict[int, Callable[..., object]] = {}
+_TRANSPORT_PROGRESS_LOCK = threading.Lock()
+_GRAD_ADD_FN_CACHE: dict[tuple[object, ...], Callable[[object, object], object]] = {}
+_GRAD_ADD_FN_CACHE_LOCK = threading.Lock()
 _MPMD_CALL_NORMALIZED_CACHE: dict[tuple[int, int], PipelineSequential] = {}
 _FWD_ONLY_VMAP_CACHE: dict[int, Callable[..., object]] = {}
 _SXCALL_SCHEDULED_TRAIN_CACHE: dict[tuple[object, ...], Callable[..., object]] = {}
@@ -196,388 +259,86 @@ _STATIC_ARG_PLACEMENT_DIAGNOSTICS: dict[str, int] = {
 _STATIC_ARG_PATHS: dict[int, str] = {}
 _VIRTUAL_FORWARD_DIAGNOSTICS: dict[str, int] = {"logged": 0}
 _TRANSPORT_DIAGNOSTICS: dict[str, int] = {"logged": 0}
+_TRANSPORT_PROGRESS_DIAGNOSTICS: dict[str, int] = {"logged": 0}
 _SCHEDULE_TRANSPORT_DIAGNOSTICS: dict[str, int] = {"ordered_dispatch_logged": 0}
+_ENABLE_FOCUSED_MPMD_DEBUG = False
+_ALL_PROCESS_DEBUG_LOCK = threading.Lock()
+_ALL_PROCESS_DEBUG_COUNTS: dict[str, int] = {}
+_ALL_PROCESS_DEBUG_EVENTS = frozenset(
+    {
+        "warm-compile-skip",
+        "stage-call-error",
+        "det-unit-error",
+        "transport-error",
+    }
+)
 _ScheduleStageKey = tuple[int, int] | tuple[int, int, int]
 _ScheduleJitMap = dict[_ScheduleStageKey, Callable[..., object] | None]
 
 
-@dataclass(frozen=True)
-class _ApplyPayload:
-    """Payload for an APPLY unit (per-rank optimizer-apply step).
+def _all_process_debug_print(event: str, *, max_per_process: int = 512, **fields: object) -> None:
+    """Emit a bounded process-local diagnostic with normal print.
 
-    APPLY is a *runtime* concept, not a schedule concept -- the schedule
-    grid never contains APPLY entries. ``_build_schedule_units_from_plan``
-    synthesizes one APPLY unit per ``(rank, virt)`` at the end of the unit
-    list when the plan has compiled apply jits (see ``apply_jits`` in the
-    plan dict). Each APPLY unit depends on every backward unit on its rank
-    (so all that rank's local gradients are settled before the optimizer
-    update fires), and is independent of backward work on other ranks --
-    that's where the overlap with the rank-0 bwd tail comes from.
-
-    The payload is intentionally small: the per-rank work (which jit to
-    call, which leaves to update, which submesh) lives in the plan dict
-    and is keyed by ``(rank, virt)`` at dispatch time.
-
-    Attributes:
-        rank: Physical pipeline rank whose stage-local leaves this apply
-            unit updates.
-        virt: Virtual sub-stage on ``rank`` (0 for flat / DualPipeV
-            schedules where apply is per-rank, not per-virtual-stage).
+    The EasyDeL logger is process-0 centric in this environment. These lines are
+    intentionally plain prints so every controller can leave a last-known point
+    before a PJRT/native crash.
     """
+    if event not in _ALL_PROCESS_DEBUG_EVENTS:
+        return
+    with _ALL_PROCESS_DEBUG_LOCK:
+        count = _ALL_PROCESS_DEBUG_COUNTS.get(event, 0)
+        if count >= max_per_process:
+            return
+        _ALL_PROCESS_DEBUG_COUNTS[event] = count + 1
+    try:
+        process_index = jax.process_index()
+        process_count = jax.process_count()
+    except Exception:
+        process_index = -1
+        process_count = -1
 
-    rank: int
-    virt: int
+    def fmt(value: object) -> str:
+        if isinstance(value, jax.Array):
+            return f"jax.Array(shape={tuple(value.shape)}, dtype={value.dtype})"
+        text = repr(value)
+        if len(text) > 240:
+            return text[:237] + "..."
+        return text
 
-
-@dataclass(frozen=True)
-class _ScheduleUnit:
-    """One executable unit in a schedule-driven MPMD dispatch.
-
-    A unit is the smallest granularity the schedule dispatcher fires:
-    either a single :class:`Action` (``kind == "action"``), a fused
-    forward+backward pair (``kind == "fused"``), or an optimizer-apply
-    step (``kind == "apply"``) on a specific physical rank. Units are
-    produced by walking ``schedule.build(n)`` (for fwd/bwd) and then
-    appending one APPLY unit per ``(rank, virt)`` (when the plan has
-    compiled apply jits). They form the nodes of the dependency DAG
-    used by the async dispatcher.
-
-    Attributes:
-        index: Stable global ordering key (insertion order in the unit
-            list). Used as the dependency-graph node id.
-        row: Source row in the schedule grid; mostly diagnostic.
-            APPLY units use a synthetic row at ``len(grid)`` so they
-            sort after every fwd/bwd unit in deterministic dispatch.
-        kind: Either ``"action"`` (a single :class:`Action`),
-            ``"fused"`` (a :class:`FusedTask`), or ``"apply"`` (a
-            stage-local optimizer-apply step).
-        rank: Physical pipeline rank that owns this unit.
-        virt: Virtual sub-stage on ``rank`` (always 0 for flat
-            schedules with ``V == 1``).
-        payload: The underlying :class:`Action`, :class:`FusedTask`, or
-            :class:`_ApplyPayload`.
-        fwd_logical: Logical stage index of the forward half (None for
-            pure-backward and apply units).
-        fwd_mb: Microbatch index of the forward half (None for
-            pure-backward and apply units).
-        bwd_logical: Logical stage index of the backward half (None
-            for pure-forward and apply units).
-        bwd_mb: Microbatch index of the backward half (None for
-            pure-forward and apply units).
-        bwd_phase: Specific backward phase (``Phase.BWD``,
-            ``Phase.BWD_I``, or ``Phase.BWD_W``) or ``None`` for
-            forward-only and apply units.
-    """
-
-    index: int
-    row: int
-    kind: Literal["action", "fused", "apply"]
-    rank: int
-    virt: int
-    payload: object
-    fwd_logical: int | None
-    fwd_mb: int | None
-    bwd_logical: int | None
-    bwd_mb: int | None
-    bwd_phase: Phase | None
+    payload = " ".join(f"{key}={fmt(value)}" for key, value in sorted(fields.items()))
+    print(
+        f"SPX_MPMD_ALLPROC event={event} proc={process_index}/{process_count} pid={os.getpid()} {payload}",
+        flush=True,
+    )
 
 
-class _ScheduleStatsCollector:
-    """Non-blocking schedule runtime counters.
+def _fwd_output_transfer_task_name(*, producer_logical: int, dst_rank: int, output_index: int, mb: int) -> str:
+    """Stable ordered-gate name for a shared forward-boundary output transfer."""
+    return f"transfer_fwd_stage{producer_logical}_to_rank{dst_rank}_out{output_index}_mb{mb}"
 
-    Timings are host enqueue durations, not device completion times. They are
-    useful for launch/dispatch critical-path analysis without adding per-task
-    ``block_until_ready`` calls.
-    """
 
-    def __init__(
-        self,
-        *,
-        dispatcher: str,
-        unit_count: int | None = None,
-        action_count: int | None = None,
-        fused_count: int | None = None,
-        window_count: int | None = None,
-        fallback_reason: str | None = None,
-        terminal_logical: int | None = None,
-        eager_terminal_bwd: bool = False,
-    ) -> None:
-        """Initialize an empty stats collector for one ``sxcall`` invocation.
+def _bwd_cotangent_transfer_task_name(
+    *,
+    phase_label: str,
+    consumer_logical: int,
+    producer_logical: int,
+    output_index: int,
+    mb: int,
+) -> str:
+    """Stable ordered-gate name for one backward cotangent boundary transfer."""
+    return f"transfer_{phase_label}_stage{consumer_logical}_to_stage{producer_logical}_out{output_index}_mb{mb}"
 
-        Args:
-            dispatcher: Tag identifying which scheduler path produced
-                the units (e.g. ``"async"``, ``"sequential"``,
-                ``"gpipe-vmap"``). Reported back in :meth:`as_dict` so
-                downstream tooling can attribute timings.
-            unit_count: Optional total number of schedule units
-                planned. Reported as-is for sanity checking.
-            action_count: Optional count of plain (non-fused) actions
-                in the schedule.
-            fused_count: Optional count of fwd+bwd fused units.
-            window_count: Optional count of dependency windows the
-                async dispatcher planned.
-            fallback_reason: Optional human-readable string explaining
-                why a faster path (e.g. GPipe vmap) was *not* taken.
-                ``None`` when the fast path was used.
-        """
-        self.dispatcher = dispatcher
-        self.unit_count = unit_count
-        self.action_count = action_count
-        self.fused_count = fused_count
-        self.window_count = window_count
-        self.fallback_reason = fallback_reason
-        self.terminal_logical = terminal_logical
-        self.eager_terminal_bwd = bool(eager_terminal_bwd)
-        self.transfer_count = 0
-        self.transfer_skipped_count = 0
-        self.transfer_cache_hit_count = 0
-        self.transfer_bytes = 0
-        self.transfer_edges: dict[str, dict[str, int]] = {}
-        self.per_rank_launch_count: dict[int, int] = {}
-        self.per_rank_launch_enqueue_ms: dict[int, float] = {}
-        self.per_rank_enqueue_ms: dict[int, float] = {}
-        self.unit_enqueue_ms: dict[int, float] = {}
-        self.lock = threading.Lock()
 
-    def record_launch(self, rank: int, elapsed_ms: float) -> None:
-        """Increment the launch (top-level dispatch) counter for one rank.
+def _stage_local_grad_accum_task_name(*, logical: int, mb: int, phase: Phase | None = None) -> str:
+    """Stable ordered-gate name for one stage-local flat-gradient accumulation batch."""
+    if phase is None:
+        return f"stage_local_grads_stage{logical}_mb{mb}"
+    return f"stage_local_grads_stage{logical}_{phase.name.lower()}_mb{mb}"
 
-        Distinct from :meth:`record_unit`: a launch is the wall time
-        spent submitting *all* the rank's units to JAX during this
-        sxcall, while a unit timing is per-individual-unit.
 
-        Args:
-            rank: Rank value consumed by this operation.
-            elapsed_ms: Elapsed ms value consumed by this operation.
-        """
-        with self.lock:
-            self.per_rank_launch_count[rank] = self.per_rank_launch_count.get(rank, 0) + 1
-            self.per_rank_launch_enqueue_ms[rank] = self.per_rank_launch_enqueue_ms.get(rank, 0.0) + elapsed_ms
-
-    def record_unit(self, unit_index: int, rank: int, elapsed_ms: float) -> None:
-        """Record the host enqueue time for one schedule unit.
-
-        ``elapsed_ms`` is the wall time spent in Python+XLA dispatch
-                for this unit; it does *not* include device execution. Used
-        to find dispatch hot-spots.
-
-        Args:
-            unit_index: Unit index value consumed by this operation.
-            rank: Rank value consumed by this operation.
-            elapsed_ms: Elapsed ms value consumed by this operation.
-        """
-        with self.lock:
-            self.unit_enqueue_ms[unit_index] = elapsed_ms
-            self.per_rank_enqueue_ms[rank] = self.per_rank_enqueue_ms.get(rank, 0.0) + elapsed_ms
-
-    def record_transfer(
-        self,
-        *,
-        nbytes: int,
-        skipped: bool,
-        cache_hit: bool,
-        src_rank: int | None,
-        dst_rank: int | None,
-    ) -> None:
-        """Record one cross-rank transfer (or attempted transfer) plus its byte size.
-
-        Tallies counts and bytes both globally and per
-        ``"src->dst"`` edge. ``skipped=True`` means the transfer was
-        elided (e.g. source and target sharding already matched);
-        ``cache_hit=True`` means a sharding-decision cache lookup
-        was reused. Both flags are also tracked separately so the
-        downstream dashboard can show "% skipped".
-
-        Args:
-            nbytes: Nbytes value consumed by this operation.
-            skipped: Skipped value consumed by this operation.
-            cache_hit: Cache hit value consumed by this operation.
-            src_rank: Src rank value consumed by this operation.
-            dst_rank: Dst rank value consumed by this operation.
-        """
-        edge = f"{src_rank if src_rank is not None else '?'}->{dst_rank if dst_rank is not None else '?'}"
-        with self.lock:
-            self.transfer_count += 1
-            self.transfer_bytes += int(nbytes)
-            if skipped:
-                self.transfer_skipped_count += 1
-            if cache_hit:
-                self.transfer_cache_hit_count += 1
-            bucket = self.transfer_edges.setdefault(edge, {"count": 0, "bytes": 0, "skipped": 0})
-            bucket["count"] += 1
-            bucket["bytes"] += int(nbytes)
-            if skipped:
-                bucket["skipped"] += 1
-
-    def as_dict(
-        self, deps: dict[int, set[int]] | None = None, units: list[_ScheduleUnit] | None = None
-    ) -> dict[str, object]:
-        """Render the recorded counters as a JSON-friendly dict.
-
-        Optional ``deps``/``units`` compute a critical-path timing
-        and per-phase / per-rank-phase breakdowns by walking the
-        dependency DAG with memoization: each unit's longest-path
-        finish time is the max over its predecessors' finish times
-        plus its own enqueue time. Without ``deps``/``units`` the
-        result still includes raw counters but no critical path.
-
-        Args:
-            deps: Optional mapping ``unit_index -> {predecessor indices}``.
-            units: Optional list of all units (in any order); needed
-                to look up phase metadata.
-
-        Returns:
-            A nested dict with the schedule's totals, per-rank
-            timings, per-phase timings, and the top-N highest-cost
-            units (capped at 16) sorted by enqueue time.
-        """
-        per_rank_critical_path_ms: dict[int, float] = {}
-        critical_path_ms = 0.0
-        per_phase_enqueue_ms: dict[str, float] = {}
-        per_rank_phase_enqueue_ms: dict[str, float] = {}
-        top_unit_enqueue_ms: list[dict[str, object]] = []
-        total_unit_enqueue_ms = 0.0
-        total_launch_enqueue_ms = 0.0
-        if deps is not None and units is not None:
-            {unit.index: unit for unit in units}
-            memo: dict[int, float] = {}
-
-            def cp(idx: int) -> float:
-                """Memoised critical-path (longest-finish) time for unit ``idx``.
-
-                The critical path of any unit is the maximum critical
-                path of its predecessors plus the unit's own enqueue
-                time. Walking the DAG with memoisation collapses the
-                recursion to ``O(|edges|)`` even when the graph has
-                wide fan-in.
-
-                Args:
-                    idx: Idx value consumed by this operation.
-
-                Returns:
-                    Result described by this helper.
-                """
-                if idx in memo:
-                    return memo[idx]
-                dep_best = max((cp(dep) for dep in deps.get(idx, ())), default=0.0)
-                total = dep_best + self.unit_enqueue_ms.get(idx, 0.0)
-                memo[idx] = total
-                return total
-
-            for unit in units:
-                value = cp(unit.index)
-                critical_path_ms = max(critical_path_ms, value)
-                rank = unit.rank
-                per_rank_critical_path_ms[rank] = max(per_rank_critical_path_ms.get(rank, 0.0), value)
-
-            def unit_phase(unit: _ScheduleUnit) -> str:
-                """Classify a schedule unit by execution phase.
-
-                Returns one of ``"fused"``, ``"fwd"``, the lowercased
-                ``Phase.name`` for backward variants
-                (e.g. ``"bwd"``, ``"bwd_w"``), or ``"unknown"`` if
-                the unit doesn't carry phase metadata.
-
-                Args:
-                    unit: Unit value consumed by this operation.
-
-                Returns:
-                    Result described by this helper.
-                """
-                if unit.kind == "fused":
-                    return unit.kind
-                if (
-                    self.eager_terminal_bwd
-                    and self.terminal_logical is not None
-                    and unit.fwd_logical == self.terminal_logical
-                ):
-                    return "terminal"
-                if unit.fwd_logical is not None:
-                    return "fwd"
-                if unit.bwd_phase is not None:
-                    return unit.bwd_phase.name.lower()
-                return "unknown"
-
-            def unit_label(unit: _ScheduleUnit) -> str:
-                """Render a short human-readable label for one schedule unit.
-
-                Format examples:
-
-                                * ``r1/v0 fwd L2:mb3`` — forward of microbatch 3 on
-                                  logical stage 2 at rank 1, virtual 0.
-                                * ``r0/v0 bwd_w L0:mb1`` — weight-grad backward.
-                                * ``r2/v0 fused L4:fwd_mb0+bwd_mb2`` — paired fused
-                                  task.
-
-                Args:
-                    unit: Unit value consumed by this operation.
-
-                Returns:
-                    Result described by this helper.
-                """
-                phase = unit_phase(unit)
-                loc = f"r{unit.rank}/v{unit.virt}"
-                if unit.kind == "fused":
-                    return f"{loc} fused L{unit.fwd_logical}:fwd_mb{unit.fwd_mb}+L{unit.bwd_logical}:bwd_mb{unit.bwd_mb}"
-                if (
-                    self.eager_terminal_bwd
-                    and self.terminal_logical is not None
-                    and unit.fwd_logical == self.terminal_logical
-                ):
-                    return f"{loc} terminal L{unit.fwd_logical}:fwd+bwd_mb{unit.fwd_mb}"
-                if unit.fwd_logical is not None:
-                    return f"{loc} fwd L{unit.fwd_logical}:mb{unit.fwd_mb}"
-                return f"{loc} {phase} L{unit.bwd_logical}:mb{unit.bwd_mb}"
-
-            for unit in units:
-                elapsed = float(self.unit_enqueue_ms.get(unit.index, 0.0))
-                total_unit_enqueue_ms += elapsed
-                phase = unit_phase(unit)
-                per_phase_enqueue_ms[phase] = per_phase_enqueue_ms.get(phase, 0.0) + elapsed
-                rank_phase = f"r{unit.rank}:{phase}"
-                per_rank_phase_enqueue_ms[rank_phase] = per_rank_phase_enqueue_ms.get(rank_phase, 0.0) + elapsed
-                top_unit_enqueue_ms.append(
-                    {
-                        "index": unit.index,
-                        "row": unit.row,
-                        "rank": unit.rank,
-                        "virt": unit.virt,
-                        "phase": phase,
-                        "fwd_logical": unit.fwd_logical,
-                        "fwd_mb": unit.fwd_mb,
-                        "bwd_logical": unit.bwd_logical,
-                        "bwd_mb": unit.bwd_mb,
-                        "elapsed_ms": round(elapsed, 3),
-                        "label": unit_label(unit),
-                    }
-                )
-            top_unit_enqueue_ms.sort(key=lambda item: item["elapsed_ms"], reverse=True)
-            top_unit_enqueue_ms = top_unit_enqueue_ms[:16]
-        total_launch_enqueue_ms = sum(float(value) for value in self.per_rank_launch_enqueue_ms.values())
-
-        return {
-            "dispatcher": self.dispatcher,
-            "unit_count": self.unit_count,
-            "action_count": self.action_count,
-            "fused_count": self.fused_count,
-            "window_count": self.window_count,
-            "fallback_reason": self.fallback_reason,
-            "transfer_count": self.transfer_count,
-            "transfer_skipped_count": self.transfer_skipped_count,
-            "transfer_cache_hit_count": self.transfer_cache_hit_count,
-            "transfer_bytes": self.transfer_bytes,
-            "transfer_edges": dict(sorted(self.transfer_edges.items())),
-            "total_launch_enqueue_ms": round(total_launch_enqueue_ms, 3),
-            "total_unit_enqueue_ms": round(total_unit_enqueue_ms, 3),
-            "per_rank_launch_count": dict(sorted(self.per_rank_launch_count.items())),
-            "per_rank_launch_enqueue_ms": {k: round(v, 3) for k, v in sorted(self.per_rank_launch_enqueue_ms.items())},
-            "per_rank_enqueue_ms": {k: round(v, 3) for k, v in sorted(self.per_rank_enqueue_ms.items())},
-            "per_phase_enqueue_ms": {k: round(v, 3) for k, v in sorted(per_phase_enqueue_ms.items())},
-            "per_rank_phase_enqueue_ms": {k: round(v, 3) for k, v in sorted(per_rank_phase_enqueue_ms.items())},
-            "top_unit_enqueue_ms": top_unit_enqueue_ms,
-            "per_rank_critical_path_ms": {k: round(v, 3) for k, v in sorted(per_rank_critical_path_ms.items())},
-            "critical_path_ms": round(critical_path_ms, 3),
-        }
+def _apply_task_name(*, rank: int) -> str:
+    """Stable ordered-gate name for one rank-local optimizer apply launch."""
+    return f"stage_apply_rank{rank}"
 
 
 def _arg_leaf_ranges(args: tuple[object, ...]) -> list[tuple[int, int]]:
@@ -833,33 +594,6 @@ def _has_array_leaf(x: object) -> bool:
     )
 
 
-def _has_microbatch_axis(x: object) -> bool:
-    """Return whether ``x`` has a leading axis that can be split.
-
-    Args:
-        x: Input value consumed by the operation.
-
-    Returns:
-        Return whether ``x`` has a leading axis that can be split.
-    """
-    return hasattr(x, "shape") and getattr(x, "ndim", len(getattr(x, "shape", ()))) > 0
-
-
-def _microbatch_sample(x: object, m: int) -> object:
-    """Return microbatch 0 for batch leaves and pass shared leaves through.
-
-    Args:
-        x: Input value consumed by the operation.
-        m: M value consumed by this operation.
-
-    Returns:
-        Return microbatch 0 for batch leaves and pass shared leaves through.
-    """
-    if not _has_microbatch_axis(x):
-        return x
-    return _microbatch(x, m)[0]
-
-
 def _infer_schedule_static_argnums(args: tuple[object, ...]) -> tuple[int, ...]:
     """Infer schedule static args without freezing array batches.
 
@@ -1038,6 +772,61 @@ def _rank_for_exact_submesh_device_set(value: object, rank_submeshes: list[objec
     return None
 
 
+def _collect_graphdefs_from_object(
+    value: object,
+    out: list[GraphDef],
+    seen: set[int],
+    *,
+    depth: int = 0,
+) -> None:
+    """Collect SpectraX graph definitions reachable from a small closure object."""
+    if depth > 5:
+        return
+    obj_id = id(value)
+    if obj_id in seen:
+        return
+    seen.add(obj_id)
+    if isinstance(value, GraphDef):
+        out.append(value)
+        return
+    graphdef = getattr(value, "graphdef", None)
+    if isinstance(graphdef, GraphDef):
+        out.append(graphdef)
+    if isinstance(value, dict):
+        iterable = tuple(value.values())
+    elif isinstance(value, tuple | list | set | frozenset):
+        iterable = tuple(value)
+    else:
+        iterable = ()
+        for attr_name in ("state", "call", "scheduled_call"):
+            child = getattr(value, attr_name, None)
+            if child is not None:
+                _collect_graphdefs_from_object(child, out, seen, depth=depth + 1)
+    for child in iterable:
+        _collect_graphdefs_from_object(child, out, seen, depth=depth + 1)
+
+
+def _collect_graphdefs_from_callable(fn: Callable[..., object]) -> tuple[GraphDef, ...]:
+    """Return graph definitions captured by ``fn``'s closure, if any."""
+    out: list[GraphDef] = []
+    closure = getattr(fn, "__closure__", None) or ()
+    seen: set[int] = set()
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        _collect_graphdefs_from_object(value, out, seen)
+    unique: list[GraphDef] = []
+    seen_graphdefs: set[int] = set()
+    for graphdef in out:
+        if id(graphdef) in seen_graphdefs:
+            continue
+        seen_graphdefs.add(id(graphdef))
+        unique.append(graphdef)
+    return tuple(unique)
+
+
 def _infer_forward_virtual_mapping_from_static_placements(
     args: tuple,
     flat_init: list[object],
@@ -1139,468 +928,6 @@ def _unpack_cluster_plan(
         return stage_jit, submesh, my_sh, next_sharding, invar_map, int(physical_rank)
     stage_jit, submesh, my_sh, next_sharding, invar_map = plan_entry
     return stage_jit, submesh, my_sh, next_sharding, invar_map, default_rank
-
-
-def _array_payload(value: object) -> object:
-    """Return the concrete array carried by an array-like wrapper, if any."""
-    if isinstance(value, jax.Array):
-        return value
-    if isinstance(value, Variable):
-        try:
-            inner = value.value
-            if isinstance(inner, jax.Array):
-                return inner
-        except Exception:
-            return value
-    jax_array = getattr(value, "__jax_array__", None)
-    if callable(jax_array):
-        try:
-            inner = jax_array()
-            if isinstance(inner, jax.Array):
-                return inner
-        except Exception:
-            pass
-    return value
-
-
-def _value_sharding(value: object) -> object:
-    """Return the physical sharding for ``value``'s array payload."""
-    payload = _array_payload(value)
-    sharding = getattr(payload, "sharding", None)
-    return sharding if sharding is not None else getattr(value, "sharding", None)
-
-
-def _device_set_from_sharding(sharding: object) -> set[object] | None:
-    """Return the devices described by a sharding object, if inspectable."""
-    devices = getattr(sharding, "device_set", None)
-    if devices is not None:
-        try:
-            return set(devices() if callable(devices) else devices)
-        except Exception:
-            pass
-    mesh = getattr(sharding, "mesh", None)
-    if mesh is not None:
-        try:
-            return set(mesh.devices.flat)
-        except Exception:
-            return None
-    return None
-
-
-def _array_device_set(value: object) -> set[object] | None:
-    """Return the device set holding ``value``'s shards, or ``None`` when unknown.
-
-    Tries the ``.devices`` attribute on the array (callable on newer
-    JAX, plain attribute on older). Returns ``None`` whenever the
-    object is not a JAX array (Python scalars, ``None``, etc.) or
-    when the attribute access raises.
-
-    Args:
-        value: object value (array or otherwise).
-
-    Returns:
-        A set of :class:`jax.Device` objects or ``None``.
-    """
-    payload = _array_payload(value)
-    devices = getattr(payload, "devices", None)
-    if devices is None:
-        return _device_set_from_sharding(getattr(payload, "sharding", None))
-    try:
-        return set(devices() if callable(devices) else devices)
-    except Exception:
-        return _device_set_from_sharding(getattr(payload, "sharding", None))
-
-
-def _device_id_tuple(devices: set[object] | None) -> tuple[int, ...] | None:
-    """Return a sorted tuple of integer device IDs (or ``None``).
-
-    Used as a stable, hashable key for sharding-decision caches —
-    ``set`` itself is not hashable, and device objects don't always
-    sort by their natural ``__lt__``.
-
-    Args:
-        devices: Device collection used to construct or inspect a mesh.
-
-    Returns:
-        Return a sorted tuple of integer device IDs (or ``None``).
-    """
-    if devices is None:
-        return None
-    return tuple(sorted(int(getattr(device, "id", idx)) for idx, device in enumerate(devices)))
-
-
-def _sharding_device_set(sharding: object) -> set[object] | None:
-    """Return the device set backing a sharding spec, or ``None``.
-
-    Tries the spec's ``device_set`` attribute first (callable or
-    direct), then falls back to flattening the spec's ``mesh.devices``.
-    Used to compare two shardings for "same physical placement"
-    independent of axis layout.
-
-    Args:
-        sharding: JAX sharding object describing how an array is placed.
-
-    Returns:
-        Return the device set backing a sharding spec, or ``None``.
-    """
-    return _device_set_from_sharding(sharding)
-
-
-def _tree_nbytes(x: object) -> int:
-    """Sum the byte sizes of every array leaf in ``x`` without touching devices.
-
-    Computes ``size * dtype.itemsize`` per leaf, ignoring leaves that
-    are not arrays. The result is reported to the schedule stats
-    collector as a transfer-size estimate. No :func:`block_until_ready`
-    is issued so the cost is purely metadata access.
-
-    Args:
-        x: A pytree whose array leaves should be measured.
-
-    Returns:
-        Total bytes across all array leaves.
-    """
-    total = 0
-    for leaf in jax.tree.leaves(x, is_leaf=_is_leaf):
-        size = getattr(leaf, "size", None)
-        dtype = getattr(leaf, "dtype", None)
-        if size is None or dtype is None:
-            continue
-        try:
-            total += int(size) * int(jnp.dtype(dtype).itemsize)
-        except Exception:
-            continue
-    return total
-
-
-def _sharding_mesh_signature(sharding: object) -> tuple[object, ...] | None:
-    """Return the mesh axis layout that is part of a sharding ABI."""
-    mesh = getattr(sharding, "mesh", None)
-    if mesh is None:
-        return None
-    axis_names = tuple(getattr(mesh, "axis_names", ()) or ())
-    try:
-        axis_sizes = tuple(int(mesh.shape[axis]) for axis in axis_names)
-    except Exception:
-        axis_sizes = ()
-    try:
-        device_grid_shape = tuple(np.asarray(mesh.devices).shape)
-    except Exception:
-        device_grid_shape = ()
-    return (axis_names, axis_sizes, device_grid_shape)
-
-
-def _same_sharding(a: object, b: object) -> bool:
-    """Return ``True`` iff ``a`` and ``b`` represent the same physical sharding.
-
-    Type, partition spec, and physical device set must all match. Two shardings
-    can compare equal at the object level while carrying different stage-local
-    meshes; those are not the same runtime ABI for MPMD transport.
-    ``None`` operands always compare unequal so that "no sharding" is never
-    confused with "any sharding".
-
-    Args:
-        a: Positional arguments forwarded to the wrapped callable.
-        b: B value consumed by this operation.
-
-    Returns:
-        Return ``True`` iff ``a`` and ``b`` represent the same physical sharding.
-    """
-    if a is None or b is None:
-        return False
-    if not isinstance(a, jax.sharding.Sharding) or not isinstance(b, jax.sharding.Sharding):
-        return False
-    if a is b:
-        return True
-    if type(a) is not type(b):
-        return False
-    if getattr(a, "spec", None) != getattr(b, "spec", None):
-        return False
-    if _sharding_mesh_signature(a) != _sharding_mesh_signature(b):
-        return False
-    a_devices = _sharding_device_set(a)
-    b_devices = _sharding_device_set(b)
-    if a_devices is not None or b_devices is not None:
-        return a_devices == b_devices
-    return a == b
-
-
-def _device_id_preview(devices: set[object] | None) -> str:
-    """Format a large device set compactly for process-aware diagnostics."""
-    device_ids = _device_id_tuple(devices)
-    if device_ids is None:
-        return "unknown"
-    if len(device_ids) <= 12:
-        return repr(device_ids)
-    head = ", ".join(str(device_id) for device_id in device_ids[:6])
-    tail = ", ".join(str(device_id) for device_id in device_ids[-3:])
-    return f"({head}, ..., {tail})"
-
-
-def _mesh_axis_names(sharding: object) -> tuple[object, ...] | None:
-    """Return mesh axis names for logging, when the sharding exposes them."""
-    mesh = getattr(sharding, "mesh", None)
-    if mesh is None:
-        return None
-    axis_names = getattr(mesh, "axis_names", None)
-    return tuple(axis_names) if axis_names is not None else None
-
-
-def _index_key(index: object) -> object:
-    """Convert a JAX shard index into a hashable equality key."""
-    if index is None:
-        return None
-    if not isinstance(index, tuple):
-        index = (index,)
-    parts: list[object] = []
-    for part in index:
-        if isinstance(part, slice):
-            parts.append(("slice", part.start, part.stop, part.step))
-        elif isinstance(part, list | tuple):
-            parts.append(tuple(part))
-        else:
-            parts.append(part)
-    return tuple(parts)
-
-
-def _index_shape(index: object, shape: tuple[int, ...]) -> tuple[int, ...]:
-    """Return the local shard shape selected by a global shard index."""
-    if index is None:
-        return shape
-    if not isinstance(index, tuple):
-        index = (index,)
-    out: list[int] = []
-    for axis, selector in enumerate(index):
-        dim = shape[axis] if axis < len(shape) else 1
-        if isinstance(selector, slice):
-            start, stop, step = selector.indices(dim)
-            out.append(max(0, stop - start) if step == 1 else len(range(start, stop, step)))
-        elif selector is None:
-            out.append(1)
-        elif isinstance(selector, int):
-            continue
-        else:
-            try:
-                out.append(len(selector))
-            except TypeError:
-                out.append(dim)
-    if len(index) < len(shape):
-        out.extend(shape[len(index) :])
-    return tuple(out)
-
-
-def _drop_leading_index_axis(index: object) -> object:
-    """Remove the synthetic leading pair-lane axis from a shard index."""
-    if index is None:
-        return None
-    if not isinstance(index, tuple):
-        index = (index,)
-    return tuple(index[1:])
-
-
-def _leading_index_axis_start(index: object) -> int | None:
-    """Return the selected start offset for a shard's leading axis."""
-    if index is None:
-        return None
-    if not isinstance(index, tuple):
-        index = (index,)
-    if not index:
-        return None
-    selector = index[0]
-    if isinstance(selector, slice):
-        start, _stop, step = selector.indices(2)
-        if step != 1:
-            return None
-        return int(start)
-    if isinstance(selector, int):
-        return int(selector)
-    return None
-
-
-def _shape_nbytes(shape: tuple[int, ...], dtype: object) -> int | None:
-    """Return the byte size of one local shard shape."""
-    try:
-        itemsize = int(jnp.dtype(dtype).itemsize)
-    except Exception:
-        return None
-    total = 1
-    for dim in shape:
-        total *= int(dim)
-    return total * itemsize
-
-
-def _same_dtype(a: object, b: object) -> bool:
-    """Return whether two dtype-like objects describe the same JAX dtype."""
-    try:
-        return jnp.dtype(a) == jnp.dtype(b)
-    except Exception:
-        return a == b
-
-
-def _addressable_shard_nbytes(value: object) -> tuple[int, ...]:
-    """Summarize the unique local shard byte sizes currently addressable."""
-    payload = _array_payload(value)
-    if not hasattr(payload, "addressable_shards"):
-        return ()
-    out: set[int] = set()
-    try:
-        shards = tuple(payload.addressable_shards)
-    except Exception:
-        return ()
-    for shard in shards:
-        data = getattr(shard, "data", None)
-        nbytes = getattr(data, "nbytes", None)
-        if nbytes is not None:
-            try:
-                out.add(int(nbytes))
-                continue
-            except Exception:
-                pass
-        shape = tuple(getattr(data, "shape", ()))
-        if shape:
-            size = _shape_nbytes(shape, getattr(payload, "dtype", None))
-            if size is not None:
-                out.add(size)
-    return tuple(sorted(out))
-
-
-def _target_shard_nbytes_for_shape_dtype(shape: tuple[int, ...], dtype: object, sharding: object) -> tuple[int, ...]:
-    """Summarize target local shard byte sizes for an expected shape/dtype."""
-    if not hasattr(sharding, "addressable_devices_indices_map"):
-        return ()
-    out: set[int] = set()
-    try:
-        mapping = sharding.addressable_devices_indices_map(shape)
-    except Exception:
-        return ()
-    for index in mapping.values():
-        size = _shape_nbytes(_index_shape(index, shape), dtype)
-        if size is not None:
-            out.add(size)
-    return tuple(sorted(out))
-
-
-def _target_shard_nbytes(value: object, sharding: object) -> tuple[int, ...]:
-    """Summarize target local shard byte sizes for ``value`` on ``sharding``."""
-    payload = _array_payload(value)
-    if not hasattr(payload, "shape") or not hasattr(payload, "dtype"):
-        return ()
-    return _target_shard_nbytes_for_shape_dtype(
-        tuple(getattr(payload, "shape", ())), getattr(payload, "dtype", None), sharding
-    )
-
-
-def _ordered_sharding_index_abi(
-    sharding: object, shape: tuple[int, ...]
-) -> tuple[tuple[object, tuple[int, ...]], ...] | None:
-    """Return the shard-index ABI for ``sharding`` in mesh-device order.
-
-    The physical devices may differ across pipeline ranks, so the device ids are
-    intentionally not part of the ABI. What must match is the per-mesh-position
-    global index and local shard shape.
-    """
-    if sharding is None or not hasattr(sharding, "devices_indices_map"):
-        return None
-    try:
-        mapping = sharding.devices_indices_map(shape)
-    except Exception:
-        return None
-    if not mapping:
-        return ()
-
-    mesh = getattr(sharding, "mesh", None)
-    devices = None
-    if mesh is not None:
-        try:
-            devices = tuple(mesh.devices.flat)
-        except Exception:
-            devices = None
-    if devices is None:
-        try:
-            devices = tuple(sorted(mapping, key=lambda device: int(getattr(device, "id", id(device)))))
-        except Exception:
-            devices = tuple(mapping)
-
-    out: list[tuple[object, tuple[int, ...]]] = []
-    for device in devices:
-        if device not in mapping:
-            return None
-        index = mapping[device]
-        out.append((_index_key(index), _index_shape(index, shape)))
-    return tuple(out)
-
-
-def _same_index_sharding_abi(value: object, target_sharding: object) -> bool:
-    """Prove a cross-device retarget keeps the exact shard-index ABI.
-
-    This is deliberately stricter than shape-only matching: the source and
-    target must have the same number of devices, the same mesh axis signature,
-    and the same ordered shard indices/shard shapes for the value's global
-    shape. It permits rank-to-rank activation handoff while continuing to reject
-    full-mesh -> stage-mesh subset placement.
-    """
-    payload = _array_payload(value)
-    if not isinstance(payload, jax.Array) or not hasattr(payload, "shape"):
-        return False
-    value = payload
-    source_sharding = _value_sharding(value)
-    if source_sharding is None or target_sharding is None:
-        return False
-    source_devices = _array_device_set(value)
-    target_devices = _sharding_device_set(target_sharding)
-    if source_devices is None or target_devices is None:
-        return False
-    if source_devices == target_devices or len(source_devices) != len(target_devices):
-        return False
-    if _mesh_axis_names(source_sharding) != _mesh_axis_names(target_sharding):
-        return False
-    shape = tuple(value.shape)
-    if isinstance(source_sharding, jax.sharding.NamedSharding) and _spec_axis_shape_mismatches(
-        getattr(source_sharding, "spec", None),
-        getattr(source_sharding, "mesh", None),
-        shape,
-    ):
-        return False
-    if isinstance(target_sharding, jax.sharding.NamedSharding) and _spec_axis_shape_mismatches(
-        getattr(target_sharding, "spec", None),
-        getattr(target_sharding, "mesh", None),
-        shape,
-    ):
-        return False
-    source_abi = _ordered_sharding_index_abi(source_sharding, shape)
-    target_abi = _ordered_sharding_index_abi(target_sharding, shape)
-    return source_abi is not None and source_abi == target_abi
-
-
-def _mesh_device_id_grid(mesh: object) -> tuple[int, ...] | None:
-    """Return mesh device ids in concrete mesh order."""
-    try:
-        devices = tuple(np.asarray(mesh.devices).flat)
-    except Exception:
-        return None
-    return tuple(int(getattr(device, "id", idx)) for idx, device in enumerate(devices))
-
-
-def _mesh_shape_key(mesh: object) -> tuple[tuple[object, int], ...] | None:
-    """Return mesh axis sizes in the ABI order used by JAX executables."""
-    if mesh is None:
-        return None
-    axis_names = tuple(getattr(mesh, "axis_names", ()))
-    if not axis_names:
-        return ()
-    shape = getattr(mesh, "shape", None)
-    if shape is not None:
-        try:
-            return tuple((axis, int(shape[axis])) for axis in axis_names)
-        except Exception:
-            pass
-    try:
-        device_shape = tuple(int(dim) for dim in np.asarray(mesh.devices, dtype=object).shape)
-    except Exception:
-        return None
-    if len(device_shape) != len(axis_names):
-        return None
-    return tuple((axis, dim) for axis, dim in zip(axis_names, device_shape, strict=False))
 
 
 def _pair_axis_name(stage_axes: tuple[object, ...]) -> str:
@@ -1964,9 +1291,6 @@ def _try_pair_ppermute_transport_leaf(
         moved_pair = _pair_transport_fn(pair_axis=pair_axis, pair_mesh=pair_mesh, pair_sharding=pair_sharding)(
             pair_value
         )
-        ordered_slot = _ORDERED_SCHEDULE_TRANSPORT_SLOT.get()
-        if ordered_slot is not None:
-            ordered_slot.release()
     except Exception as exc:
         raise ValueError(
             "SpectraX MPMD pair-mesh runtime transport failed despite an exact shard ABI; "
@@ -1981,7 +1305,8 @@ def _try_pair_ppermute_transport_leaf(
 
     if not target_map:
         try:
-            return jax.make_array_from_single_device_arrays(shape, target_sharding, [], dtype=dtype)
+            target = jax.make_array_from_single_device_arrays(shape, target_sharding, [], dtype=dtype)
+            return target
         except Exception as exc:
             raise ValueError(
                 "SpectraX MPMD pair-mesh runtime transport could not create a non-addressable target handle."
@@ -2031,7 +1356,8 @@ def _try_pair_ppermute_transport_leaf(
         target_arrays.append(data)
 
     try:
-        return jax.make_array_from_single_device_arrays(shape, target_sharding, target_arrays, dtype=dtype)
+        target = jax.make_array_from_single_device_arrays(shape, target_sharding, target_arrays, dtype=dtype)
+        return target
     except Exception as exc:
         raise ValueError("SpectraX MPMD pair-mesh runtime transport could not rewrap target shards.") from exc
 
@@ -2800,108 +2126,6 @@ def _reshard_with_jitted_identity(value: object, dst_sharding: object) -> object
         return None
 
 
-def _stage_axis_size(mesh: object, axis: object) -> int:
-    """Return the size of ``axis`` on ``mesh``; unknown axes behave replicated.
-
-    Args:
-        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
-        axis: Logical or positional axis used by the operation.
-
-    Returns:
-        Return the size of ``axis`` on ``mesh``; unknown axes behave replicated.
-    """
-    if axis is None:
-        return 1
-    try:
-        return int(mesh.shape[axis])
-    except Exception:
-        return 1
-
-
-def _stage_axis_product(mesh: object, axis: object) -> int:
-    """Return the product of every mesh axis referenced by one spec entry.
-
-    Args:
-        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
-        axis: Logical or positional axis used by the operation.
-
-    Returns:
-        Return the product of every mesh axis referenced by one spec entry.
-    """
-    if axis is None:
-        return 1
-    if isinstance(axis, tuple):
-        product = 1
-        for part in axis:
-            product *= _stage_axis_size(mesh, part)
-        return product
-    return _stage_axis_size(mesh, axis)
-
-
-def _trim_trailing_replicated_stage_axes(spec: object, mesh: object) -> object:
-    """Drop trailing spec entries that are equivalent to replication.
-
-    JAX commonly canonicalizes outputs by omitting trailing replicated
-    dimensions.  For example, on a stage mesh where ``fsdp`` and ``sp`` both
-    have size 1, ``P('tp', ('fsdp', 'sp'))`` and ``P('tp')`` are physically
-    identical.  Scheduled MPMD stage jits key on the full sharding signature,
-    so normalize to the canonical shorter form before the first launch.
-
-    Args:
-        spec: Partition specification or related sharding specification.
-        mesh: JAX mesh or SpectraX mesh descriptor used for placement.
-
-    Returns:
-        Result described by this helper.
-    """
-    try:
-        parts = list(tuple(spec))
-    except Exception:
-        return spec
-    while parts and _stage_axis_product(mesh, parts[-1]) <= 1:
-        parts.pop()
-    return jax.sharding.PartitionSpec(*parts)
-
-
-def _spec_axis_factors(spec: object, mesh: object) -> tuple[int, ...]:
-    """Return the per-dimension mesh partition factor for ``spec``."""
-    try:
-        return tuple(_stage_axis_product(mesh, axis) for axis in tuple(spec))
-    except Exception:
-        return ()
-
-
-def _spec_axis_shape_mismatches(spec: object, mesh: object, shape: tuple[int, ...]) -> tuple[str, ...]:
-    """Return per-dimension shape/factor mismatches for an explicit stage spec."""
-    messages: list[str] = []
-    try:
-        parts = tuple(spec)
-    except Exception:
-        return ()
-    for dim, axis_entry in enumerate(parts):
-        axes = _axis_entry_names(axis_entry)
-        factor = _stage_axis_product(mesh, axis_entry)
-        if factor <= 1:
-            continue
-        axis_expr = "*".join(axes) if axes else "<replicated>"
-        if dim >= len(shape):
-            messages.append(f"dim{dim}:missing_shape_for_axes_{axis_expr}_product_{factor}")
-            continue
-        size = int(shape[dim])
-        if size % factor:
-            messages.append(f"dim{dim}:size_{size}_not_divisible_by_axes_{axis_expr}_product_{factor}")
-    return tuple(messages)
-
-
-def _axis_entry_names(axis: object) -> tuple[str, ...]:
-    """Return mesh-axis names referenced by one ``PartitionSpec`` entry."""
-    if axis is None:
-        return ()
-    if isinstance(axis, tuple):
-        return tuple(str(part) for part in axis if part is not None)
-    return (str(axis),)
-
-
 def _explicit_stage_mesh_and_spec(
     spec: object,
     *,
@@ -2912,7 +2136,7 @@ def _explicit_stage_mesh_and_spec(
     """Resolve an explicit edge spec, rejecting shape-incompatible ABIs."""
     mesh_spec = sanitize_partition_spec_for_mesh_and_shape(spec, mesh=mesh, shape=None)
     shape_spec = sanitize_partition_spec_for_mesh_and_shape(mesh_spec, mesh=mesh, shape=shape)
-    if shape_spec == mesh_spec and not _spec_axis_shape_mismatches(mesh_spec, mesh, shape):
+    if not _spec_axis_shape_mismatches(shape_spec, mesh, shape):
         return mesh, shape_spec
 
     raise ValueError(
@@ -2936,7 +2160,7 @@ def _strict_sanitize_explicit_stage_spec(
     """Sanitize an explicit stage ABI spec without silently dropping shape-invalid axes."""
     mesh_spec = sanitize_partition_spec_for_mesh_and_shape(spec, mesh=mesh, shape=None)
     shape_spec = sanitize_partition_spec_for_mesh_and_shape(mesh_spec, mesh=mesh, shape=shape)
-    if shape_spec != mesh_spec:
+    if _spec_axis_shape_mismatches(shape_spec, mesh, shape):
         raise ValueError(
             "SpectraX MPMD explicit stage-edge sharding is incompatible with the value shape. "
             f"context={context}, shape={shape}, requested_spec={mesh_spec}, "
@@ -3357,14 +2581,24 @@ def _log_transport_diagnostic(
     if not (byte_mismatch or cross_device or spec_changed):
         return
 
+    flat_idx_for_log = None
+    if task_name is not None and "flat" in task_name:
+        match = re.search(r"flat(\d+)", task_name)
+        if match is not None:
+            try:
+                flat_idx_for_log = int(match.group(1))
+            except ValueError:
+                flat_idx_for_log = None
+
     logger.debug(
-        "SpectraX MPMD transport contract; task=%s src_rank=%s dst_rank=%s process=%d "
+        "SpectraX MPMD transport contract; task=%s path=%s src_rank=%s dst_rank=%s process=%d "
         "shape=%s dtype=%s source_axes=%s source_spec=%s source_device_count=%s "
         "source_device_ids=%s requested_axes=%s requested_spec=%s requested_device_count=%s "
         "requested_device_ids=%s target_axes=%s target_spec=%s target_device_count=%s "
         "target_device_ids=%s source_shard_nbytes=%s target_shard_nbytes=%s "
         "byte_mismatch=%s preserve_current_layout=%s skip=%s cache_hit=%s.",
         task_name,
+        _static_arg_path(flat_idx_for_log) if flat_idx_for_log is not None else None,
         src_rank,
         dst_rank,
         process_index,
@@ -3449,6 +2683,17 @@ def _place_schedule_const_value(
     if target is not None:
         if _same_sharding(current_sharding, target):
             return value
+        source_rank = _rank_for_exact_submesh_device_set(value, rank_submeshes)
+        if source_rank is not None and source_rank != rank:
+            return _transport(
+                "device_put",
+                value,
+                target,
+                task_name=f"transfer_schedule_const_flat{flat_idx}_rank{source_rank}_to_rank{rank}",
+                src_rank=source_rank,
+                dst_rank=rank,
+                preserve_current_layout=False,
+            )
         return _device_put_static_stage_leaf(
             value,
             target,
@@ -3497,12 +2742,12 @@ def _place_schedule_dynamic_invar(
     """
     owner = leaf_stage_owners.get(flat_idx)
     if owner is not None and owner != rank:
-        raise ValueError(
-            f"sxjit: flat argument leaf {flat_idx} is assigned to pipeline "
-            f"stage {owner}, but traced stage {rank} uses it. Move the "
-            "corresponding layer into the matching pipeline segment or "
-            "update its assign_stage(...) hint."
-        )
+        # A dynamic leaf can be shared/tied across pipeline stages (for
+        # example input embeddings reused as an LM head). Single-rank owner
+        # mismatches are rejected while building the schedule plan; reaching
+        # this runtime path means the leaf is a valid multi-rank consumer and
+        # must be transported rather than treated as a bad stage assignment.
+        pass
 
     target = _canonical_stage_sharding(value, leaf_shardings[rank].get(flat_idx), rank_submeshes[rank])
     if target is not None:
@@ -3517,6 +2762,17 @@ def _place_schedule_dynamic_invar(
     if target is not None:
         if _same_sharding(current_sharding, target):
             return value
+        source_rank = _rank_for_exact_submesh_device_set(value, rank_submeshes)
+        if source_rank is not None and source_rank != rank:
+            return _transport(
+                "device_put",
+                value,
+                target,
+                task_name=f"transfer_dynamic_invar_flat{flat_idx}_rank{source_rank}_to_rank{rank}",
+                src_rank=source_rank,
+                dst_rank=rank,
+                preserve_current_layout=False,
+            )
         return _device_put_static_stage_leaf(
             value,
             target,
@@ -3817,12 +3073,14 @@ def _build_schedule_plan(
             return None
         return loc_for_logical[logical][0]
 
+    captured_graphdefs = _collect_graphdefs_from_callable(fn)
     leaf_shardings, leaf_stage_owners = _infer_leaf_shardings(
         args,
         flat_args,
         n,
         rank_submeshes,
         stage_rank_resolver=_schedule_stage_owner,
+        graphdefs=captured_graphdefs,
     )
     const_idx_to_flat_idx: dict[int, int] = {}
     for ci, cval in enumerate(concrete_consts):
@@ -3837,6 +3095,26 @@ def _build_schedule_plan(
     for arg_idx in grad_nums:
         g_start, g_end = global_ranges[arg_idx]
         grad_flat_indices.update(range(g_start, g_end))
+    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("leaf_owner_logged", 0) < 3:
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index == 0:
+            owned_grad_count = sum(1 for idx in grad_flat_indices if idx in leaf_stage_owners)
+            logger.debug(
+                "SpectraX MPMD leaf ownership inference; graphdefs=%d flat_leaves=%d "
+                "owners=%d grad_leaves=%d owned_grad_leaves=%d unknown_grad_leaves=%d.",
+                len(captured_graphdefs),
+                len(flat_args),
+                len(leaf_stage_owners),
+                len(grad_flat_indices),
+                owned_grad_count,
+                len(grad_flat_indices) - owned_grad_count,
+            )
+            _SCHEDULE_TRANSPORT_DIAGNOSTICS["leaf_owner_logged"] = (
+                _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("leaf_owner_logged", 0) + 1
+            )
     dyn_local_idx = 0
     for arg_idx in dynamic_argnums:
         g_start, _g_end = global_ranges[arg_idx]
@@ -3846,6 +3124,7 @@ def _build_schedule_plan(
             dyn_local_idx += 1
 
     dynamic_usage_ranks: dict[int, set[int]] = {}
+    dynamic_usage_logicals: dict[int, set[int]] = {}
     for logical, sources in enumerate(invar_sources):
         rank = loc_for_logical[logical][0]
         for source_kind, source_a, _source_b in sources:
@@ -3854,6 +3133,60 @@ def _build_schedule_plan(
             flat_idx = dynamic_flat_to_global_flat.get(source_a)
             if flat_idx is not None:
                 dynamic_usage_ranks.setdefault(flat_idx, set()).add(rank)
+                dynamic_usage_logicals.setdefault(flat_idx, set()).add(logical)
+
+    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("schedule_plan_logged", 0) < 3:
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index == 0:
+            edge_samples: list[tuple[int, int, int, int]] = []
+            for consumer_logical, sources in enumerate(invar_sources):
+                consumer_rank = loc_for_logical[consumer_logical][0]
+                for source_kind, source_a, _source_b in sources:
+                    if source_kind == "cluster_out":
+                        edge_samples.append(
+                            (int(source_a), int(consumer_logical), loc_for_logical[source_a][0], consumer_rank)
+                        )
+                    if len(edge_samples) >= 24:
+                        break
+                if len(edge_samples) >= 24:
+                    break
+            mismatch_samples: list[tuple[int, str | None, int | None, tuple[int, ...], tuple[int, ...]]] = []
+            for flat_idx, ranks in sorted(dynamic_usage_ranks.items()):
+                owner = leaf_stage_owners.get(flat_idx)
+                if owner is None or owner in ranks:
+                    continue
+                mismatch_samples.append(
+                    (
+                        int(flat_idx),
+                        _static_arg_path(flat_idx),
+                        int(owner),
+                        tuple(sorted(int(rank) for rank in ranks)),
+                        tuple(sorted(int(logical) for logical in dynamic_usage_logicals.get(flat_idx, ()))),
+                    )
+                )
+                if len(mismatch_samples) >= 16:
+                    break
+            logger.debug(
+                "SpectraX MPMD schedule plan; schedule=%r n=%d v=%d n_logical=%d "
+                "serial_region_plan=%s schedule_n_logical=%s loc_for_logical=%s "
+                "cluster_eqns=%s edge_samples=%s owner_usage_mismatches=%s.",
+                schedule,
+                n,
+                v,
+                n_logical,
+                serial_region_plan,
+                n_logical,
+                tuple(loc_for_logical),
+                tuple(len(cluster.eqns) for cluster in clusters),
+                tuple(edge_samples),
+                tuple(mismatch_samples),
+            )
+            _SCHEDULE_TRANSPORT_DIAGNOSTICS["schedule_plan_logged"] = (
+                _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("schedule_plan_logged", 0) + 1
+            )
 
     for flat_idx, ranks in dynamic_usage_ranks.items():
         if len(ranks) != 1:
@@ -3901,6 +3234,21 @@ def _build_schedule_plan(
                         logical, invar_pos = used_by[0]
                         donate_invars_per_logical[logical].add(invar_pos)
 
+    def _body_invar_needs_stage_grad(logical: int, source_a: int) -> bool:
+        flat_idx = dynamic_flat_to_global_flat[source_a]
+        if flat_idx not in grad_flat_indices:
+            return False
+        rank = loc_for_logical[logical][0]
+        owner = leaf_stage_owners.get(flat_idx)
+        usage_ranks = dynamic_usage_ranks.get(flat_idx)
+        if owner is not None and usage_ranks is not None and len(usage_ranks) > 1:
+            return rank in usage_ranks
+        if owner is not None:
+            return owner == rank
+        if usage_ranks is not None and len(usage_ranks) == 1:
+            return rank in usage_ranks
+        return True
+
     def _bwd_out_shardings_for(
         logical: int, loc: tuple[int, int], consts: tuple[object, ...]
     ) -> tuple[tuple[object, ...], tuple[object | None, ...]]:
@@ -3921,7 +3269,7 @@ def _build_schedule_plan(
         for source_kind, source_a, _source_b in invar_sources[logical]:
             if source_kind == "body_invar":
                 flat_idx = dynamic_flat_to_global_flat[source_a]
-                if flat_idx not in grad_flat_indices:
+                if not _body_invar_needs_stage_grad(logical, source_a):
                     invar_grad_shardings.append(None)
                     continue
                 invar_grad_shardings.append(
@@ -3978,8 +3326,19 @@ def _build_schedule_plan(
         mask: list[bool] = []
         for source_kind, source_a, _source_b in invar_sources[logical]:
             if source_kind == "body_invar":
-                flat_idx = dynamic_flat_to_global_flat[source_a]
-                mask.append(flat_idx in grad_flat_indices)
+                mask.append(_body_invar_needs_stage_grad(logical, source_a))
+            else:
+                mask.append(False)
+        return tuple(mask)
+
+    def _bwd_full_invar_grad_mask(logical: int) -> tuple[bool, ...]:
+        """Return activation plus stage-owned body gradients for regular BWD."""
+        mask: list[bool] = []
+        for source_kind, source_a, _source_b in invar_sources[logical]:
+            if source_kind == "cluster_out":
+                mask.append(True)
+            elif source_kind == "body_invar":
+                mask.append(_body_invar_needs_stage_grad(logical, source_a))
             else:
                 mask.append(False)
         return tuple(mask)
@@ -4112,6 +3471,7 @@ def _build_schedule_plan(
                 donate_argnums=donate_positions,
                 out_shardings=bwd_out_shardings,
                 stage_mesh=stage_mesh,
+                invar_grad_mask=_bwd_full_invar_grad_mask(logical),
             )
             bwd_i_jits[stage_key] = _make_bwd_i_jit(
                 rebased_cluster,
@@ -4371,6 +3731,21 @@ def _place_grad_on_target(grad: object, target: object | None, *, flat_idx: int 
         )
         if rewrapped is not None:
             return rewrapped
+        gate_token = _ORDERED_SCHEDULE_TRANSPORT_GATE.set(None)
+        slot_token = _ORDERED_SCHEDULE_TRANSPORT_SLOT.set(None)
+        try:
+            moved = _transport(
+                "device_put",
+                grad,
+                target,
+                task_name=f"transfer_gradient_flat{flat_idx}_to_accum_target",
+                preserve_current_layout=False,
+            )
+        finally:
+            _ORDERED_SCHEDULE_TRANSPORT_SLOT.reset(slot_token)
+            _ORDERED_SCHEDULE_TRANSPORT_GATE.reset(gate_token)
+        if moved is not None:
+            return moved
         if jax.process_count() <= 1:
             return jax.device_put(grad, target)
         raise ValueError(
@@ -4387,6 +3762,194 @@ def _place_grad_on_target(grad: object, target: object | None, *, flat_idx: int 
             f"target_shard_nbytes={_target_shard_nbytes(grad, target)}."
         )
     return jax.device_put(grad, target)
+
+
+def _grad_add_sharding_key(sharding: object) -> tuple[object, ...]:
+    """Return a stable cache key fragment for a JAX array sharding."""
+    if sharding is None:
+        return (None,)
+    return (
+        type(sharding).__name__,
+        _sharding_mesh_signature(sharding),
+        _device_id_tuple(_sharding_device_set(sharding)),
+        tuple(_mesh_axis_names(sharding)),
+        repr(getattr(sharding, "spec", None)),
+        getattr(sharding, "memory_kind", None),
+    )
+
+
+def _get_grad_add_fn(a: jax.Array, b: jax.Array) -> Callable[[object, object], object]:
+    """Return a cached JIT add for two already placement-compatible grad leaves."""
+    a_sharding = getattr(a, "sharding", None)
+    b_sharding = getattr(b, "sharding", None)
+    key = (
+        tuple(getattr(a, "shape", ())),
+        str(getattr(a, "dtype", None)),
+        tuple(getattr(b, "shape", ())),
+        str(getattr(b, "dtype", None)),
+        _grad_add_sharding_key(a_sharding),
+        _grad_add_sharding_key(b_sharding),
+    )
+    cached = _GRAD_ADD_FN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def add_fn(x: object, y: object) -> object:
+        return x + y
+
+    jit_kwargs: dict[str, object] = {}
+    if isinstance(a_sharding, jax.sharding.Sharding) and isinstance(b_sharding, jax.sharding.Sharding):
+        fully_addressable = bool(getattr(a, "is_fully_addressable", False)) and bool(
+            getattr(b, "is_fully_addressable", False)
+        )
+        if fully_addressable:
+            jit_kwargs["in_shardings"] = (a_sharding, b_sharding)
+            if _same_sharding(a_sharding, b_sharding):
+                jit_kwargs["out_shardings"] = a_sharding
+
+    compiled = jax.jit(add_fn, **jit_kwargs)
+    with _GRAD_ADD_FN_CACHE_LOCK:
+        existing = _GRAD_ADD_FN_CACHE.get(key)
+        if existing is not None:
+            return existing
+        _GRAD_ADD_FN_CACHE[key] = compiled
+    return compiled
+
+
+def _grad_add_many(xs: tuple[jax.Array, ...], ys: tuple[jax.Array, ...]) -> tuple[jax.Array, ...]:
+    """Add a tuple of placement-compatible gradient leaves in one JAX launch."""
+    return tuple(x + y for x, y in zip(xs, ys, strict=True))
+
+
+_GRAD_ADD_MANY_JIT = jax.jit(_grad_add_many)
+
+
+def _ordered_schedule_event_order(
+    units: list[_ScheduleUnit],
+    deps: dict[int, set[int]],
+    launch_names_for_unit: Callable[[_ScheduleUnit], tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Return a deterministic event order with apply units sorted by ready time.
+
+    Stage-local optimizer apply is kept serialized because concurrent apply
+    launches are not stable on the current TPU runtime. Serializing by rank id,
+    however, can leave an already-ready rank idle while an earlier rank is still
+    finishing its last backward unit. This keeps all non-apply events in the
+    dependency-compatible order, then orders apply events by the latest ordered
+    event of their dependencies.
+    """
+    ordered: list[str] = []
+    seen_names: set[str] = set()
+    apply_units: list[_ScheduleUnit] = []
+    unit_names: dict[int, tuple[str, ...]] = {}
+    event_last_position_by_unit: dict[int, int] = {}
+    topo_position_by_unit: dict[int, int] = {}
+
+    topo_units = _dependency_topological_schedule_units(units, deps)
+    for topo_pos, unit in enumerate(topo_units):
+        topo_position_by_unit[unit.index] = topo_pos
+        names = tuple(dict.fromkeys(launch_names_for_unit(unit)))
+        unit_names[unit.index] = names
+        if unit.kind == "apply":
+            apply_units.append(unit)
+            continue
+        start = len(ordered)
+        for name in names:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            ordered.append(name)
+        if len(ordered) != start:
+            event_last_position_by_unit[unit.index] = len(ordered) - 1
+
+    def apply_ready_key(unit: _ScheduleUnit) -> tuple[int, int, int, int]:
+        unit_deps = deps.get(unit.index, set())
+        latest_event_pos = max(
+            (event_last_position_by_unit.get(dep, -1) for dep in unit_deps),
+            default=-1,
+        )
+        latest_topo_pos = max(
+            (topo_position_by_unit.get(dep, -1) for dep in unit_deps),
+            default=-1,
+        )
+        return latest_event_pos, latest_topo_pos, unit.rank, unit.index
+
+    for unit in sorted(apply_units, key=apply_ready_key):
+        for name in unit_names.get(unit.index, ()):
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            ordered.append(name)
+
+    return tuple(ordered)
+
+
+def _schedule_unit_has_pending_input_futures(
+    unit: _ScheduleUnit,
+    *,
+    recv_cots: dict[tuple[int, ...], list[object | None]],
+    bwd_w_cotangents: dict[tuple[int, ...], tuple[object, ...]],
+    pretransferred_output_items: dict[tuple[int, tuple[int, ...], int], object],
+    loc_for_logical: list[tuple[int, int]],
+    invar_sources: list[tuple[tuple[str, int, int], ...]],
+    runtime_key: Callable[[int, int], tuple[int, ...]],
+) -> bool:
+    """Return true when launching ``unit`` would only block on a transfer future.
+
+    The dependency DAG marks a producer BWD complete once the downstream stage
+    has submitted its cotangent transfer, not once the transfer future has
+    resolved. Launching the upstream BWD at that point occupies the rank worker
+    and then blocks inside cotangent materialization. Keep those units ready
+    but unlaunched so the rank can run other dependency-ready work while the
+    transfer executor advances.
+    """
+
+    def future_pending(value: object) -> bool:
+        return isinstance(value, concurrent.futures.Future) and not value.done()
+
+    if unit.fwd_logical is not None and unit.fwd_mb is not None:
+        logical = unit.fwd_logical
+        rank = unit.rank
+        mb = unit.fwd_mb
+        for source_kind, source_a, source_b in invar_sources[logical]:
+            if source_kind != "cluster_out":
+                continue
+            producer_rank = loc_for_logical[source_a][0]
+            if producer_rank == rank:
+                continue
+            producer_key = runtime_key(source_a, mb)
+            if future_pending(pretransferred_output_items.get((rank, producer_key, int(source_b)))):
+                return True
+
+    if unit.bwd_logical is None or unit.bwd_mb is None:
+        return False
+    key = runtime_key(unit.bwd_logical, unit.bwd_mb)
+    if unit.bwd_phase is Phase.BWD_W and key in bwd_w_cotangents:
+        return False
+    slots = recv_cots.get(key)
+    if not slots:
+        return False
+    return any(future_pending(slot) for slot in slots)
+
+
+def _add_grad_donate(a: object, b: object) -> object:
+    """Add two grad leaves with a cached JIT when both are concrete JAX arrays."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if _is_float0(a):
+        return b
+    if _is_float0(b):
+        return a
+    if isinstance(a, jax.Array) and isinstance(b, jax.Array):
+        fully_addressable = bool(getattr(a, "is_fully_addressable", False)) and bool(
+            getattr(b, "is_fully_addressable", False)
+        )
+        if not fully_addressable:
+            return a + b
+        return _get_grad_add_fn(a, b)(a, b)
+    return _add_grad(a, b)
 
 
 def _add_grad_on_common_sharding(
@@ -4413,7 +3976,7 @@ def _add_grad_on_common_sharding(
     if target is not None:
         a = _place_grad_on_target(a, target, flat_idx=flat_idx)
         b = _place_grad_on_target(b, target, flat_idx=flat_idx)
-    return _add_grad(a, b)
+    return _add_grad_donate(a, b)
 
 
 def _accumulate_flat_grad(
@@ -5249,761 +4812,6 @@ def _dispatch_schedule_faithful_serial(
     return (mean_loss if return_loss else None), tuple(final_grads)
 
 
-def _get_schedule_fused_fwd_bwd_jit(
-    fwd_jit: Callable[..., object],
-    bwd_jit: Callable[..., object],
-    n_invars: int,
-) -> Callable[..., object]:
-    """Return a cached jit that fuses FWD on microbatch A with BWD on microbatch B.
-
-    The 1F1B steady state alternates a forward on a fresh microbatch
-    with a backward on an in-flight one. Folding both into a single
-    :func:`jax.jit` cuts the per-step Python dispatch count in half and
-    lets XLA overlap the two computations on the same rank. The result
-    is memoised in :data:`_SCHEDULE_FUSED_FWDBWD_CACHE` so subsequent
-    fused units reuse the same compiled program.
-
-    Args:
-        fwd_jit: Per-cluster forward jit (from :func:`_make_fwd_jit`).
-        bwd_jit: Per-cluster backward jit (from :func:`_make_bwd_jit`).
-        n_invars: Number of cluster input variables (used to slice the
-            packed ``(fwd_invars, bwd_invars, cotangents)`` tuple).
-
-    Returns:
-        Jitted ``(consts, *args) -> (fwd_outs, g_consts, g_bwd_invars)``
-        callable.
-    """
-    key = (id(fwd_jit), id(bwd_jit), n_invars)
-    cached = _SCHEDULE_FUSED_FWDBWD_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    @jax.jit
-    def fused(consts: tuple[object, ...], *args: object) -> tuple[object, ...]:
-        """One-launch fwd(A) + bwd(B) for paired schedule microbatches.
-
-        ``args`` is the concatenation of ``(fwd_invars, bwd_invars,
-        cotangents)``, each of length ``n_invars`` (cotangents may be
-        a different length depending on the cluster's outputs). The
-        function returns ``(fwd_outs, g_consts, g_bwd_invars)`` so the
-        caller can route the forward outputs to the next stage and
-        accumulate the backward gradients.
-
-        Args:
-            consts: Consts value consumed by this operation.
-            *args: Additional positional arguments forwarded to the wrapped callable or backend.
-
-        Returns:
-            Result described by this helper.
-        """
-        with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd"):
-            fwd_invars = args[:n_invars]
-            bwd_invars = args[n_invars : 2 * n_invars]
-            cotangents = args[2 * n_invars :]
-            with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd/forward"):
-                fwd_outs = fwd_jit(consts, *fwd_invars)
-            with jax.named_scope("spectrax/mpmd/schedule/fused_fwdbwd/backward"):
-                g_consts, g_bwd_invars = bwd_jit(consts, *bwd_invars, *cotangents)
-            return fwd_outs, g_consts, g_bwd_invars
-
-    _SCHEDULE_FUSED_FWDBWD_CACHE[key] = fused
-    weak_invalidate(fwd_jit, _SCHEDULE_FUSED_FWDBWD_CACHE, key)
-    weak_invalidate(bwd_jit, _SCHEDULE_FUSED_FWDBWD_CACHE, key)
-    return fused
-
-
-def _eval_schedule_cluster_fwd(cluster_jaxpr: object, consts: tuple[object, ...], *invars: object) -> tuple[object, ...]:
-    """Evaluate a cluster sub-jaxpr without nesting a pre-compiled stage jit.
-
-    Used by direct-fused dispatch paths that compose multiple cluster
-    operations inside a single :func:`jax.jit`; calling the precompiled
-    forward jit instead would force a re-trace on every invocation.
-
-    Args:
-        cluster_jaxpr: The stage's sub-jaxpr.
-        consts: Placed constants for that cluster.
-        *invars: Stage input activations.
-
-    Returns:
-        Tuple of stage outputs (matching the cluster's outvars).
-    """
-    return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(consts), *invars))
-
-
-def _eval_schedule_cluster_bwd(
-    cluster_jaxpr: object,
-    n_invars: int,
-    consts: tuple[object, ...],
-    *invars_and_cotangents: object,
-) -> tuple[object, tuple[object, ...]]:
-    """Compute ``(g_consts, g_invars)`` for a cluster inside a fused jit.
-
-    Mirrors :func:`_make_bwd_jit` but calls the cluster jaxpr inline so
-    a fused fwd+bwd jit can carry both halves in one HLO graph.
-
-    Args:
-        cluster_jaxpr: The stage's sub-jaxpr.
-        n_invars: Number of cluster invars (used to slice
-            ``invars_and_cotangents``).
-        consts: Placed constants for the cluster.
-        *invars_and_cotangents: ``(*invars, *cotangents)`` packed as a
-            single positional sequence.
-
-    Returns:
-        ``(g_consts, g_invars)`` aligned with ``consts`` and the
-        cluster's invars respectively.
-    """
-    invars = invars_and_cotangents[:n_invars]
-    cotangents = invars_and_cotangents[n_invars:]
-
-    def pure(c: tuple[object, ...], *xs: object) -> tuple[object, ...]:
-        """Pure (consts, invars) -> outs interpreter for ``jax.vjp`` linearization.
-
-        Args:
-            c: C value consumed by this operation.
-            *xs: Additional positional arguments forwarded to the wrapped callable or backend.
-
-        Returns:
-            Result described by this helper.
-        """
-        return tuple(jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs))
-
-    _, vjp_fn = jax.vjp(pure, consts, *invars)
-    grads = vjp_fn(tuple(cotangents))
-    return grads[0], tuple(grads[1:])
-
-
-def _eval_schedule_cluster_terminal(
-    cluster_jaxpr: object,
-    n_invars: int,
-    consts: tuple[object, ...],
-    *invars: object,
-) -> tuple[object, tuple[object, tuple[object, ...]]]:
-    """Run the terminal cluster's loss + gradient computation in-place.
-
-    Used as a building block for direct-fused jits that compose the
-    cluster jaxpr inline rather than calling a pre-compiled stage jit.
-    Wraps the cluster's scalar-loss evaluator in
-    :func:`jax.value_and_grad` over both ``consts`` and ``invars`` so a
-    single trace produces the loss value and the seed cotangents the
-    upstream backward sweep needs.
-
-    Args:
-        cluster_jaxpr: Terminal cluster sub-jaxpr.
-        n_invars: Cluster's invar count.
-        consts: Placed cluster constants.
-        *invars: Cluster's positional inputs.
-
-    Returns:
-        ``(loss, (g_consts, g_invars))`` mirroring
-        :func:`_make_terminal_jit`'s output.
-    """
-
-    def pure(c: tuple[object, ...], *xs: object) -> object:
-        """Pure (consts, invars) -> scalar interpreter for the loss cluster.
-
-        The terminal cluster is required to produce a single scalar
-        (the per-microbatch loss). Anything else is a tracing error.
-
-        Args:
-            c: C value consumed by this operation.
-            *xs: Additional positional arguments forwarded to the wrapped callable or backend.
-
-        Returns:
-            Result described by this helper.
-        """
-        outs = jax.core.eval_jaxpr(cluster_jaxpr, list(c), *xs)
-        if len(outs) != 1:
-            raise ValueError(
-                f"Terminal cluster must produce exactly one scalar output (the per-microbatch loss); got {len(outs)}."
-            )
-        return outs[0]
-
-    argnums = tuple(range(1 + n_invars))
-    loss, grads = jax.value_and_grad(pure, argnums=argnums, allow_int=True)(consts, *invars)
-    return loss, (grads[0], tuple(grads[1:]))
-
-
-def _get_schedule_direct_fused_fwd_bwd_jit(
-    cluster_jaxpr: object,
-    n_invars: int,
-) -> Callable[..., object]:
-    """Return a cached fused FWD(A)+BWD(B) jit built directly from the cluster jaxpr.
-
-    Variant of :func:`_get_schedule_fused_fwd_bwd_jit` that bypasses
-    the per-cluster pre-compiled forward/backward jits and re-evaluates
-    the cluster's jaxpr inside one outer :func:`jax.jit`. This lets
-    XLA see the entire fwd+bwd as a single graph (better fusion) at
-    the cost of recompiling the cluster body inside this jit.
-
-    Cached on ``(id(cluster_jaxpr), n_invars)`` in
-    :data:`_SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE`.
-
-    Args:
-        cluster_jaxpr: The stage's sub-jaxpr.
-        n_invars: Number of cluster input variables.
-
-    Returns:
-        Jitted ``(consts, *args) -> (fwd_outs, g_consts, g_bwd_invars)``
-        callable.
-    """
-    key = (id(cluster_jaxpr), n_invars)
-    cached = _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    @jax.jit
-    def fused(consts: tuple[object, ...], *args: object) -> tuple[object, ...]:
-        """Fused fwd(A)+bwd(B) that evaluates the cluster jaxpr directly.
-
-        Bypasses the per-stage compiled fwd/bwd JITs (used elsewhere)
-        and instead lets XLA compile the entire fwd+bwd as a single
-        function. Profile-driven cache: the result is keyed on
-        ``(id(cluster_jaxpr), n_invars)``.
-
-        Args:
-            consts: Consts value consumed by this operation.
-            *args: Additional positional arguments forwarded to the wrapped callable or backend.
-
-        Returns:
-            Result described by this helper.
-        """
-        with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd"):
-            fwd_invars = args[:n_invars]
-            bwd_invars = args[n_invars : 2 * n_invars]
-            cotangents = args[2 * n_invars :]
-            with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd/forward"):
-                fwd_outs = _eval_schedule_cluster_fwd(cluster_jaxpr, consts, *fwd_invars)
-            with jax.named_scope("spectrax/mpmd/schedule/direct_fused_fwdbwd/backward"):
-                g_consts, g_bwd_invars = _eval_schedule_cluster_bwd(
-                    cluster_jaxpr,
-                    n_invars,
-                    consts,
-                    *bwd_invars,
-                    *cotangents,
-                )
-            return fwd_outs, g_consts, g_bwd_invars
-
-    _SCHEDULE_DIRECT_FUSED_FWDBWD_CACHE[key] = fused
-    return fused
-
-
-def _schedule_action_unit(
-    *,
-    index: int,
-    row: int,
-    rank: int,
-    action: object,
-    logical_for_loc: dict[tuple[int, int], int],
-    logical_override: int | None = None,
-) -> _ScheduleUnit:
-    """Wrap a single :class:`Action` cell as a :class:`_ScheduleUnit`.
-
-    Forward actions populate ``fwd_logical``/``fwd_mb``; backward
-    actions populate ``bwd_logical``/``bwd_mb``/``bwd_phase``. Used by
-    :func:`_build_schedule_units_from_plan` when expanding the
-    schedule grid into the dependency DAG.
-
-    Args:
-        index: Stable global ordering key.
-        row: Source row in the schedule grid.
-        rank: Physical pipeline rank.
-        action: The :class:`Action` cell.
-        logical_for_loc: Mapping from ``(rank, virt)`` to logical
-            stage index.
-
-    Returns:
-        A :class:`_ScheduleUnit` reflecting the action's phase.
-    """
-    virt = action.virtual_stage
-    logical = logical_for_loc[(rank, virt)] if logical_override is None else logical_override
-    if action.phase is Phase.FWD:
-        return _ScheduleUnit(
-            index=index,
-            row=row,
-            kind="action",
-            rank=rank,
-            virt=virt,
-            payload=action,
-            fwd_logical=logical,
-            fwd_mb=action.microbatch,
-            bwd_logical=None,
-            bwd_mb=None,
-            bwd_phase=None,
-        )
-    return _ScheduleUnit(
-        index=index,
-        row=row,
-        kind="action",
-        rank=rank,
-        virt=virt,
-        payload=action,
-        fwd_logical=None,
-        fwd_mb=None,
-        bwd_logical=logical,
-        bwd_mb=action.microbatch,
-        bwd_phase=action.phase,
-    )
-
-
-def _schedule_fused_unit(
-    *,
-    index: int,
-    row: int,
-    rank: int,
-    fused: FusedTask,
-    logical_for_loc: dict[tuple[int, int], int],
-    logical_override: int | None = None,
-    fwd_logical_override: int | None = None,
-    bwd_logical_override: int | None = None,
-) -> _ScheduleUnit:
-    """Wrap a paired FWD+BWD :class:`FusedTask` as a single :class:`_ScheduleUnit`.
-
-    The two halves always share the same physical rank, but DualPipe-V
-    can pair different virtual stages on that rank. Carry separate
-    logical-stage indices so the dispatcher routes each half through
-    the correct stage state.
-
-    Args:
-        index: Stable global ordering key.
-        row: Source row in the schedule grid.
-        rank: Physical pipeline rank.
-        fused: The :class:`FusedTask` cell.
-        logical_for_loc: Mapping from ``(rank, virt)`` to logical
-            stage index.
-
-    Returns:
-        A :class:`_ScheduleUnit` with ``kind="fused"``.
-    """
-    virt = fused.virtual_stage
-    if logical_override is not None:
-        fwd_logical = logical_override
-        bwd_logical = logical_override
-    else:
-        fwd_logical = (
-            logical_for_loc[(rank, fused.fwd.virtual_stage)] if fwd_logical_override is None else fwd_logical_override
-        )
-        bwd_logical = (
-            logical_for_loc[(rank, fused.bwd.virtual_stage)] if bwd_logical_override is None else bwd_logical_override
-        )
-    return _ScheduleUnit(
-        index=index,
-        row=row,
-        kind="fused",
-        rank=rank,
-        virt=virt,
-        payload=fused,
-        fwd_logical=fwd_logical,
-        fwd_mb=fused.fwd.microbatch,
-        bwd_logical=bwd_logical,
-        bwd_mb=fused.bwd.microbatch,
-        bwd_phase=fused.bwd.phase,
-    )
-
-
-def _schedule_apply_unit(
-    *,
-    index: int,
-    row: int,
-    rank: int,
-    virt: int = 0,
-) -> _ScheduleUnit:
-    """Wrap a per-rank optimizer-apply step as a :class:`_ScheduleUnit`.
-
-    APPLY units are not present in the schedule grid -- they are
-    synthesized at unit-build time by ``_build_schedule_units_from_plan``
-    when the plan has compiled apply jits. Each unit owns one rank's
-    stage-local parameter update, and depends on every backward unit on
-    its rank (the dependency edges are added in
-    :func:`_build_schedule_unit_dependencies`). The ``row`` slot is set
-    to a synthetic value past every real grid row so deterministic
-    dispatch fires the apply units after all fwd/bwd work on the same
-    rank has been issued.
-
-    Args:
-        index: Stable global ordering key.
-        row: Synthetic row index (past every real grid row).
-        rank: Physical pipeline rank whose stage-local leaves this unit
-            will update.
-        virt: Virtual sub-stage index (unused for apply; kept for
-            symmetry with fwd/bwd units).
-
-    Returns:
-        A :class:`_ScheduleUnit` with ``kind="apply"`` and an
-        :class:`_ApplyPayload` payload.
-    """
-    return _ScheduleUnit(
-        index=index,
-        row=row,
-        kind="apply",
-        rank=rank,
-        virt=virt,
-        payload=_ApplyPayload(rank=rank, virt=virt),
-        fwd_logical=None,
-        fwd_mb=None,
-        bwd_logical=None,
-        bwd_mb=None,
-        bwd_phase=None,
-    )
-
-
-def _append_apply_units(
-    plan: dict[str, object],
-    units: list[_ScheduleUnit],
-    next_index: int,
-) -> int:
-    """Append one APPLY unit per physical rank when the plan has apply jits.
-
-    No-op when the plan does not contain compiled ``apply_jits`` -- this
-    keeps the legacy ``sxvalue_and_grad`` path (no fused apply) byte-for-
-    byte unchanged. When ``apply_jits`` is present, emits exactly one
-    APPLY unit per ``rank`` (``virt=0``), placed after every real grid
-    unit in row-major order so deterministic dispatch issues them last
-    on each rank but other ranks can fire theirs in parallel with rank-0
-    bwd tail.
-
-    Args:
-        plan: Dispatch plan from :func:`_build_schedule_plan`.
-        units: Unit list to append onto.
-        next_index: Next stable global ordering key to assign.
-
-    Returns:
-        The updated ``next_index`` after appending.
-    """
-    apply_jits = plan.get("apply_jits")
-    if not apply_jits:
-        return next_index
-    n_rank = int(plan.get("n", 0))
-    if n_rank <= 0:
-        return n_rank
-    grid = plan.get("grid", ())
-    synthetic_row = len(grid) + 1
-    for rank in range(n_rank):
-        if (rank, 0) not in apply_jits:
-            continue
-        units.append(_schedule_apply_unit(index=next_index, row=synthetic_row, rank=rank, virt=0))
-        next_index += 1
-    return next_index
-
-
-def _fuse_cross_virtual_schedule_units(plan: dict[str, object], units: list[_ScheduleUnit]) -> list[_ScheduleUnit]:
-    """Return schedule units without hidden env-gated fusion.
-
-    Real schedule cells such as ``FusedTask`` are still preserved by
-    ``_build_schedule_units_from_plan``. This helper intentionally does not
-    rewrite adjacent rows through a private OS flag; that keeps the MPMD
-    runtime's behavior explicit and benchmarkable.
-
-    Args:
-        plan: Plan value consumed by this operation.
-        units: Units value consumed by this operation.
-
-    Returns:
-        Return schedule units without hidden env-gated fusion.
-    """
-    del plan
-    return units
-
-
-def _build_schedule_units_from_plan(plan: dict[str, object]) -> list[_ScheduleUnit]:
-    """Walk the schedule grid and emit executable units in row-major order.
-
-    Schedules that want split backward must explicitly emit ``BWD_I`` and
-    ``BWD_W`` actions. A plain ``BWD`` action is kept as one full backward
-    unit; automatically splitting it here duplicates VJP work and changes the
-    scheduler's intended critical path. The terminal-rank backward action is
-    omitted when ``eager_terminal_bwd`` is set (the terminal backward is fired
-    eagerly inside the forward stub).
-
-    Args:
-        plan: Dispatch plan from :func:`_build_schedule_plan`.
-
-    Returns:
-        Ordered list of :class:`_ScheduleUnit` objects ready for
-        dependency analysis.
-    """
-    units: list[_ScheduleUnit] = []
-    next_index = 0
-    logical_for_loc = plan["logical_for_loc"]
-    n_logical = plan["n_logical"]
-    schedule_n_logical = plan.get("schedule_n_logical", n_logical)
-    serial_region_plan = bool(plan.get("serial_region_plan", False))
-    region_groups = (n_logical // schedule_n_logical) if serial_region_plan else 1
-    terminal_logical = plan.get("terminal_logical", n_logical - 1)
-    eager_terminal_bwd = True
-    grid = plan["grid"]
-
-    def _is_eager_terminal_bwd(action: object, logical: int) -> bool:
-        return (
-            eager_terminal_bwd and logical == terminal_logical and action.phase in (Phase.BWD, Phase.BWD_I, Phase.BWD_W)
-        )
-
-    if serial_region_plan:
-
-        def emit_action(
-            *,
-            logical: int,
-            synthetic_row: int,
-            rank: int,
-            action: object,
-        ) -> None:
-            nonlocal next_index
-            if _is_eager_terminal_bwd(action, logical):
-                return
-            units.append(
-                _schedule_action_unit(
-                    index=next_index,
-                    row=synthetic_row,
-                    rank=rank,
-                    action=action,
-                    logical_for_loc=logical_for_loc,
-                    logical_override=logical,
-                )
-            )
-            next_index += 1
-
-        def append_action(
-            *,
-            logical: int,
-            synthetic_row: int,
-            rank: int,
-            action: object,
-        ) -> None:
-            """Append one scheduler action without rewriting its phase."""
-            emit_action(logical=logical, synthetic_row=synthetic_row, rank=rank, action=action)
-
-        for group in range(region_groups):
-            logical_offset = group * schedule_n_logical
-            row_offset = group * len(grid)
-            for row_idx, row in enumerate(grid):
-                for rank, cell in enumerate(row):
-                    if cell is None:
-                        continue
-                    fwd_action = cell.fwd if isinstance(cell, FusedTask) else cell
-                    if fwd_action.phase is not Phase.FWD:
-                        continue
-                    logical = logical_offset + logical_for_loc[(rank, fwd_action.virtual_stage)]
-                    if logical < n_logical:
-                        append_action(logical=logical, synthetic_row=row_offset + row_idx, rank=rank, action=fwd_action)
-
-        bwd_row_base = region_groups * len(grid)
-        for reverse_group, group in enumerate(reversed(range(region_groups))):
-            logical_offset = group * schedule_n_logical
-            row_offset = bwd_row_base + reverse_group * len(grid)
-            for row_idx, row in enumerate(grid):
-                for rank, cell in enumerate(row):
-                    if cell is None:
-                        continue
-                    bwd_actions = (cell.fwd, cell.bwd) if isinstance(cell, FusedTask) else (cell,)
-                    for bwd_action in bwd_actions:
-                        if bwd_action.phase not in (Phase.BWD, Phase.BWD_I, Phase.BWD_W):
-                            continue
-                        logical = logical_offset + logical_for_loc[(rank, bwd_action.virtual_stage)]
-                        if logical < n_logical:
-                            append_action(
-                                logical=logical,
-                                synthetic_row=row_offset + row_idx,
-                                rank=rank,
-                                action=bwd_action,
-                            )
-        next_index = _append_apply_units(plan, units, next_index)
-        return _fuse_cross_virtual_schedule_units(plan, units)
-
-    for group in range(region_groups):
-        logical_offset = group * schedule_n_logical
-        row_offset = group * len(grid)
-        for row_idx, row in enumerate(grid):
-            for rank, cell in enumerate(row):
-                if cell is None:
-                    continue
-                base_logical = logical_for_loc[(rank, cell.virtual_stage)]
-                logical = logical_offset + base_logical
-                if logical >= n_logical:
-                    continue
-                synthetic_row = row_offset + row_idx
-                if isinstance(cell, FusedTask):
-                    fwd_logical = logical_offset + logical_for_loc[(rank, cell.fwd.virtual_stage)]
-                    bwd_logical = logical_offset + logical_for_loc[(rank, cell.bwd.virtual_stage)]
-                    if (
-                        cell.fwd.phase is Phase.FWD
-                        and cell.bwd.phase is Phase.BWD
-                        and fwd_logical < n_logical
-                        and bwd_logical < n_logical
-                        and not _is_eager_terminal_bwd(cell.bwd, bwd_logical)
-                    ):
-                        units.append(
-                            _schedule_fused_unit(
-                                index=next_index,
-                                row=synthetic_row,
-                                rank=rank,
-                                fused=cell,
-                                logical_for_loc=logical_for_loc,
-                                fwd_logical_override=fwd_logical,
-                                bwd_logical_override=bwd_logical,
-                            )
-                        )
-                        next_index += 1
-                        continue
-
-                    actions = (cell.fwd, cell.bwd)
-                    for action in actions:
-                        action_logical = logical_offset + logical_for_loc[(rank, action.virtual_stage)]
-                        if action_logical >= n_logical:
-                            continue
-                        if _is_eager_terminal_bwd(action, action_logical):
-                            continue
-                        units.append(
-                            _schedule_action_unit(
-                                index=next_index,
-                                row=synthetic_row,
-                                rank=rank,
-                                action=action,
-                                logical_for_loc=logical_for_loc,
-                                logical_override=action_logical,
-                            )
-                        )
-                        next_index += 1
-                else:
-                    if _is_eager_terminal_bwd(cell, logical):
-                        continue
-                    units.append(
-                        _schedule_action_unit(
-                            index=next_index,
-                            row=synthetic_row,
-                            rank=rank,
-                            action=cell,
-                            logical_for_loc=logical_for_loc,
-                            logical_override=logical,
-                        )
-                    )
-                    next_index += 1
-    next_index = _append_apply_units(plan, units, next_index)
-    return _fuse_cross_virtual_schedule_units(plan, units)
-
-
-def _build_schedule_unit_dependencies(plan: dict[str, object], units: list[_ScheduleUnit]) -> dict[int, set[int]]:
-    """Compute the predecessor-set for each schedule unit.
-
-    Three classes of edge are added:
-
-    * **Same-rank order**: each unit depends on the previous unit fired
-      on the same rank (preserves the schedule's intended sequencing).
-    * **Forward-data dependencies**: a forward unit depends on the
-      forward units that produced each of its cluster inputs (looked
-      up via ``invar_sources``).
-    * **Backward-cotangent dependencies**: a backward unit depends on
-      its own paired forward (so saved activations are available) and
-      on the backward of every downstream consumer that supplies a
-      cotangent. ``BWD_W`` units are excluded from
-      cotangent-supplier tracking because they only produce weight
-      grads.
-
-    Args:
-        plan: Dispatch plan from :func:`_build_schedule_plan`.
-        units: Units returned by :func:`_build_schedule_units_from_plan`.
-
-    Returns:
-        A mapping ``unit_index -> {predecessor unit indices}``.
-    """
-    n_logical = plan["n_logical"]
-    invar_sources = plan["invar_sources"]
-    fwd_units: dict[tuple[int, int], int] = {}
-    bwd_cot_units: dict[tuple[int, int], int] = {}
-    consumers_by_producer: dict[int, set[int]] = {logical: set() for logical in range(n_logical)}
-    for consumer_logical, sources in enumerate(invar_sources):
-        for source_kind, source_a, _source_b in sources:
-            if source_kind == "cluster_out":
-                consumers_by_producer.setdefault(source_a, set()).add(consumer_logical)
-
-    for unit in units:
-        if unit.fwd_logical is not None and unit.fwd_mb is not None:
-            fwd_units[(unit.fwd_logical, unit.fwd_mb)] = unit.index
-        if unit.bwd_logical is not None and unit.bwd_mb is not None and unit.bwd_phase is not Phase.BWD_W:
-            bwd_cot_units[(unit.bwd_logical, unit.bwd_mb)] = unit.index
-
-    terminal_logical = plan.get("terminal_logical", n_logical - 1)
-    for mb in range(plan["m"]):
-        fwd_idx = fwd_units.get((terminal_logical, mb))
-        if fwd_idx is not None:
-            bwd_cot_units[(terminal_logical, mb)] = fwd_idx
-
-    deps: dict[int, set[int]] = {unit.index: set() for unit in units}
-    previous_by_rank: dict[int, int] = {}
-
-    def add_dep(unit: _ScheduleUnit, dep: int | None) -> None:
-        """Insert ``dep`` into ``unit``'s predecessor set if it is real and distinct.
-
-        Skips ``None`` (no dependency) and self-references (a unit
-        cannot depend on itself). The caller may pass a missing
-        index from a dictionary lookup directly without an extra
-        ``if`` check.
-
-        Args:
-            unit: Unit value consumed by this operation.
-            dep: Dep value consumed by this operation.
-        """
-        if dep is not None and dep != unit.index:
-            deps[unit.index].add(dep)
-
-    for unit in units:
-        add_dep(unit, previous_by_rank.get(unit.rank))
-        previous_by_rank[unit.rank] = unit.index
-
-        if unit.fwd_logical is not None and unit.fwd_mb is not None:
-            for source_kind, source_a, _source_b in invar_sources[unit.fwd_logical]:
-                if source_kind == "cluster_out":
-                    add_dep(unit, fwd_units.get((source_a, unit.fwd_mb)))
-
-        if unit.bwd_logical is not None and unit.bwd_mb is not None:
-            add_dep(unit, fwd_units.get((unit.bwd_logical, unit.bwd_mb)))
-            for consumer_logical in consumers_by_producer.get(unit.bwd_logical, ()):
-                add_dep(unit, bwd_cot_units.get((consumer_logical, unit.bwd_mb)))
-
-    return deps
-
-
-def _dependency_topological_schedule_units(
-    units: list[_ScheduleUnit],
-    deps: dict[int, set[int]],
-) -> list[_ScheduleUnit]:
-    """Return units in a stable dependency-compatible order.
-
-    The order is used for deterministic multi-controller transport gates. It
-    must be topologically compatible with the schedule DAG; a plain row-major
-    walk can ask the gate to wait for a transfer whose owning unit is not
-    dependency-ready yet.
-    """
-    by_index = {unit.index: unit for unit in units}
-    dependents: dict[int, set[int]] = {unit.index: set() for unit in units}
-    remaining = {idx: set(unit_deps) for idx, unit_deps in deps.items()}
-    for idx, unit_deps in deps.items():
-        for dep in unit_deps:
-            dependents.setdefault(dep, set()).add(idx)
-
-    ready = sorted(
-        (idx for idx, unit_deps in remaining.items() if not unit_deps),
-        key=lambda idx: (by_index[idx].row, idx),
-    )
-    ordered: list[_ScheduleUnit] = []
-    emitted: set[int] = set()
-    while ready:
-        idx = ready.pop(0)
-        if idx in emitted:
-            continue
-        emitted.add(idx)
-        ordered.append(by_index[idx])
-        for dependent in dependents.get(idx, ()):
-            remaining[dependent].discard(idx)
-            if not remaining[dependent] and dependent not in emitted and dependent not in ready:
-                ready.append(dependent)
-        ready.sort(key=lambda item: (by_index[item].row, item))
-
-    if len(ordered) != len(units):
-        blocked = {idx: sorted(unit_deps) for idx, unit_deps in remaining.items() if idx not in emitted and unit_deps}
-        raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
-    return ordered
-
-
 def _dispatch_schedule_faithful(
     plan: dict[str, object],
     args: tuple,
@@ -6091,9 +4899,9 @@ def _dispatch_schedule_fused_async(
     leaf_shardings = plan["leaf_shardings"]
     leaf_stage_owners = plan["leaf_stage_owners"]
     const_indices_per_loc = plan["const_indices_per_loc"]
-    n_invars_per_loc = plan["n_invars_per_loc"]
-    cache_terminal_grads = True
-    eager_terminal_bwd = True
+    plan["n_invars_per_loc"]
+    cache_terminal_grads = False
+    eager_terminal_bwd = False
     serial_region_plan = bool(plan.get("serial_region_plan", False))
 
     def _stage_key(logical: int) -> _ScheduleStageKey:
@@ -6132,9 +4940,7 @@ def _dispatch_schedule_fused_async(
 
     saved_inputs: dict[tuple[int, ...], tuple[object, ...]] = {}
     saved_outputs: dict[tuple[int, ...], tuple[object, ...]] = {}
-    pretransferred_outputs: dict[
-        tuple[int, tuple[int, ...]], tuple[object, ...] | concurrent.futures.Future[object]
-    ] = {}
+    pretransferred_output_items: dict[tuple[int, tuple[int, ...], int], object | concurrent.futures.Future[object]] = {}
     microbatch_leading_sizes: set[tuple[int, int]] = set()
     for i, arg in enumerate(flat_args_live):
         if not microbatch_mask[i]:
@@ -6153,6 +4959,9 @@ def _dispatch_schedule_fused_async(
     recv_cots: dict[tuple[int, ...], list[object | None]] = {}
     bwd_w_cotangents: dict[tuple[int, ...], tuple[object, ...]] = {}
     grad_accums: dict[int, object] = {}
+    stage_local_grad_accums: dict[tuple[int, tuple[object, ...]], object] = {}
+    _STAGE_LOCAL_MISSING = object()
+    deferred_flat_grad_updates: list[tuple[int, object]] = []
     const_tuple_accums: dict[tuple[int, ...], object] = {}
     terminal_const_tuple_accums: dict[tuple[int, ...], object] = {}
     requested_grad_flat_indices = plan.get("grad_flat_indices")
@@ -6160,23 +4969,681 @@ def _dispatch_schedule_fused_async(
         set(requested_grad_flat_indices) if requested_grad_flat_indices is not None else set(range(n_flat))
     )
     loss_acc = jnp.asarray(0.0)
+    loss_terms: list[object] = []
     state_lock = threading.Lock()
+    collective_launch_lock = threading.Lock()
     placed_dynamic_invars: dict[tuple[int, int, int], object] = {}
     stats_collector: _ScheduleStatsCollector | None = None
     transfer_executor: concurrent.futures.Executor | None = None
     fused_pair_executor: concurrent.futures.Executor | None = None
+    grad_reduce_executor: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="spectrax-grad-reduce",
+    )
+    pending_transfer_futures: set[concurrent.futures.Future[object]] = set()
+    active_grad_ready_futures: set[concurrent.futures.Future[object]] = set()
     consumers_by_producer: dict[int, set[int]] = {logical: set() for logical in range(n_logical)}
+    producer_dst_output_indices: dict[int, dict[int, set[int]]] = {logical: {} for logical in range(n_logical)}
     producer_output_use_counts: dict[int, int] = {logical: 0 for logical in range(n_logical)}
     for consumer_logical, sources in enumerate(invar_sources):
-        for source_kind, source_a, _source_b in sources:
+        consumer_rank = loc_for_logical[consumer_logical][0]
+        for source_kind, source_a, source_b in sources:
             if source_kind == "cluster_out":
                 consumers_by_producer.setdefault(source_a, set()).add(consumer_logical)
+                producer_dst_output_indices.setdefault(source_a, {}).setdefault(consumer_rank, set()).add(int(source_b))
                 producer_output_use_counts[source_a] = producer_output_use_counts.get(source_a, 0) + 1
     remaining_output_uses: dict[tuple[int, ...], int] = {}
+    body_grad_stage_owners: dict[int, set[int]] = {}
+    for logical, sources in enumerate(invar_sources):
+        for source_kind, source_a, _source_b in sources:
+            if source_kind != "body_invar":
+                continue
+            flat_idx = dynamic_flat_to_global_flat.get(source_a)
+            if flat_idx is None:
+                continue
+            if flat_idx not in requested_grad_flat_indices or microbatch_mask[flat_idx]:
+                continue
+            body_grad_stage_owners.setdefault(flat_idx, set()).add(logical)
+    shared_body_grad_flat_indices = {
+        flat_idx for flat_idx, logicals in body_grad_stage_owners.items() if len(logicals) > 1
+    }
+
+    progress_log_state = {"count": 0}
+    focused_terminal_bwd_state = {"count": 0}
+    focused_bwd_state = {"count": 0}
 
     def _progress(event: str, **fields: object) -> None:
-        """No-op hook kept to avoid scattering debug guards through dispatch."""
-        del event, fields
+        """Emit bounded process-0 progress for tiny schedule probes."""
+        if n_logical > 4 or m > 2 or progress_log_state["count"] >= 256:
+            return
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index != 0:
+            return
+        progress_log_state["count"] += 1
+        rendered = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        logger.debug("SpectraX MPMD progress %s %s", event, rendered)
+
+    def _focused_terminal_bwd_debug(event: str, **fields: object) -> None:
+        """Emit bounded process-0 diagnostics for the current terminal-BWD stall."""
+        if focused_terminal_bwd_state["count"] >= 1024:
+            return
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index != 0:
+            return
+        focused_terminal_bwd_state["count"] += 1
+        rendered = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        logger.warning("SpectraX MPMD focused terminal-bwd %s %s", event, rendered)
+
+    def _focused_bwd_debug(event: str, **fields: object) -> None:
+        """Emit bounded process-0 diagnostics for the current non-terminal BWD stall."""
+        if focused_bwd_state["count"] >= 512:
+            return
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index != 0:
+            return
+        focused_bwd_state["count"] += 1
+        rendered = " ".join(f"{key}={value!r}" for key, value in sorted(fields.items()))
+        logger.warning("SpectraX MPMD focused bwd %s %s", event, rendered)
+
+    def _resolve_future_value(value: object) -> object:
+        """Resolve a Future-like value if needed."""
+        result = getattr(value, "result", None)
+        if callable(result):
+            return result()
+        return value
+
+    def _track_grad_ready_future(future: concurrent.futures.Future[object]) -> concurrent.futures.Future[object]:
+        """Track a launched reducer op until its device work is complete."""
+        with state_lock:
+            active_grad_ready_futures.add(future)
+
+        def _discard(done: concurrent.futures.Future[object]) -> None:
+            with state_lock:
+                active_grad_ready_futures.discard(done)
+
+        future.add_done_callback(_discard)
+        return future
+
+    def _wait_active_grad_reductions() -> None:
+        """Wait only for reducer device work that has already been launched."""
+        while True:
+            with state_lock:
+                pending = [future for future in active_grad_ready_futures if not future.done()]
+            if not pending:
+                return
+            for future in pending:
+                future.result()
+
+    def _rank_for_exact_sharding_device_set(sharding: object) -> int | None:
+        """Return the physical rank whose submesh exactly owns ``sharding``."""
+        devices = _sharding_device_set(sharding)
+        if devices is None:
+            return None
+        for rank, submesh in enumerate(rank_submeshes):
+            try:
+                rank_devices = set(submesh.devices.flat)
+            except Exception:
+                continue
+            if devices == rank_devices:
+                return rank
+        return None
+
+    def _routed_gradient_accumulation_transfer(
+        grad: object,
+        target: object,
+        *,
+        flat_idx: int | None,
+        src_rank: int,
+        dst_rank: int,
+    ) -> object:
+        """Move a gradient to its accumulation target through adjacent ranks."""
+        current = grad
+        current_rank = src_rank
+        for hop_rank in _rank_transport_hops(src_rank, dst_rank):
+            final_hop = hop_rank == dst_rank
+            if final_hop:
+                hop_target = target
+            else:
+                fallback = jax.sharding.NamedSharding(rank_submeshes[hop_rank], jax.sharding.PartitionSpec())
+                hop_target = _retarget_transfer_sharding(current, fallback)
+            hop_task_name = (
+                f"transfer_gradient_flat{flat_idx}_rank{current_rank}_to_rank{hop_rank}"
+                if final_hop
+                else f"transfer_gradient_flat{flat_idx}_rank{current_rank}_to_rank{hop_rank}_hop"
+            )
+            gate_token = _ORDERED_SCHEDULE_TRANSPORT_GATE.set(None)
+            slot_token = _ORDERED_SCHEDULE_TRANSPORT_SLOT.set(None)
+            try:
+                current = _transport(
+                    "device_put",
+                    current,
+                    hop_target,
+                    task_name=hop_task_name,
+                    src_rank=current_rank,
+                    dst_rank=hop_rank,
+                    preserve_current_layout=not final_hop,
+                )
+            finally:
+                _ORDERED_SCHEDULE_TRANSPORT_SLOT.reset(slot_token)
+                _ORDERED_SCHEDULE_TRANSPORT_GATE.reset(gate_token)
+            current_rank = hop_rank
+        return current
+
+    def _place_grad_on_accum_target(grad: object, target: object | None, *, flat_idx: int | None) -> object:
+        """Place a grad on its accumulation target using routed cross-rank movement."""
+        focused_flat_grad = _ENABLE_FOCUSED_MPMD_DEBUG and flat_idx == 365
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug(
+                "flat365-place-enter",
+                path=_static_arg_path(flat_idx),
+                shape=tuple(getattr(grad, "shape", ())) if hasattr(grad, "shape") else None,
+                dtype=str(getattr(grad, "dtype", None)),
+                target_is_none=target is None,
+            )
+        if grad is None or target is None or _is_float0(grad) or not hasattr(grad, "shape"):
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug(
+                    "flat365-place-return-early",
+                    grad_is_none=grad is None,
+                    target_is_none=target is None,
+                    is_float0=_is_float0(grad),
+                    has_shape=hasattr(grad, "shape"),
+                )
+            return grad
+        current = _value_sharding(grad)
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug(
+                "flat365-place-sharding",
+                same_sharding=_same_sharding(current, target),
+                source_axes=_mesh_axis_names(current),
+                source_spec=repr(getattr(current, "spec", None)),
+                target_axes=_mesh_axis_names(target),
+                target_spec=repr(getattr(target, "spec", None)),
+            )
+        if _same_sharding(current, target):
+            actual_devices = _array_device_set(grad)
+            target_devices = _sharding_device_set(target)
+            if actual_devices is None or target_devices is None or actual_devices == target_devices:
+                if focused_flat_grad:
+                    _focused_terminal_bwd_debug("flat365-place-return-same-sharding")
+                return grad
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug(
+                    "flat365-place-same-sharding-device-mismatch",
+                    actual_device_ids=_device_id_preview(actual_devices),
+                    target_device_ids=_device_id_preview(target_devices),
+                )
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug("flat365-place-before-device-sets")
+        source_devices = _array_device_set(grad)
+        target_devices = _sharding_device_set(target)
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug(
+                "flat365-place-after-device-sets",
+                source_device_count=len(source_devices) if source_devices is not None else None,
+                source_device_ids=_device_id_preview(source_devices),
+                target_device_count=len(target_devices) if target_devices is not None else None,
+                target_device_ids=_device_id_preview(target_devices),
+                device_sets_differ=(
+                    source_devices is not None and target_devices is not None and source_devices != target_devices
+                ),
+            )
+        if source_devices is not None and target_devices is not None and source_devices != target_devices:
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-place-before-rank-lookup")
+            src_rank = _rank_for_exact_submesh_device_set(grad, rank_submeshes)
+            dst_rank = _rank_for_exact_sharding_device_set(target)
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-place-after-rank-lookup", src_rank=src_rank, dst_rank=dst_rank)
+            if src_rank is not None and dst_rank is not None and src_rank != dst_rank:
+                if focused_flat_grad:
+                    _focused_terminal_bwd_debug(
+                        "flat365-place-before-routed-transfer", src_rank=src_rank, dst_rank=dst_rank
+                    )
+                moved = _routed_gradient_accumulation_transfer(
+                    grad,
+                    target,
+                    flat_idx=flat_idx,
+                    src_rank=src_rank,
+                    dst_rank=dst_rank,
+                )
+                if focused_flat_grad:
+                    _focused_terminal_bwd_debug("flat365-place-after-routed-transfer")
+                return moved
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-place-before-rewrap", src_rank=src_rank, dst_rank=dst_rank)
+            rewrapped = _try_rewrap_from_target_subset(
+                grad,
+                target,
+                flat_idx=flat_idx,
+                reason="schedule_gradient_accumulation",
+            )
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-place-after-rewrap", rewrapped=rewrapped is not None)
+            if rewrapped is not None:
+                return rewrapped
+            if src_rank is not None and dst_rank is not None:
+                if focused_flat_grad:
+                    _focused_terminal_bwd_debug(
+                        "flat365-place-before-routed-transfer-fallback",
+                        src_rank=src_rank,
+                        dst_rank=dst_rank,
+                    )
+                moved = _routed_gradient_accumulation_transfer(
+                    grad,
+                    target,
+                    flat_idx=flat_idx,
+                    src_rank=src_rank,
+                    dst_rank=dst_rank,
+                )
+                if focused_flat_grad:
+                    _focused_terminal_bwd_debug("flat365-place-after-routed-transfer-fallback")
+                return moved
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug("flat365-place-before-generic-placement")
+        placed = _place_grad_on_target(grad, target, flat_idx=flat_idx)
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug("flat365-place-after-generic-placement")
+        return placed
+
+    def _add_grad_on_accum_target(
+        a: object,
+        b: object,
+        target: object | None,
+        *,
+        flat_idx: int | None,
+    ) -> object:
+        """Add two grads after normalizing them with routed accumulation placement."""
+        focused_flat_grad = _ENABLE_FOCUSED_MPMD_DEBUG and flat_idx == 365
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug(
+                "flat365-add-enter",
+                a_shape=tuple(getattr(a, "shape", ())) if hasattr(a, "shape") else None,
+                a_dtype=str(getattr(a, "dtype", None)),
+                b_shape=tuple(getattr(b, "shape", ())) if hasattr(b, "shape") else None,
+                b_dtype=str(getattr(b, "dtype", None)),
+                target_is_none=target is None,
+            )
+        if target is None:
+            target = _value_sharding(a)
+            if target is None:
+                target = _value_sharding(b)
+        if focused_flat_grad:
+            a_sharding = getattr(a, "sharding", None)
+            b_sharding = getattr(b, "sharding", None)
+            _focused_terminal_bwd_debug(
+                "flat365-add-target",
+                target_axes=_mesh_axis_names(target),
+                target_spec=repr(getattr(target, "spec", None)),
+                a_axes=_mesh_axis_names(a_sharding),
+                a_spec=repr(getattr(a_sharding, "spec", None)),
+                b_axes=_mesh_axis_names(b_sharding),
+                b_spec=repr(getattr(b_sharding, "spec", None)),
+            )
+        if target is not None:
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-add-before-place-a")
+            a = _place_grad_on_accum_target(a, target, flat_idx=flat_idx)
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-add-after-place-a")
+                _focused_terminal_bwd_debug("flat365-add-before-place-b")
+            b = _place_grad_on_accum_target(b, target, flat_idx=flat_idx)
+            if focused_flat_grad:
+                _focused_terminal_bwd_debug("flat365-add-after-place-b")
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug("flat365-add-before-add")
+        merged = _add_grad_donate(a, b)
+        if focused_flat_grad:
+            _focused_terminal_bwd_debug("flat365-add-after-add")
+        return merged
+
+    def _accumulate_flat_grad_claimed(flat_idx: int, grad: object) -> None:
+        """Queue a non-microbatched flat grad reduction without blocking the schedule."""
+        missing = object()
+        merge_future: concurrent.futures.Future[object] = concurrent.futures.Future()
+        with state_lock:
+            existing = grad_accums.get(flat_idx, missing)
+            grad_accums[flat_idx] = merge_future
+
+        def reduce_update() -> object:
+            """Reduce one flat-gradient update on a reducer thread."""
+            target = grad_targets.get(flat_idx)
+            ready_future: concurrent.futures.Future[object] = _track_grad_ready_future(concurrent.futures.Future())
+            try:
+                if existing is missing:
+                    with collective_launch_lock:
+                        merged = _place_grad_on_accum_target(grad, target, flat_idx=flat_idx)
+                else:
+                    # Updates for the same flat leaf form a true data
+                    # dependency chain. A previous reducer future may be
+                    # device-complete only after its reducer future resolves.
+                    # Keep the chain ordered per leaf while leaving unrelated
+                    # leaves asynchronous.
+                    existing_value = _resolve_future_value(existing)
+                    with collective_launch_lock:
+                        merged = _add_grad_on_accum_target(existing_value, grad, target, flat_idx=flat_idx)
+                merged = jax.block_until_ready(merged)
+            except BaseException as exc:
+                merge_future.set_exception(exc)
+                ready_future.set_exception(exc)
+                with state_lock:
+                    if grad_accums.get(flat_idx) is merge_future:
+                        if existing is missing:
+                            grad_accums.pop(flat_idx, None)
+                        else:
+                            grad_accums[flat_idx] = existing
+                raise
+            merge_future.set_result(merged)
+            ready_future.set_result(merged)
+            with state_lock:
+                if grad_accums.get(flat_idx) is merge_future:
+                    grad_accums[flat_idx] = merged
+            if _ENABLE_FOCUSED_MPMD_DEBUG and flat_idx == 365:
+                try:
+                    process_index = jax.process_index()
+                except Exception:
+                    process_index = -1
+                if process_index == 0:
+                    logger.warning(
+                        "SpectraX MPMD focused terminal-bwd flat365-ready-tracked done=%s", ready_future.done()
+                    )
+            return merged
+
+        grad_reduce_executor.submit(reduce_update)
+
+    def _stage_local_flat_grad_key(flat_idx: int, grad: object) -> tuple[int, tuple[object, ...]]:
+        """Return the stage-local accumulation bucket for a scheduled grad."""
+        device_key = _device_id_tuple(_array_device_set(grad))
+        if device_key is not None:
+            return flat_idx, ("devices", *device_key)
+        return flat_idx, ("sharding", *_grad_add_sharding_key(_value_sharding(grad)))
+
+    def _grad_global_nbytes(grad: object) -> int:
+        """Return the global byte size for one gradient leaf, when known."""
+        size = getattr(grad, "size", None)
+        dtype = getattr(grad, "dtype", None)
+        if size is None or dtype is None:
+            return 0
+        try:
+            return int(size) * int(jnp.dtype(dtype).itemsize)
+        except Exception:
+            return 0
+
+    def _enter_ordered_gate(
+        gate: object,
+        task_name: str | None,
+        *,
+        rank: int | None,
+        kind: str,
+    ) -> object:
+        """Enter the ordered gate and attribute host wait time to runtime stats."""
+        gate_enter = gate.enter
+        t0 = time.perf_counter_ns()
+        slot = gate_enter(task_name)
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+        if stats_collector is not None:
+            stats_collector.record_gate_wait(task_name, rank, elapsed_ms, kind)
+        return slot
+
+    def _accumulate_stage_local_flat_grad(flat_idx: int, grad: object, *, task_name: str | None = None) -> bool:
+        """Asynchronously fold a scheduled flat-gradient update on its producing mesh."""
+        if grad is None or _is_float0(grad):
+            _skip_ordered_transport(task_name)
+            return True
+        focused_flat0 = _ENABLE_FOCUSED_MPMD_DEBUG and flat_idx == 0
+        gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+        slot = (
+            _enter_ordered_gate(gate, task_name, rank=None, kind="stage_local_grad")
+            if gate is not None and task_name is not None
+            else None
+        )
+        try:
+            key = _stage_local_flat_grad_key(flat_idx, grad)
+            missing = object()
+            merge_future: concurrent.futures.Future[object] = concurrent.futures.Future()
+            with state_lock:
+                existing = stage_local_grad_accums.get(key, missing)
+                stage_local_grad_accums[key] = merge_future
+            if focused_flat0:
+                _focused_terminal_bwd_debug(
+                    "flat0-stage-local-claimed",
+                    existing=existing is not missing,
+                    key=key,
+                    shape=tuple(getattr(grad, "shape", ())) if hasattr(grad, "shape") else None,
+                    dtype=str(getattr(grad, "dtype", None)),
+                )
+
+            target = _value_sharding(grad)
+            try:
+                if existing is missing:
+                    if focused_flat0:
+                        _focused_terminal_bwd_debug("flat0-stage-local-missing-retain-local")
+                    merged = _place_grad_on_accum_target(grad, _value_sharding(grad), flat_idx=flat_idx)
+                    if focused_flat0:
+                        _focused_terminal_bwd_debug("flat0-stage-local-after-retain-local")
+                else:
+                    if focused_flat0:
+                        _focused_terminal_bwd_debug("flat0-stage-local-before-resolve-existing")
+                    existing_value = _resolve_future_value(existing)
+                    if focused_flat0:
+                        _focused_terminal_bwd_debug("flat0-stage-local-after-resolve-existing")
+                    with collective_launch_lock:
+                        if focused_flat0:
+                            _focused_terminal_bwd_debug("flat0-stage-local-before-add")
+                        merged = _add_grad_on_accum_target(existing_value, grad, target, flat_idx=flat_idx)
+                        if focused_flat0:
+                            _focused_terminal_bwd_debug("flat0-stage-local-after-add")
+                # Keep live-schedule retention asynchronous. Forcing readiness here
+                # serializes on the full producer BWD computation and prevents MPMD
+                # overlap; final folding is the synchronization point.
+                if focused_flat0:
+                    _focused_terminal_bwd_debug("flat0-stage-local-retained-pending")
+            except BaseException as exc:
+                merge_future.set_exception(exc)
+                with state_lock:
+                    if stage_local_grad_accums.get(key) is merge_future:
+                        if existing is missing:
+                            stage_local_grad_accums.pop(key, None)
+                        else:
+                            stage_local_grad_accums[key] = existing
+                raise
+            merge_future.set_result(merged)
+            with state_lock:
+                if stage_local_grad_accums.get(key) is merge_future:
+                    stage_local_grad_accums[key] = merged
+            return True
+        finally:
+            if slot is not None:
+                slot.release()
+
+    def _can_batch_stage_local_grad_add(existing: object, grad: object) -> bool:
+        """Return whether a stage-local grad add can join the tuple-add fast path."""
+        if not isinstance(existing, jax.Array) or not isinstance(grad, jax.Array):
+            return False
+        if _is_float0(existing) or _is_float0(grad):
+            return False
+        if tuple(getattr(existing, "shape", ())) != tuple(getattr(grad, "shape", ())):
+            return False
+        if not _same_dtype(existing, grad):
+            return False
+        existing_sharding = _value_sharding(existing)
+        grad_sharding = _value_sharding(grad)
+        if not _same_sharding(existing_sharding, grad_sharding):
+            return False
+        existing_devices = _array_device_set(existing)
+        grad_devices = _array_device_set(grad)
+        return existing_devices is None or grad_devices is None or existing_devices == grad_devices
+
+    def _set_stage_local_claim_result(
+        *,
+        key: tuple[int, tuple[object, ...]],
+        future: concurrent.futures.Future[object],
+        value: object,
+    ) -> None:
+        """Resolve one claimed stage-local grad accumulator."""
+        future.set_result(value)
+        with state_lock:
+            if stage_local_grad_accums.get(key) is future:
+                stage_local_grad_accums[key] = value
+
+    def _restore_stage_local_claims(
+        claims: tuple[
+            tuple[int, object, tuple[int, tuple[object, ...]], object, concurrent.futures.Future[object]], ...
+        ],
+        exc: BaseException,
+    ) -> None:
+        """Restore stage-local accumulator state after a failed batched claim."""
+        for _flat_idx, _grad, key, existing, future in claims:
+            if not future.done():
+                future.set_exception(exc)
+            with state_lock:
+                if stage_local_grad_accums.get(key) is future:
+                    if existing is _STAGE_LOCAL_MISSING:
+                        stage_local_grad_accums.pop(key, None)
+                    else:
+                        stage_local_grad_accums[key] = existing
+
+    def _accumulate_stage_local_flat_grad_batch(
+        updates: tuple[tuple[int, object], ...],
+    ) -> bool:
+        """Fold a stage-local gradient batch with one JAX add for compatible leaves."""
+        if not updates:
+            return False
+        claims: list[tuple[int, object, tuple[int, tuple[object, ...]], object, concurrent.futures.Future[object]]] = []
+        claimed_keys: set[tuple[int, tuple[object, ...]]] = set()
+        try:
+            for flat_idx, grad in updates:
+                if grad is None or _is_float0(grad):
+                    continue
+                key = _stage_local_flat_grad_key(flat_idx, grad)
+                if key in claimed_keys:
+                    # Duplicate leaves inside one stage batch are unexpected; keep the old
+                    # per-leaf chain for that rare case rather than self-waiting on a claim.
+                    if claims:
+                        for _flat_idx, _grad, claim_key, existing, future in claims:
+                            future.cancel()
+                            with state_lock:
+                                if stage_local_grad_accums.get(claim_key) is future:
+                                    if existing is _STAGE_LOCAL_MISSING:
+                                        stage_local_grad_accums.pop(claim_key, None)
+                                    else:
+                                        stage_local_grad_accums[claim_key] = existing
+                        claims.clear()
+                    accumulated = False
+                    for inner_flat_idx, inner_grad in updates:
+                        accumulated = (
+                            _accumulate_stage_local_flat_grad(inner_flat_idx, inner_grad, task_name=None) or accumulated
+                        )
+                    return accumulated
+                claimed_keys.add(key)
+                future: concurrent.futures.Future[object] = concurrent.futures.Future()
+                with state_lock:
+                    existing = stage_local_grad_accums.get(key, _STAGE_LOCAL_MISSING)
+                    stage_local_grad_accums[key] = future
+                claims.append((flat_idx, grad, key, existing, future))
+            if not claims:
+                return False
+
+            place_claims: list[
+                tuple[int, object, tuple[int, tuple[object, ...]], concurrent.futures.Future[object]]
+            ] = []
+            batch_claims: list[
+                tuple[int, object, object, tuple[int, tuple[object, ...]], concurrent.futures.Future[object]]
+            ] = []
+            fallback_claims: list[
+                tuple[int, object, object, tuple[int, tuple[object, ...]], concurrent.futures.Future[object]]
+            ] = []
+            for flat_idx, grad, key, existing, future in claims:
+                if existing is _STAGE_LOCAL_MISSING:
+                    place_claims.append((flat_idx, grad, key, future))
+                    continue
+                existing_value = _resolve_future_value(existing)
+                if _can_batch_stage_local_grad_add(existing_value, grad):
+                    batch_claims.append((flat_idx, existing_value, grad, key, future))
+                else:
+                    fallback_claims.append((flat_idx, existing_value, grad, key, future))
+
+            with collective_launch_lock:
+                for flat_idx, grad, key, future in place_claims:
+                    placed = _place_grad_on_accum_target(grad, _value_sharding(grad), flat_idx=flat_idx)
+                    _set_stage_local_claim_result(key=key, future=future, value=placed)
+                if batch_claims:
+                    xs = tuple(
+                        cast(jax.Array, existing_value)
+                        for _flat_idx, existing_value, _grad, _key, _future in batch_claims
+                    )
+                    ys = tuple(cast(jax.Array, grad) for _flat_idx, _existing_value, grad, _key, _future in batch_claims)
+                    merged_values = _GRAD_ADD_MANY_JIT(xs, ys)
+                    for (_flat_idx, _existing_value, _grad, key, future), merged in zip(
+                        batch_claims,
+                        merged_values,
+                        strict=True,
+                    ):
+                        _set_stage_local_claim_result(key=key, future=future, value=merged)
+                for flat_idx, existing_value, grad, key, future in fallback_claims:
+                    target = _value_sharding(grad)
+                    merged = _add_grad_on_accum_target(existing_value, grad, target, flat_idx=flat_idx)
+                    _set_stage_local_claim_result(key=key, future=future, value=merged)
+            return True
+        except BaseException as exc:
+            _restore_stage_local_claims(tuple(claims), exc)
+            raise
+
+    def _fold_stage_local_flat_grad_accums() -> None:
+        """Move stage-local scheduled flat-gradient accumulators to final targets."""
+        with state_lock:
+            pending = list(stage_local_grad_accums.items())
+            stage_local_grad_accums.clear()
+        for (flat_idx, _bucket), value in pending:
+            grad = jax.block_until_ready(_resolve_future_value(value))
+            _accumulate_flat_grad_claimed(flat_idx, grad)
+
+    def _resolve_pending_flat_grad_reductions() -> None:
+        """Resolve queued flat-gradient reductions before final grad materialization."""
+        with state_lock:
+            pending = list(grad_accums.items())
+        for flat_idx, value in pending:
+            if isinstance(value, concurrent.futures.Future):
+                resolved = jax.block_until_ready(value.result())
+                with state_lock:
+                    if grad_accums.get(flat_idx) is value:
+                        grad_accums[flat_idx] = resolved
+            elif isinstance(value, list):
+                continue
+            else:
+                resolved = jax.block_until_ready(_resolve_future_value(value))
+                with state_lock:
+                    if grad_accums.get(flat_idx) is value:
+                        grad_accums[flat_idx] = resolved
+
+    def _fold_deferred_flat_grad_updates() -> None:
+        """Submit deferred flat-gradient updates and resolve queued reducers."""
+        while True:
+            with state_lock:
+                pending_updates = tuple(deferred_flat_grad_updates)
+                deferred_flat_grad_updates.clear()
+            if not pending_updates:
+                break
+            for flat_idx, grad in pending_updates:
+                _accumulate_flat_grad_claimed(flat_idx, grad)
+        _resolve_pending_flat_grad_reductions()
+
+    def _dynamic_invar_transfer_task_name(value: object, *, rank: int, flat_idx: int) -> str | None:
+        if microbatch_mask[flat_idx]:
+            return None
+        source_rank = _rank_for_exact_submesh_device_set(value, rank_submeshes)
+        if source_rank is not None and source_rank != rank:
+            return f"transfer_dynamic_invar_flat{flat_idx}_rank{source_rank}_to_rank{rank}"
+        return None
 
     def _place_dynamic_invar_for_stage(value: object, *, rank: int, flat_idx: int) -> object:
         """Place a live non-batch invar once per dispatch/rank/leaf.
@@ -6197,6 +5664,32 @@ def _dispatch_schedule_fused_async(
                 stage_shardings=stage_shardings,
                 rank_submeshes=rank_submeshes,
             )
+
+        task_name = _dynamic_invar_transfer_task_name(value, rank=rank, flat_idx=flat_idx)
+
+        def place_once() -> object:
+            cache_key = (rank, flat_idx, id(_array_payload(value)))
+            with state_lock:
+                cached = placed_dynamic_invars.get(cache_key)
+            if cached is not None:
+                return cached
+
+            placed = _place_schedule_dynamic_invar(
+                value,
+                rank=rank,
+                flat_idx=flat_idx,
+                leaf_shardings=leaf_shardings,
+                leaf_stage_owners=leaf_stage_owners,
+                stage_shardings=stage_shardings,
+                rank_submeshes=rank_submeshes,
+            )
+            with state_lock:
+                existing = placed_dynamic_invars.setdefault(cache_key, placed)
+            return existing
+
+        gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+        if gate is not None and task_name is not None:
+            return gate.run(task_name, place_once)
 
         cache_key = (rank, flat_idx, id(_array_payload(value)))
         with state_lock:
@@ -6234,11 +5727,91 @@ def _dispatch_schedule_fused_async(
             Result described by this helper.
         """
         t0 = time.perf_counter_ns()
+        focused_stage_call = _ENABLE_FOCUSED_MPMD_DEBUG and task_name in {
+            "stage0_bwd_mb0",
+            "stage0_bwd_i_mb0",
+            "stage0_bwd_w_mb0",
+            "stage0_bwd_mb1",
+            "stage1_bwd_mb0",
+            "stage1_bwd_i_mb0",
+            "stage1_bwd_w_mb0",
+            "stage6_fwd_mb4",
+            "stage6_fwd_mb6",
+            "stage7_bwd_mb2",
+            "stage7_bwd_i_mb2",
+            "stage7_bwd_w_mb2",
+            "stage7_terminal_bwd_mb2",
+            "stage7_terminal_bwd_mb3",
+            "stage7_terminal_bwd_mb4",
+            "stage7_terminal_fwd_mb6",
+            "stage7_terminal_loss_mb6",
+        }
+        if focused_stage_call:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning("SpectraX MPMD focused stage-call start; task=%s rank=%s.", task_name, rank)
+        _all_process_debug_print(
+            "stage-call-start",
+            task=task_name,
+            rank=rank,
+            arg_count=len(call_args),
+            focused=focused_stage_call,
+        )
         try:
-            out = _time_call(task_name, fn, *call_args)
-        except BaseException:
+            gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+            terminal_collective_stage = "_terminal_" in task_name
+
+            def launch_stage_call() -> object:
+                if gate is not None:
+                    slot = _enter_ordered_gate(gate, task_name, rank=rank, kind="stage")
+                    prof = _active_profiler()
+                    stage_t0 = time.perf_counter_ns()
+                    try:
+                        stage_out = fn(*call_args)
+                    finally:
+                        if slot is not None:
+                            slot.release()
+                    if prof is not None:
+                        jax.block_until_ready(stage_out)
+                        prof.record(task_name, (time.perf_counter_ns() - stage_t0) / 1e6)
+                    return stage_out
+                return _time_call(task_name, fn, *call_args)
+
+            if terminal_collective_stage:
+                with collective_launch_lock:
+                    out = launch_stage_call()
+            else:
+                out = launch_stage_call()
+        except BaseException as exc:
+            _all_process_debug_print(
+                "stage-call-error",
+                task=task_name,
+                rank=rank,
+                exc=repr(exc),
+            )
             raise
         elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+        _all_process_debug_print(
+            "stage-call-finish",
+            task=task_name,
+            rank=rank,
+            elapsed_ms=round(elapsed_ms, 3),
+        )
+        if focused_stage_call:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused stage-call finish; task=%s rank=%s elapsed_ms=%.3f.",
+                    task_name,
+                    rank,
+                    elapsed_ms,
+                )
         if stats_collector is not None:
             stats_collector.record_launch(rank, elapsed_ms)
         return out
@@ -6275,6 +5848,225 @@ def _dispatch_schedule_fused_async(
             return
         jax.tree_util.tree_map(check_leaf, value)
 
+    def _track_transfer_future(future: concurrent.futures.Future[object]) -> concurrent.futures.Future[object]:
+        """Track an executor transport future so the dispatcher can wait for gate progress."""
+        with state_lock:
+            pending_transfer_futures.add(future)
+
+        def drop_done(done: concurrent.futures.Future[object]) -> None:
+            with state_lock:
+                pending_transfer_futures.discard(done)
+
+        future.add_done_callback(drop_done)
+        return future
+
+    def _submit_transport_work(fn: Callable[[], object]) -> object | concurrent.futures.Future[object]:
+        """Run or enqueue transport while tracking pending transfer workers.
+
+        Ordered schedules gate collective launches inside ``_transport``. Keeping
+        that wait on the transfer executor lets the producer rank continue
+        launching later stage work instead of tying up the rank worker thread.
+        """
+        if transfer_executor is None:
+            return fn()
+        ctx = contextvars.copy_context()
+        future = transfer_executor.submit(ctx.run, fn)
+        return _track_transfer_future(future)
+
+    def _skip_ordered_transport(task_name: str) -> None:
+        """Advance the ordered gate for a planned transfer with no runtime payload."""
+        gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+        if gate is None:
+            return
+        slot = _enter_ordered_gate(gate, task_name, rank=None, kind="skip")
+        if slot is not None:
+            slot.release()
+
+    def _submit_ordered_transport_sequence(
+        items: tuple[tuple[str, concurrent.futures.Future[object], Callable[[], object]], ...],
+    ) -> None:
+        """Enqueue ordered transport items as one sequential worker task.
+
+        A single stage action can fan out several transfers. Submitting those
+        fanout transfers as independent executor tasks lets a later item occupy
+        a worker while waiting for an earlier gate position, which can starve
+        the earlier item. This keeps the fanout order deterministic without
+        blocking the rank worker that produced the outputs.
+        """
+        if not items:
+            return
+        gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+        if gate is not None:
+
+            def ordered_item_key(
+                item: tuple[str, concurrent.futures.Future[object], Callable[[], object]],
+            ) -> tuple[int, int, str]:
+                position = gate.position_for((item[0],))
+                if position is None:
+                    return (1, 0, item[0])
+                return (0, position, item[0])
+
+            items = tuple(sorted(items, key=ordered_item_key))
+
+        def skip_ordered_transfer(task_name: str) -> None:
+            """Advance the ordered gate for a canceled transfer that will not launch."""
+            _skip_ordered_transport(task_name)
+
+        def run_sequence() -> None:
+            pending_after_error: BaseException | None = None
+            for task_name, result_future, fn in items:
+                if _ENABLE_FOCUSED_MPMD_DEBUG and _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_sequence_logged", 0) < 32:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD ordered transfer sequence item; task=%s cancelled=%s gate=%s.",
+                            task_name,
+                            result_future.cancelled(),
+                            gate.snapshot() if gate is not None else None,
+                        )
+                        _SCHEDULE_TRANSPORT_DIAGNOSTICS["ordered_sequence_logged"] = (
+                            _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_sequence_logged", 0) + 1
+                        )
+                if result_future.cancelled():
+                    skip_ordered_transfer(task_name)
+                    continue
+                if pending_after_error is not None:
+                    if not result_future.cancelled():
+                        result_future.set_exception(pending_after_error)
+                    skip_ordered_transfer(task_name)
+                    continue
+                try:
+                    result = fn()
+                    if not result_future.cancelled():
+                        result_future.set_result(result)
+                except BaseException as exc:
+                    if not result_future.cancelled():
+                        result_future.set_exception(exc)
+                    pending_after_error = exc
+            if pending_after_error is not None:
+                raise pending_after_error
+
+        if transfer_executor is None:
+            run_sequence()
+            return
+        ctx = contextvars.copy_context()
+        _track_transfer_future(transfer_executor.submit(ctx.run, run_sequence))
+
+    def _rank_transport_hops(src_rank: int, dst_rank: int) -> tuple[int, ...]:
+        """Return adjacent pipeline ranks that route ``src_rank`` to ``dst_rank``."""
+        if src_rank == dst_rank:
+            return ()
+        step = 1 if dst_rank > src_rank else -1
+        return tuple(range(src_rank + step, dst_rank + step, step))
+
+    def _routed_stage_edge_transport(
+        value: object,
+        *,
+        producer_logical: int,
+        src_rank: int,
+        dst_rank: int,
+        task_name: str,
+        producer_key: tuple[int, ...] | None = None,
+        output_index: int | None = None,
+    ) -> object:
+        """Move one boundary value through adjacent rank hops.
+
+        Direct producer-to-any-consumer fanout creates long-distance pair-mesh
+        collectives such as rank0->rank3. On multi-controller TPU those launches
+        have been the common stall/crash point. Routing through neighbouring
+        pipeline ranks keeps each collective to one pipeline boundary while
+        preserving the final consumer ABI.
+        """
+        if src_rank == dst_rank:
+            return value
+
+        current = value
+        current_rank = src_rank
+        hops = _rank_transport_hops(src_rank, dst_rank)
+        for hop_rank in hops:
+            if producer_key is not None and output_index is not None:
+                with state_lock:
+                    cached_hop = pretransferred_output_items.get((hop_rank, producer_key, int(output_index)))
+                if isinstance(cached_hop, concurrent.futures.Future):
+                    cached_hop = cached_hop.result() if cached_hop.done() else None
+                if cached_hop is not None:
+                    current = cached_hop
+                    current_rank = hop_rank
+                    continue
+            hop_task_name = task_name if hop_rank == dst_rank else f"{task_name}_hop{current_rank}_to_{hop_rank}"
+            target = _transfer_target_for_edge(
+                current,
+                producer_logical=producer_logical,
+                dst_rank=hop_rank,
+                edge_shardings=edge_shardings,
+                stage_shardings=stage_shardings,
+                rank_submeshes=rank_submeshes,
+                mpmd_mesh=mpmd_mesh,
+            )
+
+            def move_one_hop(
+                transfer_value: object = current,
+                transfer_target: object = target,
+                transfer_task_name: str = hop_task_name,
+                transfer_src_rank: int = current_rank,
+                transfer_dst_rank: int = hop_rank,
+            ) -> object:
+                gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+                if gate is not None:
+                    slot = _enter_ordered_gate(gate, transfer_task_name, rank=transfer_src_rank, kind="transfer")
+                    gate_token = _ORDERED_SCHEDULE_TRANSPORT_GATE.set(None)
+                    slot_token = _ORDERED_SCHEDULE_TRANSPORT_SLOT.set(slot)
+                    try:
+                        with collective_launch_lock:
+                            return _transport(
+                                "device_put",
+                                transfer_value,
+                                transfer_target,
+                                task_name=transfer_task_name,
+                                stats=stats_collector,
+                                src_rank=transfer_src_rank,
+                                dst_rank=transfer_dst_rank,
+                                preserve_current_layout=_preserve_current_layout_for_edge(
+                                    edge_shardings,
+                                    producer_logical,
+                                ),
+                            )
+                    finally:
+                        _ORDERED_SCHEDULE_TRANSPORT_SLOT.reset(slot_token)
+                        _ORDERED_SCHEDULE_TRANSPORT_GATE.reset(gate_token)
+                        if slot is not None:
+                            slot.release()
+                with collective_launch_lock:
+                    return _transport(
+                        "device_put",
+                        transfer_value,
+                        transfer_target,
+                        task_name=transfer_task_name,
+                        stats=stats_collector,
+                        src_rank=transfer_src_rank,
+                        dst_rank=transfer_dst_rank,
+                        preserve_current_layout=_preserve_current_layout_for_edge(edge_shardings, producer_logical),
+                    )
+
+            if hop_rank == dst_rank:
+                current = move_one_hop()
+            else:
+                gate_token = _ORDERED_SCHEDULE_TRANSPORT_GATE.set(None)
+                slot_token = _ORDERED_SCHEDULE_TRANSPORT_SLOT.set(None)
+                try:
+                    current = move_one_hop()
+                finally:
+                    _ORDERED_SCHEDULE_TRANSPORT_SLOT.reset(slot_token)
+                    _ORDERED_SCHEDULE_TRANSPORT_GATE.reset(gate_token)
+            if producer_key is not None and output_index is not None:
+                with state_lock:
+                    pretransferred_output_items.setdefault((hop_rank, producer_key, int(output_index)), current)
+            current_rank = hop_rank
+        return current
+
     def _collect_fwd_invars(logical: int, rank: int, mb: int) -> list[object]:
         """Gather forward-pass input arrays for one (logical stage, rank, microbatch).
 
@@ -6296,6 +6088,24 @@ def _dispatch_schedule_fused_async(
         _progress("collect-fwd-invars-enter", logical=logical, rank=rank, mb=mb)
         invars: list[object] = []
         for source_kind, source_a, source_b in invar_sources[logical]:
+            focused_collect = _ENABLE_FOCUSED_MPMD_DEBUG and (
+                (logical == 7 and mb == 6) or (logical == 6 and mb in {4, 6})
+            )
+            if focused_collect and source_kind == "cluster_out":
+                try:
+                    process_index = jax.process_index()
+                except Exception:
+                    process_index = -1
+                if process_index == 0:
+                    logger.warning(
+                        "SpectraX MPMD focused collect source; logical=%s rank=%s mb=%s kind=%s source_a=%s source_b=%s.",
+                        logical,
+                        rank,
+                        mb,
+                        source_kind,
+                        source_a,
+                        source_b,
+                    )
             if source_kind == "body_invar":
                 flat_idx = dynamic_flat_to_global_flat[source_a]
                 val = mb_args[flat_idx]
@@ -6307,31 +6117,108 @@ def _dispatch_schedule_fused_async(
                 producer_loc = loc_for_logical[source_a]
                 producer_key = _runtime_key(source_a, mb)
                 with state_lock:
-                    pretransferred = pretransferred_outputs.get((rank, producer_key))
+                    pretransferred = pretransferred_output_items.get((rank, producer_key, int(source_b)))
                     producer_outputs = saved_outputs[producer_key]
                 if isinstance(pretransferred, concurrent.futures.Future):
+                    if focused_collect:
+                        try:
+                            process_index = jax.process_index()
+                        except Exception:
+                            process_index = -1
+                        if process_index == 0:
+                            logger.warning(
+                                "SpectraX MPMD focused collect waiting pretransfer; logical=%s rank=%s mb=%s "
+                                "producer=%s producer_rank=%s output=%s.",
+                                logical,
+                                rank,
+                                mb,
+                                source_a,
+                                producer_loc[0],
+                                source_b,
+                            )
                     pretransferred = pretransferred.result()
-                val = (pretransferred if pretransferred is not None else producer_outputs)[source_b]
+                    if focused_collect:
+                        try:
+                            process_index = jax.process_index()
+                        except Exception:
+                            process_index = -1
+                        if process_index == 0:
+                            logger.warning(
+                                "SpectraX MPMD focused collect got pretransfer; logical=%s rank=%s mb=%s "
+                                "producer=%s producer_rank=%s output=%s.",
+                                logical,
+                                rank,
+                                mb,
+                                source_a,
+                                producer_loc[0],
+                                source_b,
+                            )
+                val = pretransferred if pretransferred is not None else producer_outputs[source_b]
                 if producer_loc[0] != rank:
                     if pretransferred is None:
-                        val = _transport(
-                            "device_put",
-                            val,
-                            _transfer_target_for_edge(
-                                val,
-                                producer_logical=source_a,
-                                dst_rank=rank,
-                                edge_shardings=edge_shardings,
-                                stage_shardings=stage_shardings,
-                                rank_submeshes=rank_submeshes,
-                                mpmd_mesh=mpmd_mesh,
-                            ),
-                            task_name=f"transfer_fwd_stage{source_a}_to_stage{logical}_mb{mb}",
-                            stats=stats_collector,
-                            src_rank=producer_loc[0],
+                        transfer_task_name = _fwd_output_transfer_task_name(
+                            producer_logical=source_a,
                             dst_rank=rank,
-                            preserve_current_layout=_preserve_current_layout_for_edge(edge_shardings, source_a),
+                            output_index=int(source_b),
+                            mb=mb,
                         )
+
+                        def do_transfer(
+                            transfer_value: object = val,
+                            src_rank: int = producer_loc[0],
+                            dst_rank: int = rank,
+                            producer_logical: int = source_a,
+                            task_name: str = transfer_task_name,
+                            producer_key_for_transfer: tuple[int, ...] = producer_key,
+                            output_index: int = int(source_b),
+                        ) -> object:
+                            _validate_scheduled_boundary_microbatch(transfer_value, task_name=task_name)
+                            return _routed_stage_edge_transport(
+                                transfer_value,
+                                producer_logical=producer_logical,
+                                src_rank=src_rank,
+                                dst_rank=dst_rank,
+                                task_name=task_name,
+                                producer_key=producer_key_for_transfer,
+                                output_index=output_index,
+                            )
+
+                        moved = _submit_transport_work(do_transfer)
+                        if focused_collect:
+                            try:
+                                process_index = jax.process_index()
+                            except Exception:
+                                process_index = -1
+                            if process_index == 0:
+                                logger.warning(
+                                    "SpectraX MPMD focused collect submitted demand transfer; logical=%s rank=%s mb=%s "
+                                    "producer=%s producer_rank=%s output=%s future=%s.",
+                                    logical,
+                                    rank,
+                                    mb,
+                                    source_a,
+                                    producer_loc[0],
+                                    source_b,
+                                    isinstance(moved, concurrent.futures.Future),
+                                )
+                        result = getattr(moved, "result", None)
+                        val = result() if callable(result) else moved
+                        if focused_collect:
+                            try:
+                                process_index = jax.process_index()
+                            except Exception:
+                                process_index = -1
+                            if process_index == 0:
+                                logger.warning(
+                                    "SpectraX MPMD focused collect demand transfer done; logical=%s rank=%s mb=%s "
+                                    "producer=%s producer_rank=%s output=%s.",
+                                    logical,
+                                    rank,
+                                    mb,
+                                    source_a,
+                                    producer_loc[0],
+                                    source_b,
+                                )
                 invars.append(val)
                 pretransfer_keys_to_drop: list[tuple[int, tuple[int, ...]]] = []
                 with state_lock:
@@ -6340,12 +6227,29 @@ def _dispatch_schedule_fused_async(
                         remaining -= 1
                         if remaining <= 0:
                             remaining_output_uses.pop(producer_key, None)
-                            pretransfer_keys_to_drop = [key for key in pretransferred_outputs if key[1] == producer_key]
+                            pretransfer_keys_to_drop = [
+                                key for key in pretransferred_output_items if key[1] == producer_key
+                            ]
                         else:
                             remaining_output_uses[producer_key] = remaining
                     for pretransfer_key in pretransfer_keys_to_drop:
-                        pretransferred_outputs.pop(pretransfer_key, None)
+                        dropped_pretransfer = pretransferred_output_items.pop(pretransfer_key, None)
+                        if isinstance(dropped_pretransfer, concurrent.futures.Future):
+                            dropped_pretransfer.cancel()
         _progress("collect-fwd-invars-exit", logical=logical, rank=rank, mb=mb, invar_count=len(invars))
+        if _ENABLE_FOCUSED_MPMD_DEBUG and ((logical == 6 and mb == 6) or (logical == 7 and mb == 6)):
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused collect exit; logical=%s rank=%s mb=%s invar_count=%s.",
+                    logical,
+                    rank,
+                    mb,
+                    len(invars),
+                )
         return invars
 
     def _release_consumed_backward_state(logical: int, mb: int, phase: Phase) -> None:
@@ -6411,69 +6315,125 @@ def _dispatch_schedule_fused_async(
             outputs: Outputs value consumed by this operation.
         """
         key = _runtime_key(logical, mb)
-        for consumer_logical in sorted(consumers_by_producer.get(logical, ())):
-            consumer_loc = loc_for_logical[consumer_logical]
-            dst_rank = consumer_loc[0]
+        focused_pretransfer = _ENABLE_FOCUSED_MPMD_DEBUG and (logical, mb) in {(5, 6), (6, 6)}
+        if focused_pretransfer:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused pretransfer enter; logical=%s rank=%s virt=%s mb=%s dsts=%s.",
+                    logical,
+                    rank,
+                    virt,
+                    mb,
+                    sorted(producer_dst_output_indices.get(logical, {}).keys()),
+                )
+        ordered_transfer_items: list[tuple[str, concurrent.futures.Future[object], Callable[[], object]]] = []
+        for dst_rank, output_indices in sorted(producer_dst_output_indices.get(logical, {}).items()):
             if dst_rank == rank:
                 continue
+            if abs(int(dst_rank) - int(rank)) > 1:
+                continue
+            duplicate_consumers = sum(
+                1
+                for consumer_logical in consumers_by_producer.get(logical, ())
+                if loc_for_logical[consumer_logical][0] == dst_rank
+            )
+            duplicate_saves = max(0, duplicate_consumers - len(output_indices))
+            if duplicate_saves and stats_collector is not None:
+                stats_collector.record_boundary_sharing(saved=duplicate_saves)
+            for source_b in sorted(output_indices):
+                value = outputs[source_b]
 
-            def do_transfer(dst: int = dst_rank, consumer: int = consumer_logical) -> tuple[object, ...]:
-                """Run one cross-rank ``device_put`` for the producer's forward outputs.
-
-                Args:
-                    dst: Dst value consumed by this operation.
-                    consumer: Consumer value consumed by this operation.
-
-                Returns:
-                    Result described by this helper.
-                """
-                transfer_task_name = f"transfer_fwd_stage{logical}_to_stage{consumer}_mb{mb}"
-                _validate_scheduled_boundary_microbatch(outputs, task_name=transfer_task_name)
-                _progress(
-                    "pretransfer-fwd-enter",
-                    producer_logical=logical,
-                    consumer_logical=consumer,
-                    mb=mb,
-                    src_rank=rank,
-                    dst_rank=dst,
-                )
-                return cast(
-                    tuple[object, ...],
-                    _transport(
-                        "device_put",
-                        outputs,
-                        _transfer_target_for_edge(
-                            outputs,
-                            producer_logical=logical,
-                            dst_rank=dst,
-                            edge_shardings=edge_shardings,
-                            stage_shardings=stage_shardings,
-                            rank_submeshes=rank_submeshes,
-                            mpmd_mesh=mpmd_mesh,
-                        ),
-                        task_name=transfer_task_name,
-                        stats=stats_collector,
+                def do_transfer(
+                    dst: int = dst_rank,
+                    output_index: int = source_b,
+                    transfer_value: object = value,
+                ) -> object:
+                    """Run one cross-rank ``device_put`` for one producer output."""
+                    transfer_task_name = _fwd_output_transfer_task_name(
+                        producer_logical=logical,
+                        dst_rank=dst,
+                        output_index=output_index,
+                        mb=mb,
+                    )
+                    _validate_scheduled_boundary_microbatch(transfer_value, task_name=transfer_task_name)
+                    _progress(
+                        "pretransfer-fwd-enter",
+                        producer_logical=logical,
+                        output_index=output_index,
+                        mb=mb,
                         src_rank=rank,
                         dst_rank=dst,
-                        preserve_current_layout=_preserve_current_layout_for_edge(edge_shardings, logical),
-                    ),
-                )
+                    )
+                    return _routed_stage_edge_transport(
+                        transfer_value,
+                        producer_logical=logical,
+                        src_rank=rank,
+                        dst_rank=dst,
+                        task_name=transfer_task_name,
+                        producer_key=key,
+                        output_index=output_index,
+                    )
 
-            if transfer_executor is not None:
-                ctx = contextvars.copy_context()
-                moved = transfer_executor.submit(ctx.run, do_transfer)
-            else:
-                moved = do_transfer()
-            with state_lock:
-                pretransferred_outputs[(dst_rank, key)] = moved
-                _progress(
-                    "pretransfer-fwd-submit",
-                    producer_logical=logical,
-                    consumer_logical=consumer_logical,
-                    mb=mb,
-                    src_rank=rank,
-                    dst_rank=dst_rank,
-                    pending_pretransfers=len(pretransferred_outputs),
+                if _ORDERED_SCHEDULE_TRANSPORT_GATE.get() is not None and transfer_executor is not None:
+                    moved = concurrent.futures.Future()
+                    transfer_task_name = _fwd_output_transfer_task_name(
+                        producer_logical=logical,
+                        dst_rank=dst_rank,
+                        output_index=int(source_b),
+                        mb=mb,
+                    )
+                    ordered_transfer_items.append((transfer_task_name, moved, do_transfer))
+                else:
+                    moved = _submit_transport_work(do_transfer)
+                    moved_result = getattr(moved, "result", None)
+                    if callable(moved_result):
+                        moved = moved_result()
+                with state_lock:
+                    pretransferred_output_items[(dst_rank, key, int(source_b))] = moved
+                    _progress(
+                        "pretransfer-fwd-submit",
+                        producer_logical=logical,
+                        output_index=source_b,
+                        mb=mb,
+                        src_rank=rank,
+                        dst_rank=dst_rank,
+                        pending_pretransfers=len(pretransferred_output_items),
+                    )
+                if focused_pretransfer:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD focused pretransfer submitted; logical=%s rank=%s mb=%s "
+                            "dst_rank=%s output=%s future=%s.",
+                            logical,
+                            rank,
+                            mb,
+                            dst_rank,
+                            source_b,
+                            isinstance(moved, concurrent.futures.Future),
+                        )
+        if ordered_transfer_items:
+            _submit_ordered_transport_sequence(tuple(ordered_transfer_items))
+        if focused_pretransfer:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused pretransfer exit; logical=%s rank=%s virt=%s mb=%s ordered_items=%s.",
+                    logical,
+                    rank,
+                    virt,
+                    mb,
+                    len(ordered_transfer_items),
                 )
 
     def _accumulate_bwd_result(
@@ -6510,9 +6470,36 @@ def _dispatch_schedule_fused_async(
             consts_already_accumulated: Consts already accumulated value consumed by this operation.
         """
         phase_label = phase.name.lower()
+        focused_terminal_bwd = _ENABLE_FOCUSED_MPMD_DEBUG and logical == terminal_logical and mb in {2, 3, 4}
+        focused_nonterminal_bwd = (
+            _ENABLE_FOCUSED_MPMD_DEBUG and logical != terminal_logical and logical in {0, 1} and mb in {0, 1}
+        )
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug(
+                "accumulate-enter",
+                logical=logical,
+                rank=rank,
+                mb=mb,
+                phase=phase.name,
+                g_const_leaves=len(jax.tree_util.tree_leaves(g_consts)) if g_consts is not None else 0,
+                g_invar_count=len(g_invars),
+            )
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug(
+                "accumulate-enter",
+                logical=logical,
+                rank=rank,
+                mb=mb,
+                phase=phase.name,
+                g_const_leaves=len(jax.tree_util.tree_leaves(g_consts)) if g_consts is not None else 0,
+                g_invar_count=len(g_invars),
+            )
         _progress("accumulate-bwd-enter", logical=logical, rank=rank, mb=mb, phase=phase.name)
         const_accums = const_tuple_accums if const_grad_accums is None else const_grad_accums
-        cot_updates: list[tuple[tuple[int, int, int], int]] = []
+        cot_updates: list[tuple[tuple[int, ...], int, object]] = []
+        cot_transfer_inputs: list[tuple[tuple[int, ...], int, int, int, object]] = []
+        flat_grad_updates: list[tuple[int, object]] = []
+        ordered_transfer_items: list[tuple[str, concurrent.futures.Future[object], Callable[[], object]]] = []
         if phase is not Phase.BWD_W:
             for invar_idx, (source_kind, source_a, source_b) in enumerate(invar_sources[logical]):
                 if source_kind != "cluster_out":
@@ -6522,77 +6509,187 @@ def _dispatch_schedule_fused_async(
                 producer_loc = loc_for_logical[producer_logical]
                 p_key = _runtime_key(producer_logical, mb)
                 cot = g_invars[invar_idx]
+                if focused_terminal_bwd:
+                    cot_leaf = _first_array_leaf(cot)
+                    _focused_terminal_bwd_debug(
+                        "accumulate-cotangent-before-cast",
+                        invar_idx=invar_idx,
+                        producer_logical=producer_logical,
+                        producer_rank=producer_loc[0],
+                        producer_out_idx=producer_out_idx,
+                        shape=tuple(getattr(cot_leaf, "shape", ())) if cot_leaf is not None else None,
+                        dtype=str(getattr(cot_leaf, "dtype", None)) if cot_leaf is not None else None,
+                    )
                 cot = _cast_cotangent_like(cot, saved_outputs[p_key][producer_out_idx])
-                if producer_loc[0] != rank:
+                if focused_terminal_bwd:
+                    cot_leaf = _first_array_leaf(cot)
+                    _focused_terminal_bwd_debug(
+                        "accumulate-cotangent-after-cast",
+                        invar_idx=invar_idx,
+                        producer_logical=producer_logical,
+                        producer_rank=producer_loc[0],
+                        producer_out_idx=producer_out_idx,
+                        is_float0=_is_float0(cot),
+                        shape=tuple(getattr(cot_leaf, "shape", ())) if cot_leaf is not None else None,
+                        dtype=str(getattr(cot_leaf, "dtype", None)) if cot_leaf is not None else None,
+                    )
+                cot_transfer_inputs.append(
+                    (
+                        p_key,
+                        int(producer_out_idx),
+                        int(producer_logical),
+                        int(producer_loc[0]),
+                        cot,
+                    )
+                )
 
-                    def do_transfer(
-                        value: object = cot,
-                        dst_rank: int = producer_loc[0],
-                        src_rank: int = rank,
-                        src_logical: int = logical,
-                        dst_logical: int = producer_logical,
-                    ) -> object:
-                        """Push one backward cotangent across ranks for the producer to consume.
+        if cot_transfer_inputs:
+            missing_group = object()
+            grouped_cots: dict[tuple[tuple[int, ...], int, int, int], object] = {}
+            grouped_order: list[tuple[tuple[int, ...], int, int, int]] = []
+            for p_key, producer_out_idx, producer_logical, producer_rank, cot in cot_transfer_inputs:
+                group_key = (p_key, producer_out_idx, producer_logical, producer_rank)
+                existing = grouped_cots.get(group_key, missing_group)
+                if existing is missing_group:
+                    grouped_order.append(group_key)
+                    grouped_cots[group_key] = cot
+                    continue
+                grouped_cots[group_key] = _add_grad_on_common_sharding(existing, cot)
 
-                        Args:
-                            value: Value consumed by the helper.
-                            dst_rank: Dst rank value consumed by this operation.
-                            src_rank: Src rank value consumed by this operation.
-                            src_logical: Src logical value consumed by this operation.
-                            dst_logical: Dst logical value consumed by this operation.
+            for p_key, producer_out_idx, producer_logical, producer_rank in grouped_order:
+                cot = grouped_cots[(p_key, producer_out_idx, producer_logical, producer_rank)]
+                if producer_rank == rank:
+                    cot_updates.append((p_key, producer_out_idx, cot))
+                    continue
+                transfer_task_name = _bwd_cotangent_transfer_task_name(
+                    phase_label=phase_label,
+                    consumer_logical=logical,
+                    producer_logical=producer_logical,
+                    output_index=producer_out_idx,
+                    mb=mb,
+                )
+                if _is_float0(cot):
+                    _skip_ordered_transport(transfer_task_name)
+                    cot_updates.append((p_key, producer_out_idx, cot))
+                    continue
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug(
+                        "accumulate-transfer-needed",
+                        task=transfer_task_name,
+                        src_rank=rank,
+                        dst_rank=producer_rank,
+                        src_logical=logical,
+                        dst_logical=producer_logical,
+                        producer_out_idx=producer_out_idx,
+                    )
 
-                        Returns:
-                            Result described by this helper.
-                        """
-                        transfer_task_name = f"transfer_{phase_label}_stage{src_logical}_to_stage{dst_logical}_mb{mb}"
-                        _validate_scheduled_boundary_microbatch(value, task_name=transfer_task_name)
-                        _progress(
-                            "transfer-bwd-cotangent-enter",
-                            src_logical=src_logical,
-                            dst_logical=dst_logical,
-                            mb=mb,
-                            src_rank=src_rank,
-                            dst_rank=dst_rank,
-                            phase=phase.name,
-                        )
-                        return _transport(
-                            "device_put",
-                            value,
-                            _transfer_target_for_edge(
-                                value,
-                                producer_logical=dst_logical,
-                                dst_rank=dst_rank,
-                                edge_shardings=edge_shardings,
-                                stage_shardings=stage_shardings,
-                                rank_submeshes=rank_submeshes,
-                                mpmd_mesh=mpmd_mesh,
-                            ),
-                            task_name=transfer_task_name,
-                            stats=stats_collector,
-                            src_rank=src_rank,
-                            dst_rank=dst_rank,
-                            preserve_current_layout=_preserve_current_layout_for_edge(
-                                edge_shardings,
-                                dst_logical,
-                            ),
-                        )
+                def do_transfer(
+                    value: object = cot,
+                    dst_rank: int = producer_rank,
+                    src_rank: int = rank,
+                    src_logical: int = logical,
+                    dst_logical: int = producer_logical,
+                    task_name: str = transfer_task_name,
+                ) -> object:
+                    """Push one backward cotangent across ranks for the producer to consume."""
+                    _validate_scheduled_boundary_microbatch(value, task_name=task_name)
+                    _progress(
+                        "transfer-bwd-cotangent-enter",
+                        src_logical=src_logical,
+                        dst_logical=dst_logical,
+                        mb=mb,
+                        src_rank=src_rank,
+                        dst_rank=dst_rank,
+                        phase=phase.name,
+                    )
+                    moved_cot = _routed_stage_edge_transport(
+                        value,
+                        producer_logical=dst_logical,
+                        src_rank=src_rank,
+                        dst_rank=dst_rank,
+                        task_name=task_name,
+                    )
+                    if (
+                        _ENABLE_FOCUSED_MPMD_DEBUG
+                        and ((src_logical == 2 and dst_logical == 1) or (src_logical == 1 and dst_logical == 0))
+                        and mb == 0
+                    ):
+                        try:
+                            process_index = jax.process_index()
+                        except Exception:
+                            process_index = -1
+                        if process_index == 0:
+                            leaf = _first_array_leaf(moved_cot)
+                            sharding = getattr(leaf, "sharding", None) if leaf is not None else None
+                            logger.warning(
+                                "SpectraX MPMD focused bwd cotangent moved; task=%s src_rank=%s dst_rank=%s "
+                                "shape=%s dtype=%s axes=%s spec=%s devices=%s.",
+                                task_name,
+                                src_rank,
+                                dst_rank,
+                                tuple(getattr(leaf, "shape", ())) if leaf is not None else None,
+                                getattr(leaf, "dtype", None) if leaf is not None else None,
+                                _mesh_axis_names(sharding),
+                                getattr(sharding, "spec", None),
+                                _device_id_preview(_array_device_set(leaf) if leaf is not None else None),
+                            )
+                    return moved_cot
 
-                    if transfer_executor is not None:
-                        ctx = contextvars.copy_context()
-                        cot = transfer_executor.submit(ctx.run, do_transfer)
-                    else:
-                        cot = do_transfer()
-                cot_updates.append((p_key, producer_out_idx, cot))
+                if _ORDERED_SCHEDULE_TRANSPORT_GATE.get() is not None and transfer_executor is not None:
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("accumulate-transfer-queued", task=transfer_task_name)
+                    cot_future: concurrent.futures.Future[object] = concurrent.futures.Future()
+                    ordered_transfer_items.append((transfer_task_name, cot_future, do_transfer))
+                    cot_updates.append((p_key, producer_out_idx, cot_future))
+                else:
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("accumulate-transfer-submit", task=transfer_task_name)
+                    cot = _submit_transport_work(do_transfer)
+                    cot_result = getattr(cot, "result", None)
+                    if callable(cot_result):
+                        if focused_terminal_bwd:
+                            _focused_terminal_bwd_debug("accumulate-transfer-wait", task=transfer_task_name)
+                        cot = cot_result()
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("accumulate-transfer-done", task=transfer_task_name)
+                    cot_updates.append((p_key, producer_out_idx, cot))
+        if ordered_transfer_items:
+            if focused_terminal_bwd:
+                _focused_terminal_bwd_debug("accumulate-ordered-transfer-submit", count=len(ordered_transfer_items))
+            _submit_ordered_transport_sequence(tuple(ordered_transfer_items))
 
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug(
+                "accumulate-before-state-lock",
+                cot_updates=len(cot_updates),
+                const_accums=len(const_accums),
+            )
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug(
+                "accumulate-before-state-lock",
+                cot_updates=len(cot_updates),
+                const_accums=len(const_accums),
+            )
         with state_lock:
             if phase is not Phase.BWD_I and g_consts is not None:
                 loc_key = _stage_key(logical)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug(
+                        "accumulate-const-enter",
+                        loc_key=loc_key,
+                        consts_already_accumulated=consts_already_accumulated,
+                        loc_key_exists=loc_key in const_accums,
+                    )
                 if consts_already_accumulated:
                     const_accums[loc_key] = g_consts
                 elif loc_key not in const_accums:
                     const_accums[loc_key] = g_consts
                 else:
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("accumulate-const-before-donate", loc_key=loc_key)
                     const_accums[loc_key] = _accumulate_grad_tree_donate(const_accums[loc_key], g_consts)
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("accumulate-const-after-donate", loc_key=loc_key)
 
             if phase is not Phase.BWD_I:
                 for invar_idx, (source_kind, source_a, _source_b) in enumerate(invar_sources[logical]):
@@ -6611,35 +6708,166 @@ def _dispatch_schedule_fused_async(
                             grad_accums[flat_idx] = [None] * m
                         grad_accums[flat_idx][mb] = grad
                     else:
-                        _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
+                        flat_grad_updates.append((flat_idx, grad))
 
-            for p_key, producer_out_idx, cot in cot_updates:
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug(
+                "accumulate-after-state-lock-grad-scan", flat_grad_updates=len(flat_grad_updates)
+            )
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug("accumulate-after-state-lock-grad-scan", flat_grad_updates=len(flat_grad_updates))
+        stage_local_grad_task = _stage_local_grad_accum_task_name(logical=logical, mb=mb, phase=phase)
+        stage_local_grad_updates: list[tuple[int, object]] = []
+        stage_local_grad_slot = None
+        saw_stage_local_grad_update = False
+        for update_idx, (flat_idx, grad) in enumerate(flat_grad_updates):
+            global_nbytes = _grad_global_nbytes(grad)
+            defer_stage_local = flat_idx in shared_body_grad_flat_indices
+            deferred_reason = "shared" if flat_idx in shared_body_grad_flat_indices else None
+            if focused_terminal_bwd:
+                _focused_terminal_bwd_debug(
+                    "accumulate-flat-grad-before-stage-local-merge",
+                    flat_idx=flat_idx,
+                    update_idx=update_idx,
+                    deferred=defer_stage_local,
+                    global_nbytes=global_nbytes,
+                    shared=flat_idx in shared_body_grad_flat_indices,
+                    reason=deferred_reason,
+                )
+            if focused_nonterminal_bwd:
+                _focused_bwd_debug(
+                    "accumulate-flat-grad-before-stage-local-merge",
+                    flat_idx=flat_idx,
+                    update_idx=update_idx,
+                    deferred=defer_stage_local,
+                    global_nbytes=global_nbytes,
+                    shared=flat_idx in shared_body_grad_flat_indices,
+                    reason=deferred_reason,
+                )
+            if defer_stage_local:
+                with state_lock:
+                    deferred_flat_grad_updates.append((flat_idx, grad))
+                    deferred_count = len(deferred_flat_grad_updates)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug(
+                        "accumulate-flat-grad-deferred-stage-local",
+                        flat_idx=flat_idx,
+                        update_idx=update_idx,
+                        deferred=deferred_count,
+                    )
+                if focused_nonterminal_bwd:
+                    _focused_bwd_debug(
+                        "accumulate-flat-grad-deferred-stage-local",
+                        flat_idx=flat_idx,
+                        update_idx=update_idx,
+                        deferred=deferred_count,
+                        reason=deferred_reason,
+                    )
+            else:
+                stage_local_grad_updates.append((flat_idx, grad))
+            if focused_terminal_bwd:
+                _focused_terminal_bwd_debug(
+                    "accumulate-flat-grad-after-stage-local-merge",
+                    flat_idx=flat_idx,
+                    update_idx=update_idx,
+                    deferred=defer_stage_local,
+                    shared=flat_idx in shared_body_grad_flat_indices,
+                    reason=deferred_reason,
+                )
+            if focused_nonterminal_bwd:
+                _focused_bwd_debug(
+                    "accumulate-flat-grad-after-stage-local-merge",
+                    flat_idx=flat_idx,
+                    update_idx=update_idx,
+                    deferred=defer_stage_local,
+                    shared=flat_idx in shared_body_grad_flat_indices,
+                    reason=deferred_reason,
+                )
+        if stage_local_grad_updates:
+            gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+            if gate is not None:
+                stage_local_grad_slot = _enter_ordered_gate(
+                    gate,
+                    stage_local_grad_task,
+                    rank=rank,
+                    kind="stage_local_grad",
+                )
+            try:
+                saw_stage_local_grad_update = _accumulate_stage_local_flat_grad_batch(tuple(stage_local_grad_updates))
+            finally:
+                if stage_local_grad_slot is not None:
+                    stage_local_grad_slot.release()
+        if not saw_stage_local_grad_update:
+            _skip_ordered_transport(stage_local_grad_task)
+
+        for p_key, producer_out_idx, cot in cot_updates:
+            with state_lock:
                 slots = recv_cots.setdefault(
                     p_key,
                     [None] * len(saved_outputs[p_key]),
                 )
                 if slots[producer_out_idx] is None:
                     slots[producer_out_idx] = cot
-                else:
-                    existing = slots[producer_out_idx]
-                    existing_result = getattr(existing, "result", None)
-                    cot_result = getattr(cot, "result", None)
-                    if callable(existing_result):
-                        existing = existing_result()
-                    if callable(cot_result):
-                        cot = cot_result()
-                    slots[producer_out_idx] = _add_grad_on_common_sharding(existing, cot)
-            _progress(
-                "accumulate-bwd-exit",
-                logical=logical,
-                rank=rank,
-                mb=mb,
-                phase=phase.name,
+                    continue
+                existing = slots[producer_out_idx]
+                merge_future: concurrent.futures.Future[object] = concurrent.futures.Future()
+                slots[producer_out_idx] = merge_future
+
+            if focused_terminal_bwd:
+                _focused_terminal_bwd_debug(
+                    "accumulate-cot-merge-claimed",
+                    p_key=p_key,
+                    producer_out_idx=producer_out_idx,
+                    existing_is_future=isinstance(existing, concurrent.futures.Future),
+                    cot_is_future=isinstance(cot, concurrent.futures.Future),
+                )
+            try:
+                existing_value = _resolve_future_value(existing)
+                cot_value = _resolve_future_value(cot)
+                merged = _add_grad_on_common_sharding(existing_value, cot_value)
+            except BaseException as exc:
+                merge_future.set_exception(exc)
+                with state_lock:
+                    current_slots = recv_cots.get(p_key)
+                    if current_slots is not None and current_slots[producer_out_idx] is merge_future:
+                        current_slots[producer_out_idx] = existing
+                raise
+            merge_future.set_result(merged)
+            with state_lock:
+                current_slots = recv_cots.get(p_key)
+                if current_slots is not None and current_slots[producer_out_idx] is merge_future:
+                    current_slots[producer_out_idx] = merged
+            if focused_terminal_bwd:
+                _focused_terminal_bwd_debug(
+                    "accumulate-cot-merge-done",
+                    p_key=p_key,
+                    producer_out_idx=producer_out_idx,
+                )
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug(
+                "accumulate-after-cot-updates",
                 cot_update_count=len(cot_updates),
-                grad_accums=len(grad_accums),
-                const_accums=len(const_accums),
                 recv_cots=len(recv_cots),
+                const_accums=len(const_accums),
             )
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug(
+                "accumulate-after-cot-updates",
+                cot_update_count=len(cot_updates),
+                recv_cots=len(recv_cots),
+                const_accums=len(const_accums),
+            )
+        _progress(
+            "accumulate-bwd-exit",
+            logical=logical,
+            rank=rank,
+            mb=mb,
+            phase=phase.name,
+            cot_update_count=len(cot_updates),
+            grad_accums=len(grad_accums),
+            const_accums=len(const_accums),
+            recv_cots=len(recv_cots),
+        )
 
     def _run_fwd(logical: int, rank: int, virt: int, action: object) -> None:
         """Execute one forward action for the given (rank, virt) location.
@@ -6663,7 +6891,35 @@ def _dispatch_schedule_fused_async(
         key = _runtime_key(logical, mb)
         consts = per_loc_consts[stage_key]
         _progress("run-fwd-enter", logical=logical, rank=rank, virt=virt, mb=mb)
+        focused_fwd = _ENABLE_FOCUSED_MPMD_DEBUG and logical == 6 and mb == 6
+        if focused_fwd:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused fwd before collect; logical=%s rank=%s virt=%s mb=%s.",
+                    logical,
+                    rank,
+                    virt,
+                    mb,
+                )
         invars = _collect_fwd_invars(logical, rank, mb)
+        if focused_fwd:
+            try:
+                process_index = jax.process_index()
+            except Exception:
+                process_index = -1
+            if process_index == 0:
+                logger.warning(
+                    "SpectraX MPMD focused fwd after collect; logical=%s rank=%s virt=%s mb=%s invar_count=%s.",
+                    logical,
+                    rank,
+                    virt,
+                    mb,
+                    len(invars),
+                )
         with rank_submeshes[rank]:
             if logical == terminal_logical:
                 if cache_terminal_grads:
@@ -6685,11 +6941,10 @@ def _dispatch_schedule_fused_async(
                     loss = loss_out[0]
                     g_consts = None
                     g_invars = ()
-                with state_lock:
-                    loss_acc = loss_acc + loss
-                    if cache_terminal_grads and not eager_terminal_bwd:
-                        terminal_grads[key] = (g_consts, g_invars)
-                    saved_inputs[key] = tuple(invars)
+                loss_terms.append(loss)
+                if cache_terminal_grads and not eager_terminal_bwd:
+                    terminal_grads[key] = (g_consts, g_invars)
+                saved_inputs[key] = tuple(invars)
                 if eager_terminal_bwd:
                     if g_consts is None:
                         raise ValueError("Cannot run eager terminal backward when terminal gradients were not computed.")
@@ -6707,7 +6962,33 @@ def _dispatch_schedule_fused_async(
                     _release_consumed_backward_state(logical, mb, Phase.BWD)
                 _progress("run-fwd-terminal-exit", logical=logical, rank=rank, virt=virt, mb=mb)
             else:
+                if focused_fwd:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD focused fwd before stage-call; logical=%s rank=%s virt=%s mb=%s.",
+                            logical,
+                            rank,
+                            virt,
+                            mb,
+                        )
                 out = _stage_call(rank, f"stage{logical}_fwd_mb{mb}", fwd_jits[stage_key], consts, *invars)
+                if focused_fwd:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD focused fwd after stage-call; logical=%s rank=%s virt=%s mb=%s.",
+                            logical,
+                            rank,
+                            virt,
+                            mb,
+                        )
                 with state_lock:
                     saved_inputs[key] = tuple(invars)
                     saved_outputs[key] = out
@@ -6724,7 +7005,33 @@ def _dispatch_schedule_fused_async(
                         saved_outputs=len(saved_outputs),
                         remaining_output_uses=len(remaining_output_uses),
                     )
+                if focused_fwd:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD focused fwd before pretransfer; logical=%s rank=%s virt=%s mb=%s.",
+                            logical,
+                            rank,
+                            virt,
+                            mb,
+                        )
                 _pretransfer_fwd_outputs(logical, rank, virt, mb, out)
+                if focused_fwd:
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    if process_index == 0:
+                        logger.warning(
+                            "SpectraX MPMD focused fwd after pretransfer; logical=%s rank=%s virt=%s mb=%s.",
+                            logical,
+                            rank,
+                            virt,
+                            mb,
+                        )
                 _progress("run-fwd-exit", logical=logical, rank=rank, virt=virt, mb=mb)
 
     def _run_bwd(logical: int, rank: int, virt: int, action: object) -> None:
@@ -6751,18 +7058,74 @@ def _dispatch_schedule_fused_async(
         phase_label = phase.name.lower()
         consts_already_accumulated = False
         cotangents: tuple[object, ...] = ()
+        focused_terminal_bwd = _ENABLE_FOCUSED_MPMD_DEBUG and logical == terminal_logical and mb in {2, 3, 4}
+        focused_nonterminal_bwd = (
+            _ENABLE_FOCUSED_MPMD_DEBUG and logical != terminal_logical and logical in {0, 1} and mb in {0, 1}
+        )
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug(
+                "run-bwd-enter",
+                logical=logical,
+                rank=rank,
+                virt=virt,
+                mb=mb,
+                phase=phase.name,
+                eager_terminal_bwd=eager_terminal_bwd,
+            )
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug(
+                "run-bwd-enter",
+                logical=logical,
+                rank=rank,
+                virt=virt,
+                mb=mb,
+                phase=phase.name,
+            )
         _progress("run-bwd-enter", logical=logical, rank=rank, virt=virt, mb=mb, phase=phase.name)
 
         if logical == terminal_logical and eager_terminal_bwd:
             _progress("run-bwd-terminal-eager-skip", logical=logical, rank=rank, virt=virt, mb=mb)
             return
 
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug("run-bwd-before-saved-inputs", key=key)
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug("run-bwd-before-saved-inputs", key=key)
         invars = saved_inputs[key]
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug("run-bwd-after-saved-inputs", invar_count=len(invars))
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug("run-bwd-after-saved-inputs", invar_count=len(invars))
 
         with rank_submeshes[rank]:
             if logical == terminal_logical:
+                if focused_terminal_bwd:
+                    with state_lock:
+                        active_grad_count = sum(1 for future in active_grad_ready_futures if not future.done())
+                    _focused_terminal_bwd_debug(
+                        "run-bwd-before-active-grad-wait",
+                        active_grad_ready=active_grad_count,
+                    )
+                _wait_active_grad_reductions()
+                if focused_terminal_bwd:
+                    with state_lock:
+                        active_grad_count = sum(1 for future in active_grad_ready_futures if not future.done())
+                    _focused_terminal_bwd_debug(
+                        "run-bwd-after-active-grad-wait",
+                        active_grad_ready=active_grad_count,
+                    )
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug("run-bwd-before-terminal-pop", cached=len(terminal_grads))
                 cached_terminal_grads = terminal_grads.pop(key, None)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug(
+                        "run-bwd-after-terminal-pop",
+                        cache_hit=cached_terminal_grads is not None,
+                        cached=len(terminal_grads),
+                    )
                 if cached_terminal_grads is None:
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("run-bwd-before-terminal-call")
                     _, cached_terminal_grads = _stage_call(
                         rank,
                         f"stage{logical}_terminal_{phase_label}_mb{mb}",
@@ -6770,9 +7133,24 @@ def _dispatch_schedule_fused_async(
                         consts,
                         *invars,
                     )
+                    if focused_terminal_bwd:
+                        _focused_terminal_bwd_debug("run-bwd-after-terminal-call")
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug("run-bwd-before-terminal-ready")
+                cached_terminal_grads = jax.block_until_ready(cached_terminal_grads)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug("run-bwd-after-terminal-ready")
                 g_consts, g_invars = cached_terminal_grads
                 scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug(
+                        "run-bwd-before-scale",
+                        g_const_leaves=len(jax.tree_util.tree_leaves(g_consts)) if g_consts is not None else 0,
+                        g_invar_count=len(g_invars),
+                    )
                 g_invars = tuple(_scale_grad(x, scale) for x in g_invars)
+                if focused_terminal_bwd:
+                    _focused_terminal_bwd_debug("run-bwd-after-scale", g_invar_count=len(g_invars))
             else:
                 if phase is Phase.BWD_W:
                     with state_lock:
@@ -6780,10 +7158,35 @@ def _dispatch_schedule_fused_async(
                 else:
                     cached_cotangents = None
                 if cached_cotangents is None:
+                    if focused_nonterminal_bwd:
+                        slots = recv_cots.get(key)
+                        slot_states = ()
+                        if slots is not None:
+                            slot_states = tuple(
+                                "none"
+                                if slot is None
+                                else f"future_done={slot.done()}"
+                                if isinstance(slot, concurrent.futures.Future)
+                                else f"dtype={getattr(slot, 'dtype', None)} shape={tuple(getattr(slot, 'shape', ())) if hasattr(slot, 'shape') else None}"
+                                for slot in slots
+                            )
+                        _focused_bwd_debug(
+                            "run-bwd-before-cotangents",
+                            recv_slots=0 if slots is None else len(slots),
+                            missing_recv_slots=0 if slots is None else sum(1 for slot in slots if slot is None),
+                            saved_outputs=len(saved_outputs[key]),
+                            slot_states=slot_states,
+                        )
                     cotangents = _materialize_cotangents(
                         recv_cots.get(key),
                         saved_outputs[key],
                     )
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug(
+                            "run-bwd-after-cotangents",
+                            cotangent_count=len(cotangents),
+                            cached=False,
+                        )
                     _progress(
                         "run-bwd-materialized-cotangents",
                         logical=logical,
@@ -6796,6 +7199,12 @@ def _dispatch_schedule_fused_async(
                     )
                 else:
                     cotangents = cached_cotangents
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug(
+                            "run-bwd-after-cotangents",
+                            cotangent_count=len(cotangents),
+                            cached=True,
+                        )
                     _progress(
                         "run-bwd-materialized-cotangents",
                         logical=logical,
@@ -6807,34 +7216,72 @@ def _dispatch_schedule_fused_async(
                         cached=True,
                     )
                 if phase is Phase.BWD_I and bwd_i_jits.get(stage_key) is not None:
+                    task_name = f"stage{logical}_{phase_label}_mb{mb}"
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug(
+                            "run-bwd-before-stage-call",
+                            task=task_name,
+                            invar_count=len(invars),
+                            cotangent_count=len(cotangents),
+                        )
                     g_consts = None
                     g_invars = _stage_call(
                         rank,
-                        f"stage{logical}_{phase_label}_mb{mb}",
+                        task_name,
                         bwd_i_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
                     )
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug("run-bwd-after-stage-call", task=task_name)
                 elif phase is Phase.BWD_W and bwd_w_jits.get(stage_key) is not None:
+                    task_name = f"stage{logical}_{phase_label}_mb{mb}"
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug(
+                            "run-bwd-before-stage-call",
+                            task=task_name,
+                            invar_count=len(invars),
+                            cotangent_count=len(cotangents),
+                        )
                     g_consts, g_invars = _stage_call(
                         rank,
-                        f"stage{logical}_{phase_label}_mb{mb}",
+                        task_name,
                         bwd_w_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
                     )
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug("run-bwd-after-stage-call", task=task_name)
                 else:
+                    task_name = f"stage{logical}_{phase_label}_mb{mb}"
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug(
+                            "run-bwd-before-stage-call",
+                            task=task_name,
+                            invar_count=len(invars),
+                            cotangent_count=len(cotangents),
+                        )
                     g_consts, g_invars = _stage_call(
                         rank,
-                        f"stage{logical}_{phase_label}_mb{mb}",
+                        task_name,
                         bwd_jits[stage_key],
                         consts,
                         *invars,
                         *cotangents,
                     )
+                    if focused_nonterminal_bwd:
+                        _focused_bwd_debug("run-bwd-after-stage-call", task=task_name)
 
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug("run-bwd-before-accumulate")
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug(
+                "run-bwd-before-accumulate",
+                g_const_leaves=len(jax.tree_util.tree_leaves(g_consts)) if g_consts is not None else 0,
+                g_invar_count=len(g_invars),
+            )
         _accumulate_bwd_result(
             loc=loc,
             logical=logical,
@@ -6846,6 +7293,10 @@ def _dispatch_schedule_fused_async(
             const_grad_accums=terminal_const_tuple_accums if logical == terminal_logical else None,
             consts_already_accumulated=consts_already_accumulated,
         )
+        if focused_terminal_bwd:
+            _focused_terminal_bwd_debug("run-bwd-after-accumulate")
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug("run-bwd-after-accumulate")
         if (
             phase is Phase.BWD_I
             and logical != terminal_logical
@@ -6854,6 +7305,8 @@ def _dispatch_schedule_fused_async(
         ):
             _release_bwd_i_output_template(logical, mb, cotangents)
         _release_consumed_backward_state(logical, mb, phase)
+        if focused_nonterminal_bwd:
+            _focused_bwd_debug("run-bwd-after-release")
         _progress("run-bwd-exit", logical=logical, rank=rank, virt=virt, mb=mb, phase=phase.name)
 
     def _run_fused(fwd_logical: int, bwd_logical: int, rank: int, fused: FusedTask) -> None:
@@ -6886,23 +7339,27 @@ def _dispatch_schedule_fused_async(
             bwd_phase=bwd_action.phase.name,
         )
         if fwd_logical != bwd_logical:
-            fwd_ctx = contextvars.copy_context()
-            bwd_ctx = contextvars.copy_context()
-            if fused_pair_executor is not None:
-                futures = (
-                    fused_pair_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
-                    fused_pair_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
-                )
-                for future in concurrent.futures.as_completed(futures):
-                    future.result()
+            if _ORDERED_SCHEDULE_TRANSPORT_GATE.get() is not None:
+                _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
+                _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
             else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as local_executor:
+                fwd_ctx = contextvars.copy_context()
+                bwd_ctx = contextvars.copy_context()
+                if fused_pair_executor is not None:
                     futures = (
-                        local_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
-                        local_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
+                        fused_pair_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
+                        fused_pair_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
                     )
                     for future in concurrent.futures.as_completed(futures):
                         future.result()
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as local_executor:
+                        futures = (
+                            local_executor.submit(fwd_ctx.run, _run_fwd, fwd_logical, rank, fwd_virt, fwd_action),
+                            local_executor.submit(bwd_ctx.run, _run_bwd, bwd_logical, rank, bwd_virt, bwd_action),
+                        )
+                        for future in concurrent.futures.as_completed(futures):
+                            future.result()
         else:
             _run_fwd(fwd_logical, rank, fwd_virt, fwd_action)
             _run_bwd(bwd_logical, rank, bwd_virt, bwd_action)
@@ -7058,11 +7515,21 @@ def _dispatch_schedule_fused_async(
             )
         apply_fn = apply_context["apply_fn"]
         with rank_submeshes[rank]:
-            apply_fn(
-                rank=rank,
-                grad_accums=grad_accums,
-                state=apply_context,
+            gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
+            slot = (
+                _enter_ordered_gate(gate, _apply_task_name(rank=rank), rank=rank, kind="apply")
+                if gate is not None
+                else None
             )
+            try:
+                apply_fn(
+                    rank=rank,
+                    grad_accums=grad_accums,
+                    state=apply_context,
+                )
+            finally:
+                if slot is not None:
+                    slot.release()
 
     def _run_unit(unit: _ScheduleUnit) -> None:
         """Dispatch one unit through the right runner and record its enqueue time.
@@ -7188,6 +7655,8 @@ def _dispatch_schedule_fused_async(
     def _run_units_dependency_async(
         units: list[_ScheduleUnit],
         deps: dict[int, set[int]],
+        *,
+        transfer_worker_count: int | None = None,
     ) -> None:
         """Drive the unit DAG asynchronously across two thread-pool executors.
 
@@ -7224,7 +7693,9 @@ def _dispatch_schedule_fused_async(
 
         with (
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(rank_submeshes))) as executor,
-            concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(rank_submeshes))) as tx_executor,
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(4, 2 * len(rank_submeshes), int(transfer_worker_count or 0))
+            ) as tx_executor,
             concurrent.futures.ThreadPoolExecutor(max_workers=max(2, 2 * len(rank_submeshes))) as pair_executor,
         ):
             transfer_executor = tx_executor
@@ -7239,6 +7710,19 @@ def _dispatch_schedule_fused_async(
                         if unit.rank in active_by_rank:
                             pos += 1
                             continue
+                        with state_lock:
+                            has_pending_inputs = _schedule_unit_has_pending_input_futures(
+                                unit,
+                                recv_cots=recv_cots,
+                                bwd_w_cotangents=bwd_w_cotangents,
+                                pretransferred_output_items=pretransferred_output_items,
+                                loc_for_logical=loc_for_logical,
+                                invar_sources=invar_sources,
+                                runtime_key=_runtime_key,
+                            )
+                        if has_pending_inputs:
+                            pos += 1
+                            continue
                         ready.pop(pos)
                         ctx = contextvars.copy_context()
                         future = executor.submit(ctx.run, _run_unit, unit)
@@ -7247,6 +7731,24 @@ def _dispatch_schedule_fused_async(
                         launched = True
 
                     if not future_to_index:
+                        with state_lock:
+                            has_pending_inputs = any(
+                                _schedule_unit_has_pending_input_futures(
+                                    by_index[idx],
+                                    recv_cots=recv_cots,
+                                    bwd_w_cotangents=bwd_w_cotangents,
+                                    pretransferred_output_items=pretransferred_output_items,
+                                    loc_for_logical=loc_for_logical,
+                                    invar_sources=invar_sources,
+                                    runtime_key=_runtime_key,
+                                )
+                                for idx in ready
+                            )
+                            sum(1 for future in pending_transfer_futures if not future.done())
+                        if has_pending_inputs:
+                            time.sleep(0.005)
+                            ready.sort(key=lambda i: (by_index[i].row, i))
+                            continue
                         if ready:
                             ready_preview = [
                                 {
@@ -7279,16 +7781,255 @@ def _dispatch_schedule_fused_async(
                 transfer_executor = None
                 fused_pair_executor = None
 
-    def _run_units_deterministic_nonblocking(units: list[_ScheduleUnit], deps: dict[int, set[int]]) -> None:
+    def _run_units_ordered_dependency_async(
+        units: list[_ScheduleUnit],
+        deps: dict[int, set[int]],
+        *,
+        event_gate: _OrderedScheduleTransportGate,
+        ordered_transfer_names_by_unit: dict[int, tuple[str, ...]],
+        launch_gate_names_by_unit: dict[int, tuple[str, ...]],
+        transfer_worker_count: int | None = None,
+    ) -> None:
+        """Drive the schedule DAG asynchronously while preserving transfer order.
+
+        Multi-controller pair transports need every process to enter named
+        collective launches in the same sequence. This path keeps one in-flight
+        unit per physical rank, but only pre-compute transfer events are allowed
+        to launch-block a unit. Stage compute, outgoing activation movement, and
+        backward cotangent movement are ordered at their exact transport launch
+        boundary so unrelated ranks can keep overlapping while a producer or
+        consumer waits for data.
+        """
+        nonlocal transfer_executor, fused_pair_executor
+        by_index = {unit.index: unit for unit in units}
+        dependents: dict[int, set[int]] = {unit.index: set() for unit in units}
+        remaining = {idx: set(unit_deps) for idx, unit_deps in deps.items()}
+        for idx, unit_deps in deps.items():
+            for dep in unit_deps:
+                dependents.setdefault(dep, set()).add(idx)
+
+        def ready_sort_key(idx: int) -> tuple[int, int, int, int]:
+            names = launch_gate_names_by_unit.get(idx, ())
+            position = event_gate.position_for(names)
+            unit = by_index[idx]
+            if position is None:
+                return (1, unit.row, unit.rank, idx)
+            return (0, position, unit.rank, idx)
+
+        def sort_ready(items: list[int]) -> None:
+            items.sort(key=ready_sort_key)
+
+        ready = [idx for idx, unit_deps in remaining.items() if not unit_deps]
+        sort_ready(ready)
+        active_by_rank: dict[int, concurrent.futures.Future[object]] = {}
+        future_to_index: dict[concurrent.futures.Future[object], int] = {}
+        future_started_at: dict[concurrent.futures.Future[object], float] = {}
+        transfer_workers = (
+            max(1, int(transfer_worker_count)) if transfer_worker_count is not None else max(4, 2 * len(rank_submeshes))
+        )
+        pair_workers = max(2, 2 * len(rank_submeshes))
+
+        def unit_summary(idx: int, *, now: float | None = None) -> dict[str, object]:
+            """Summarize one unit without capturing large runtime state."""
+            unit = by_index[idx]
+            return {
+                "idx": idx,
+                "row": unit.row,
+                "rank": unit.rank,
+                "virt": unit.virt,
+                "kind": unit.kind,
+                "fwd": (unit.fwd_logical, unit.fwd_mb),
+                "bwd": (unit.bwd_logical, unit.bwd_mb, unit.bwd_phase.name if unit.bwd_phase is not None else None),
+                "ordered": ordered_transfer_names_by_unit.get(idx, ()),
+                "launch_gate": launch_gate_names_by_unit.get(idx, ()),
+                "running_s": None
+                if now is None
+                else f"{now - future_started_at.get(next((f for f, i in future_to_index.items() if i == idx), None), now):.1f}",
+            }
+
+        def unit_preview(indices: list[int] | tuple[int, ...], *, limit: int = 8) -> list[dict[str, object]]:
+            """Return compact unit summaries for diagnostics."""
+            return [unit_summary(idx) for idx in list(indices)[:limit]]
+
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(rank_submeshes))) as executor,
+            concurrent.futures.ThreadPoolExecutor(max_workers=transfer_workers) as tx_executor,
+            concurrent.futures.ThreadPoolExecutor(max_workers=pair_workers) as pair_executor,
+        ):
+            transfer_executor = tx_executor
+            fused_pair_executor = pair_executor
+            try:
+                last_progress_warning = time.perf_counter()
+                while ready or future_to_index:
+                    launched = False
+                    pos = 0
+                    while pos < len(ready):
+                        idx = ready[pos]
+                        unit = by_index[idx]
+                        if unit.rank in active_by_rank:
+                            pos += 1
+                            continue
+                        ordered_names = launch_gate_names_by_unit.get(idx, ())
+                        if ordered_names and not event_gate.ready_for(ordered_names):
+                            pos += 1
+                            continue
+                        with state_lock:
+                            has_pending_inputs = _schedule_unit_has_pending_input_futures(
+                                unit,
+                                recv_cots=recv_cots,
+                                bwd_w_cotangents=bwd_w_cotangents,
+                                pretransferred_output_items=pretransferred_output_items,
+                                loc_for_logical=loc_for_logical,
+                                invar_sources=invar_sources,
+                                runtime_key=_runtime_key,
+                            )
+                        if has_pending_inputs:
+                            pos += 1
+                            continue
+                        ready.pop(pos)
+                        ctx = contextvars.copy_context()
+                        future = executor.submit(ctx.run, _run_unit, unit)
+                        active_by_rank[unit.rank] = future
+                        future_to_index[future] = idx
+                        future_started_at[future] = time.perf_counter()
+                        launched = True
+
+                    if not future_to_index:
+                        with state_lock:
+                            pending_transfer_count = sum(1 for future in pending_transfer_futures if not future.done())
+                            has_pending_transfers = pending_transfer_count > 0
+                            has_pending_inputs = any(
+                                _schedule_unit_has_pending_input_futures(
+                                    by_index[idx],
+                                    recv_cots=recv_cots,
+                                    bwd_w_cotangents=bwd_w_cotangents,
+                                    pretransferred_output_items=pretransferred_output_items,
+                                    loc_for_logical=loc_for_logical,
+                                    invar_sources=invar_sources,
+                                    runtime_key=_runtime_key,
+                                )
+                                for idx in ready
+                            )
+                        if has_pending_inputs:
+                            now = time.perf_counter()
+                            if now - last_progress_warning >= 30.0:
+                                try:
+                                    process_index = jax.process_index()
+                                except Exception:
+                                    process_index = -1
+                                if process_index == 0:
+                                    logger.warning(
+                                        "SpectraX MPMD ordered schedule dispatcher waiting on pending input futures; "
+                                        "pending_transfers=%s ready=%s gate=%s.",
+                                        pending_transfer_count,
+                                        unit_preview(ready),
+                                        event_gate.snapshot(),
+                                    )
+                                last_progress_warning = now
+                            time.sleep(0.005)
+                            sort_ready(ready)
+                            continue
+                        if has_pending_transfers:
+                            now = time.perf_counter()
+                            if now - last_progress_warning >= 30.0:
+                                try:
+                                    process_index = jax.process_index()
+                                except Exception:
+                                    process_index = -1
+                                if process_index == 0:
+                                    logger.warning(
+                                        "SpectraX MPMD ordered schedule dispatcher waiting on pending transfer workers; "
+                                        "pending_transfers=%s ready=%s gate=%s.",
+                                        pending_transfer_count,
+                                        unit_preview(ready),
+                                        event_gate.snapshot(),
+                                    )
+                                last_progress_warning = now
+                            time.sleep(0.005)
+                            sort_ready(ready)
+                            continue
+                        if ready:
+                            now = time.perf_counter()
+                            if now - last_progress_warning >= 30.0:
+                                try:
+                                    process_index = jax.process_index()
+                                except Exception:
+                                    process_index = -1
+                                if process_index == 0:
+                                    logger.warning(
+                                        "SpectraX MPMD ordered schedule dispatcher has gate-blocked ready units "
+                                        "and no local pending transfer worker; ready=%s gate=%s.",
+                                        unit_preview(ready),
+                                        event_gate.snapshot(),
+                                    )
+                                last_progress_warning = now
+                            time.sleep(0.005)
+                            sort_ready(ready)
+                            continue
+                        blocked = {idx: sorted(unit_deps) for idx, unit_deps in remaining.items() if unit_deps}
+                        raise RuntimeError(f"schedule executor dependency cycle or missing dependency: {blocked}")
+
+                    done, _pending = concurrent.futures.wait(
+                        tuple(future_to_index),
+                        timeout=0.005 if ready else 5.0,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        sort_ready(ready)
+                        now = time.perf_counter()
+                        if now - last_progress_warning >= 30.0:
+                            try:
+                                process_index = jax.process_index()
+                            except Exception:
+                                process_index = -1
+                            if process_index == 0:
+                                active_preview = []
+                                for future, idx in list(future_to_index.items())[:8]:
+                                    summary = unit_summary(idx)
+                                    summary["running_s"] = f"{now - future_started_at.get(future, now):.1f}"
+                                    active_preview.append(summary)
+                                logger.warning(
+                                    "SpectraX MPMD ordered schedule dispatcher waiting; active=%s ready=%s gate=%s.",
+                                    active_preview,
+                                    unit_preview(ready),
+                                    event_gate.snapshot(),
+                                )
+                            last_progress_warning = now
+                        continue
+                    for future in done:
+                        idx = future_to_index.pop(future)
+                        future_started_at.pop(future, None)
+                        unit = by_index[idx]
+                        active_by_rank.pop(unit.rank, None)
+                        future.result()
+                        for dependent in dependents.get(idx, ()):
+                            remaining[dependent].discard(idx)
+                            if not remaining[dependent] and dependent not in ready:
+                                ready.append(dependent)
+                        if launched or done:
+                            sort_ready(ready)
+            finally:
+                transfer_executor = None
+                fused_pair_executor = None
+
+    def _run_units_deterministic_nonblocking(
+        units: list[_ScheduleUnit],
+        deps: dict[int, set[int]],
+        *,
+        transfer_worker_count: int | None = None,
+    ) -> None:
         """Topologically enqueue schedule units in one deterministic host order.
 
         Multi-controller TPU dispatch requires every controller to enter JAX
-        computations and pair-mesh transports in the same order.  This launcher
+        computations and pair-mesh transports in the same order. This launcher
         preserves that global host order while still relying on normal JAX
         asynchronous dispatch: it never waits for device completion between
-        units, so disjoint stage meshes can overlap on device.
+        units, so disjoint stage meshes can overlap on device. Cross-rank
+        activation/cotangent transfers are sent to a small executor; the
+        ordered transport gate still serializes collective launch order, while
+        host transfer setup can overlap the next deterministic unit enqueue.
         """
-        nonlocal transfer_executor
+        nonlocal transfer_executor, fused_pair_executor
         by_index = {unit.index: unit for unit in units}
         dependents: dict[int, set[int]] = {unit.index: set() for unit in units}
         remaining = {idx: set(unit_deps) for idx, unit_deps in deps.items()}
@@ -7301,19 +8042,87 @@ def _dispatch_schedule_fused_async(
             key=lambda i: (by_index[i].row, i),
         )
         launched: set[int] = set()
-        transfer_executor = None
-        while ready:
-            idx = ready.pop(0)
-            unit = by_index[idx]
-            if idx in launched:
-                continue
-            _run_unit(unit)
-            launched.add(idx)
-            for dependent in dependents.get(idx, ()):
-                remaining[dependent].discard(idx)
-                if not remaining[dependent] and dependent not in launched and dependent not in ready:
-                    ready.append(dependent)
-            ready.sort(key=lambda i: (by_index[i].row, i))
+        transfer_workers = (
+            max(1, int(transfer_worker_count)) if transfer_worker_count is not None else max(4, 2 * len(rank_submeshes))
+        )
+        pair_workers = max(2, 2 * len(rank_submeshes))
+        log_large_progress = n_logical * m >= 32
+
+        def unit_summary(unit: _ScheduleUnit) -> dict[str, object]:
+            return {
+                "idx": unit.index,
+                "row": unit.row,
+                "rank": unit.rank,
+                "virt": unit.virt,
+                "kind": unit.kind,
+                "fwd": (unit.fwd_logical, unit.fwd_mb),
+                "bwd": (unit.bwd_logical, unit.bwd_mb, unit.bwd_phase.name if unit.bwd_phase is not None else None),
+            }
+
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=transfer_workers) as tx_executor,
+            concurrent.futures.ThreadPoolExecutor(max_workers=pair_workers) as pair_executor,
+        ):
+            transfer_executor = tx_executor
+            fused_pair_executor = pair_executor
+            try:
+                while ready:
+                    idx = ready.pop(0)
+                    unit = by_index[idx]
+                    if idx in launched:
+                        continue
+                    try:
+                        process_index = jax.process_index()
+                    except Exception:
+                        process_index = -1
+                    unit_started = time.perf_counter()
+                    summary = unit_summary(unit)
+                    _all_process_debug_print("det-unit-start", **summary)
+                    if log_large_progress and process_index == 0:
+                        logger.info("SpectraX MPMD deterministic dispatch starting unit %s.", summary)
+                    try:
+                        _run_unit(unit)
+                    except BaseException as exc:
+                        _all_process_debug_print(
+                            "det-unit-error",
+                            idx=unit.index,
+                            row=unit.row,
+                            rank=unit.rank,
+                            virt=unit.virt,
+                            kind=unit.kind,
+                            fwd=(unit.fwd_logical, unit.fwd_mb),
+                            bwd=(
+                                unit.bwd_logical,
+                                unit.bwd_mb,
+                                unit.bwd_phase.name if unit.bwd_phase is not None else None,
+                            ),
+                            exc=repr(exc),
+                        )
+                        raise
+                    elapsed_s = time.perf_counter() - unit_started
+                    _all_process_debug_print(
+                        "det-unit-finish",
+                        idx=unit.index,
+                        row=unit.row,
+                        rank=unit.rank,
+                        virt=unit.virt,
+                        elapsed_s=round(elapsed_s, 3),
+                    )
+                    if log_large_progress and process_index == 0:
+                        logger.info(
+                            "SpectraX MPMD deterministic dispatch finished unit idx=%s in %.2fs.",
+                            unit.index,
+                            elapsed_s,
+                        )
+                    launched.add(idx)
+                    for dependent in dependents.get(idx, ()):
+                        remaining[dependent].discard(idx)
+                        if not remaining[dependent] and dependent not in launched and dependent not in ready:
+                            ready.append(dependent)
+                    ready.sort(key=lambda i: (by_index[i].row, i))
+            finally:
+                transfer_executor = None
+                fused_pair_executor = None
 
         if len(launched) != len(units):
             blocked = {
@@ -7333,37 +8142,38 @@ def _dispatch_schedule_fused_async(
         scheduler starts launching real data. It never executes pair-mesh
         collectives or synthesizes payload data.
         """
-        return
-
         signature = repr((m, _abstract_signature_key(tuple(flat_args_live))))
         warm_keys = plan.setdefault("_warm_compile_signatures", set())
         if signature in warm_keys:
             return
-
         try:
             process_index = jax.process_index()
         except Exception:
             process_index = -1
         started_at = time.perf_counter()
-        futures: list[tuple[str, concurrent.futures.Future[object]]] = []
+        futures: dict[concurrent.futures.Future[object], tuple[str, Callable[[object], None] | None, float]] = {}
         fwd_inputs: dict[tuple[int, ...], tuple[object, ...]] = {}
         fwd_outputs: dict[int, tuple[object, ...]] = {}
         lowered_count = 0
 
-        worker_count = max(1, len(rank_submeshes))
+        if n_logical * m >= 128:
+            worker_count = max(1, min(2, len(rank_submeshes)))
+        else:
+            worker_count = max(1, min(4, len(rank_submeshes)))
         needed_action_phases: dict[tuple[int, ...], set[Phase]] = {}
-        needed_fused: set[tuple[int, ...]] = set()
         for unit in units:
             if unit.kind == "fused" and unit.fwd_logical is not None:
                 logical = unit.fwd_logical
                 fused = unit.payload
-                can_use_stage_fused_jit = (
+                if (
                     isinstance(fused, FusedTask)
-                    and unit.bwd_logical == unit.fwd_logical
-                    and fused.fwd.virtual_stage == fused.bwd.virtual_stage == fused.virtual_stage
-                )
-                if logical != terminal_logical and can_use_stage_fused_jit:
-                    needed_fused.add(tuple(int(x) for x in _stage_key(logical)))
+                    and unit.bwd_logical == logical
+                    and logical != terminal_logical
+                    and unit.bwd_phase is not None
+                ):
+                    needed_action_phases.setdefault(tuple(int(x) for x in _stage_key(logical)), set()).add(
+                        unit.bwd_phase
+                    )
                 continue
             phase = getattr(unit.payload, "phase", None)
             if phase is Phase.FWD or unit.bwd_logical is None:
@@ -7373,14 +8183,14 @@ def _dispatch_schedule_fused_async(
                 continue
             needed_action_phases.setdefault(tuple(int(x) for x in _stage_key(logical)), set()).add(phase)
         if process_index == 0:
-            logger.debug(
+            logger.info(
                 "SpectraX MPMD starting scheduled warm compile for %d logical stage(s), "
                 "%d schedule unit(s), %d action-bwd stage signature(s), %d fused stage signature(s) "
                 "using %d worker thread(s).",
                 n_logical,
                 len(units),
                 sum(len(phases) for phases in needed_action_phases.values()),
-                len(needed_fused),
+                0,
                 worker_count,
             )
 
@@ -7391,16 +8201,115 @@ def _dispatch_schedule_fused_async(
             rank: int,
             fn: Callable[..., object],
             args_for_lower: tuple[object, ...],
+            install: Callable[[object], None] | None = None,
         ) -> object:
             nonlocal lowered_count
             lower = getattr(fn, "lower", None)
             if not callable(lower):
                 return None
+            if process_index == 0:
+                logger.info("SpectraX MPMD warm compile lowering %s.", label)
+            lower_started = time.perf_counter()
             with rank_submeshes[rank]:
                 lowered = lower(*args_for_lower)
+            if process_index == 0:
+                logger.info(
+                    "SpectraX MPMD warm compile lowered %s in %.2fs.",
+                    label,
+                    time.perf_counter() - lower_started,
+                )
             lowered_count += 1
-            futures.append((label, executor.submit(lambda lo=lowered: lo.compile())))
+            started = time.perf_counter()
+
+            def compile_lowered(lo: object = lowered, compile_label: str = label) -> object:
+                compile_started = time.perf_counter()
+                try:
+                    return lo.compile()
+                finally:
+                    if process_index == 0:
+                        logger.info(
+                            "SpectraX MPMD warm compile finished %s in %.2fs.",
+                            compile_label,
+                            time.perf_counter() - compile_started,
+                        )
+
+            future = executor.submit(compile_lowered)
+            futures[future] = (label, install, started)
             return getattr(lowered, "out_info", None)
+
+        def is_input_sharding_mismatch(exc: ValueError) -> bool:
+            message = str(exc)
+            return "input shardings" in message and "shardings of arguments passed to it" in message
+
+        def log_warm_install_fallback(label: str, exc: ValueError) -> None:
+            try:
+                proc = jax.process_index()
+            except Exception:
+                proc = -1
+            if proc == 0:
+                detail = " | ".join(line.strip() for line in str(exc).splitlines() if line.strip())[:700]
+                if not detail:
+                    detail = repr(exc)
+                logger.warning(
+                    "SpectraX MPMD warm executable for %s has incompatible input shardings; "
+                    "falling back to original jit. %s",
+                    label,
+                    detail,
+                )
+
+        def forward_lower_attribute(wrapper: Callable[..., object], original: object) -> None:
+            lower = getattr(original, "lower", None)
+            if callable(lower):
+                try:
+                    wrapper.lower = lower
+                except Exception:
+                    pass
+
+        def install_terminal(compiled: object) -> None:
+            nonlocal terminal_jit
+            if callable(compiled):
+                original = terminal_jit
+                label = "terminal"
+
+                def _call(*args: object) -> object:
+                    nonlocal terminal_jit
+                    try:
+                        return compiled(*args)
+                    except ValueError as exc:
+                        if not is_input_sharding_mismatch(exc):
+                            raise
+                        log_warm_install_fallback(label, exc)
+                        terminal_jit = original
+                        plan["terminal_jit"] = original
+                        return original(*args)
+
+                forward_lower_attribute(_call, original)
+                terminal_jit = _call
+                plan["terminal_jit"] = _call
+
+        def install_into(
+            mapping: dict[tuple[int, ...], Callable[..., object] | None],
+            stage_key: tuple[int, ...],
+            label: str,
+        ) -> Callable[[object], None]:
+            def _install(compiled: object) -> None:
+                if callable(compiled):
+                    original = mapping[stage_key]
+
+                    def _call(*args: object) -> object:
+                        try:
+                            return compiled(*args)
+                        except ValueError as exc:
+                            if not is_input_sharding_mismatch(exc) or original is None:
+                                raise
+                            log_warm_install_fallback(label, exc)
+                            mapping[stage_key] = original
+                            return original(*args)
+
+                    forward_lower_attribute(_call, original)
+                    mapping[stage_key] = _call
+
+            return _install
 
         def as_tuple(value: object) -> tuple[object, ...]:
             if value is None:
@@ -7408,6 +8317,38 @@ def _dispatch_schedule_fused_async(
             if isinstance(value, tuple):
                 return value
             return (value,)
+
+        def normalize_boundary_output(value: object, *, producer_logical: int, rank: int) -> object:
+            value = _abstract_like_value(value)
+            current = getattr(value, "sharding", None)
+            if isinstance(current, jax.sharding.NamedSharding):
+                return value
+            edge_sharding = _edge_sharding_for_logical(edge_shardings, producer_logical)
+            if edge_sharding is not None:
+                target = _transfer_target_for_edge(
+                    value,
+                    producer_logical=producer_logical,
+                    dst_rank=rank,
+                    edge_shardings=edge_shardings,
+                    stage_shardings=stage_shardings,
+                    rank_submeshes=rank_submeshes,
+                    mpmd_mesh=mpmd_mesh,
+                )
+            else:
+                target = jax.sharding.NamedSharding(rank_submeshes[rank], jax.sharding.PartitionSpec())
+                target = _named_sharding_with_memory_kind(target, getattr(current, "memory_kind", None))
+            return _abstract_with_sharding(value, target)
+
+        def abstract_body_invar_for_lower(value: object, *, rank: int, flat_idx: int) -> object:
+            value = _abstract_like_value(value)
+            target = _canonical_stage_sharding(value, leaf_shardings[rank].get(flat_idx), rank_submeshes[rank])
+            if target is not None:
+                target = _prefer_existing_nonreplicated_sharding(value, target, rank_submeshes[rank])
+            if target is None:
+                target = _canonical_stage_sharding(value, getattr(value, "sharding", None), rank_submeshes[rank])
+            if target is None:
+                target = stage_shardings[rank]
+            return _abstract_with_sharding(value, target)
 
         def build_fwd_invars(logical: int, rank: int) -> tuple[object, ...]:
             invars: list[object] = []
@@ -7417,8 +8358,7 @@ def _dispatch_schedule_fused_async(
                     val = mb_args[flat_idx]
                     if microbatch_mask[flat_idx]:
                         val = val[0]
-                    val = _place_dynamic_invar_for_stage(val, rank=rank, flat_idx=flat_idx)
-                    invars.append(_abstract_like_value(val))
+                    invars.append(abstract_body_invar_for_lower(val, rank=rank, flat_idx=flat_idx))
                 elif source_kind == "cluster_out":
                     producer_loc = loc_for_logical[source_a]
                     producer_outputs = fwd_outputs[source_a]
@@ -7453,6 +8393,7 @@ def _dispatch_schedule_fused_async(
                             rank=rank,
                             fn=terminal_jit,
                             args_for_lower=(consts, *invars),
+                            install=install_terminal,
                         )
                     else:
                         out_info = submit_compile(
@@ -7461,8 +8402,12 @@ def _dispatch_schedule_fused_async(
                             rank=rank,
                             fn=fwd_jits[stage_key],
                             args_for_lower=(consts, *invars),
+                            install=install_into(fwd_jits, stage_key, f"stage{logical}:fwd"),
                         )
-                        fwd_outputs[logical] = as_tuple(out_info)
+                        fwd_outputs[logical] = tuple(
+                            normalize_boundary_output(output, producer_logical=logical, rank=rank)
+                            for output in as_tuple(out_info)
+                        )
 
                 warmed_action_bwd: set[tuple[tuple[int, ...], str]] = set()
                 for logical in range(n_logical):
@@ -7496,46 +8441,43 @@ def _dispatch_schedule_fused_async(
                             rank=rank,
                             fn=fn,
                             args_for_lower=(consts, *invars, *cotangents),
+                            install=install_into(
+                                bwd_i_jits if label == "bwd_i" else bwd_w_jits if label == "bwd_w" else bwd_jits,
+                                stage_key,
+                                f"stage{logical}:{label}",
+                            ),
                         )
 
-                warmed_fused: set[tuple[int, ...]] = set()
-                for unit in units:
-                    if unit.kind != "fused" or unit.fwd_logical is None:
-                        continue
-                    logical = unit.fwd_logical
-                    if logical == terminal_logical:
-                        continue
-                    loc = loc_for_logical[logical]
-                    rank, _virt = loc
-                    stage_key = _stage_key(logical)
-                    key = tuple(int(x) for x in stage_key)
-                    if key in warmed_fused or key not in needed_fused:
-                        continue
-                    warmed_fused.add(key)
-                    bwd = bwd_jits.get(stage_key)
-                    if bwd is None:
-                        continue
-                    fused_jit = _get_schedule_fused_fwd_bwd_jit(
-                        fwd_jits[stage_key],
-                        bwd,
-                        n_invars_per_loc[stage_key],
+                installed_count = 0
+                pending = dict(futures)
+                while pending:
+                    done, _ = concurrent.futures.wait(
+                        tuple(pending),
+                        timeout=30.0,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
                     )
-                    consts = per_loc_consts[stage_key]
-                    invars = fwd_inputs[stage_key]
-                    cotangents = fwd_outputs.get(logical, ())
-                    submit_compile(
-                        executor,
-                        label=f"stage{logical}:fused",
-                        rank=rank,
-                        fn=fused_jit,
-                        args_for_lower=(consts, *invars, *invars, *cotangents),
-                    )
-
-                for label, future in futures:
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        raise ValueError(f"SpectraX MPMD warm compile failed for {label}.") from exc
+                    if not done:
+                        if process_index == 0:
+                            now = time.perf_counter()
+                            active = [
+                                f"{label}:{now - started:.1f}s"
+                                for label, _install, started in list(pending.values())[:8]
+                            ]
+                            logger.warning(
+                                "SpectraX MPMD warm compile still waiting on %d executable(s): %s.",
+                                len(pending),
+                                active,
+                            )
+                        continue
+                    for future in done:
+                        label, install, _started = pending.pop(future)
+                        try:
+                            compiled = future.result()
+                        except Exception as exc:
+                            raise ValueError(f"SpectraX MPMD warm compile failed for {label}.") from exc
+                        if install is not None and callable(compiled):
+                            install(compiled)
+                            installed_count += 1
         except Exception:
             plan.pop("_warm_compile_signatures", None)
             raise
@@ -7543,9 +8485,11 @@ def _dispatch_schedule_fused_async(
         warm_keys.add(signature)
         if process_index == 0:
             elapsed = time.perf_counter() - started_at
-            logger.debug(
-                "SpectraX MPMD warm-compiled %d scheduled stage executable(s) in %.2fs using %d worker thread(s).",
+            logger.info(
+                "SpectraX MPMD warm-compiled %d scheduled stage executable(s), "
+                "installed %d executable(s) in %.2fs using %d worker thread(s).",
                 lowered_count,
+                installed_count,
                 elapsed,
                 worker_count,
             )
@@ -7596,82 +8540,338 @@ def _dispatch_schedule_fused_async(
     if deps is None:
         deps = _build_schedule_unit_dependencies(plan, units)
 
-    def _ordered_transfer_names_for_unit(unit: _ScheduleUnit) -> tuple[str, ...]:
-        """Return the deterministic transfer names emitted by one schedule unit.
+    def _ordered_launch_names_for_unit(unit: _ScheduleUnit) -> tuple[str, ...]:
+        """Return deterministic host-launch events for one schedule unit.
 
-        The order is intentionally global, not filtered to this process' local
-        devices. Multi-controller TPU pair collectives are sensitive to the
-        relative launch sequence on overlapping stage pairs: if rank 0 sees
-        ``0->1`` immediately followed by another ``0->1`` while rank 1 sees an
-        intervening ``1->2``, the controllers can enter different pair-mesh
-        executables as their next collective. Every process executes the same
-        Python schedule and non-participating processes create non-addressable
-        handles, so all processes advance through the same event names.
+        Multi-controller pair transports must be produced in one schedule-wide
+        order. Stage launches remain in the ordered sequence because they are
+        the producers of those transfers; dropping them lets later transfer
+        workers outrun an earlier producer and can wedge the gate. Rank-local
+        optimizer apply and stage-local grad accumulation also stay ordered:
+        the small shape can tolerate relaxing local-grad gates, but the large
+        SFT shape crashed near tail apply when those reducers overlapped too
+        aggressively.
         """
         ordered: list[str] = []
+        if unit.kind == "apply":
+            ordered.append(_apply_task_name(rank=unit.rank))
         if unit.fwd_logical is not None and unit.fwd_mb is not None:
             logical = unit.fwd_logical
             rank = unit.rank
             mb = unit.fwd_mb
-            for consumer_logical in sorted(consumers_by_producer.get(logical, ())):
-                dst_rank = loc_for_logical[consumer_logical][0]
+            for source_kind, source_a, _source_b in invar_sources[logical]:
+                if source_kind != "body_invar":
+                    continue
+                flat_idx = dynamic_flat_to_global_flat.get(source_a)
+                if flat_idx is None or microbatch_mask[flat_idx]:
+                    continue
+                try:
+                    value = flat_args_live[flat_idx]
+                except IndexError:
+                    continue
+                task_name = _dynamic_invar_transfer_task_name(value, rank=rank, flat_idx=flat_idx)
+                if task_name is not None:
+                    ordered.append(task_name)
+            for source_kind, producer_logical, source_b in invar_sources[logical]:
+                if source_kind != "cluster_out":
+                    continue
+                producer_rank = loc_for_logical[producer_logical][0]
+                if producer_rank == rank:
+                    continue
+                if abs(int(producer_rank) - int(rank)) <= 1:
+                    continue
+                ordered.append(
+                    _fwd_output_transfer_task_name(
+                        producer_logical=producer_logical,
+                        dst_rank=rank,
+                        output_index=int(source_b),
+                        mb=mb,
+                    )
+                )
+            if logical == terminal_logical:
+                if cache_terminal_grads:
+                    ordered.append(f"stage{logical}_terminal_fwd_mb{mb}")
+                else:
+                    ordered.append(f"stage{logical}_terminal_loss_mb{mb}")
+            else:
+                ordered.append(f"stage{logical}_fwd_mb{mb}")
+            for dst_rank, output_indices in sorted(producer_dst_output_indices.get(logical, {}).items()):
                 if rank != dst_rank:
-                    ordered.append(f"transfer_fwd_stage{logical}_to_stage{consumer_logical}_mb{mb}")
-        if (
-            unit.bwd_logical is not None
-            and unit.bwd_mb is not None
-            and unit.bwd_phase is not None
-            and unit.bwd_phase is not Phase.BWD_W
-        ):
+                    if abs(int(dst_rank) - int(rank)) > 1:
+                        continue
+                    for source_b in sorted(output_indices):
+                        ordered.append(
+                            _fwd_output_transfer_task_name(
+                                producer_logical=logical,
+                                dst_rank=dst_rank,
+                                output_index=int(source_b),
+                                mb=mb,
+                            )
+                        )
+            if eager_terminal_bwd and logical == terminal_logical:
+                for source_kind, producer_logical, _source_b in invar_sources[logical]:
+                    if source_kind != "cluster_out":
+                        continue
+                    dst_rank = loc_for_logical[producer_logical][0]
+                    if rank != dst_rank:
+                        ordered.append(
+                            _bwd_cotangent_transfer_task_name(
+                                phase_label="bwd",
+                                consumer_logical=logical,
+                                producer_logical=producer_logical,
+                                output_index=int(_source_b),
+                                mb=mb,
+                            )
+                        )
+        if unit.bwd_logical is not None and unit.bwd_mb is not None and unit.bwd_phase is not None:
             logical = unit.bwd_logical
             rank = unit.rank
             mb = unit.bwd_mb
             phase_label = unit.bwd_phase.name.lower()
+            if logical == terminal_logical:
+                if not eager_terminal_bwd:
+                    ordered.append(f"stage{logical}_terminal_{phase_label}_mb{mb}")
+            else:
+                ordered.append(f"stage{logical}_{phase_label}_mb{mb}")
+
+            def has_stage_local_grad_accum() -> bool:
+                for source_kind, source_a, _source_b in invar_sources[logical]:
+                    if source_kind != "body_invar":
+                        continue
+                    flat_idx = dynamic_flat_to_global_flat.get(source_a)
+                    if (
+                        flat_idx is None
+                        or flat_idx not in requested_grad_flat_indices
+                        or microbatch_mask[flat_idx]
+                        or flat_idx in shared_body_grad_flat_indices
+                    ):
+                        continue
+                    return True
+                return False
+
+            if unit.bwd_phase is Phase.BWD_W:
+                if has_stage_local_grad_accum():
+                    ordered.append(_stage_local_grad_accum_task_name(logical=logical, mb=mb, phase=unit.bwd_phase))
+                return tuple(dict.fromkeys(ordered))
             for source_kind, producer_logical, _source_b in invar_sources[logical]:
                 if source_kind != "cluster_out":
                     continue
                 dst_rank = loc_for_logical[producer_logical][0]
                 if rank != dst_rank:
-                    ordered.append(f"transfer_{phase_label}_stage{logical}_to_stage{producer_logical}_mb{mb}")
-        return tuple(ordered)
+                    ordered.append(
+                        _bwd_cotangent_transfer_task_name(
+                            phase_label=phase_label,
+                            consumer_logical=logical,
+                            producer_logical=producer_logical,
+                            output_index=int(_source_b),
+                            mb=mb,
+                        )
+                    )
+            if unit.bwd_phase is not Phase.BWD_I:
+                if has_stage_local_grad_accum():
+                    ordered.append(_stage_local_grad_accum_task_name(logical=logical, mb=mb, phase=unit.bwd_phase))
+        return tuple(dict.fromkeys(ordered))
+
+    def _ordered_precompute_launch_gate_names_for_unit(unit: _ScheduleUnit) -> tuple[str, ...]:
+        """Return ordered events that can block before this unit reaches compute.
+
+        Outgoing forward transfers and backward cotangent transfers run after
+        the stage executable has been launched, usually on the transfer worker
+        pool. They should not prevent unrelated ranks from launching their own
+        ready compute. Only dynamic invar placement and non-adjacent demand
+        activation fetches are synchronous before the stage call and therefore
+        useful as dispatcher launch guards.
+        """
+        ordered: list[str] = []
+        if unit.fwd_logical is None or unit.fwd_mb is None:
+            return ()
+        logical = unit.fwd_logical
+        rank = unit.rank
+        mb = unit.fwd_mb
+        for source_kind, source_a, _source_b in invar_sources[logical]:
+            if source_kind != "body_invar":
+                continue
+            flat_idx = dynamic_flat_to_global_flat.get(source_a)
+            if flat_idx is None or microbatch_mask[flat_idx]:
+                continue
+            try:
+                value = flat_args_live[flat_idx]
+            except IndexError:
+                continue
+            task_name = _dynamic_invar_transfer_task_name(value, rank=rank, flat_idx=flat_idx)
+            if task_name is not None:
+                ordered.append(task_name)
+        for source_kind, producer_logical, source_b in invar_sources[logical]:
+            if source_kind != "cluster_out":
+                continue
+            producer_rank = loc_for_logical[producer_logical][0]
+            if producer_rank == rank or abs(int(producer_rank) - int(rank)) <= 1:
+                continue
+            ordered.append(
+                _fwd_output_transfer_task_name(
+                    producer_logical=producer_logical,
+                    dst_rank=rank,
+                    output_index=int(source_b),
+                    mb=mb,
+                )
+            )
+        return tuple(dict.fromkeys(ordered))
 
     def _ordered_transfer_task_order(units: list[_ScheduleUnit], deps: dict[int, set[int]]) -> tuple[str, ...]:
-        """Return a deterministic dependency-compatible pair-transport order."""
-        ordered: list[str] = []
-        for unit in _dependency_topological_schedule_units(units, deps):
-            ordered.extend(_ordered_transfer_names_for_unit(unit))
-        return tuple(ordered)
+        """Return a deterministic dependency-compatible launch order."""
+        return _ordered_schedule_event_order(units, deps, _ordered_launch_names_for_unit)
+
+    def _schedule_preflight_stats(units: list[_ScheduleUnit], deps: dict[int, set[int]]) -> dict[str, object]:
+        """Compute a cheap static measurement snapshot before dispatch starts."""
+        del deps
+        per_rank_units: dict[int, int] = {}
+        per_phase_units: dict[str, int] = {}
+        row_count = len(grid)
+        physical_stages = len(rank_submeshes)
+        total_cells = row_count * max(1, physical_stages)
+        occupied_cells = 0
+        for row in grid:
+            for cell in row:
+                if cell is not None:
+                    occupied_cells += 1
+        for unit in units:
+            per_rank_units[unit.rank] = per_rank_units.get(unit.rank, 0) + 1
+            if unit.kind == "fused":
+                phase = "fused"
+            elif unit.fwd_logical is not None:
+                phase = "fwd"
+            elif unit.bwd_phase is not None:
+                phase = unit.bwd_phase.name.lower()
+            else:
+                phase = unit.kind
+            per_phase_units[phase] = per_phase_units.get(phase, 0) + 1
+        rank_counts = [per_rank_units.get(rank, 0) for rank in range(physical_stages)]
+        fwd_transfer_count_before_sharing = 0
+        fwd_transfer_count_after_sharing = 0
+        bwd_transfer_count_before_sharing = 0
+        bwd_transfer_count_after_sharing = 0
+        for producer_logical, dst_outputs in producer_dst_output_indices.items():
+            src_rank = loc_for_logical[producer_logical][0]
+            for dst_rank, output_indices in dst_outputs.items():
+                if src_rank == dst_rank:
+                    continue
+                fwd_transfer_count_after_sharing += len(output_indices)
+                for consumer_logical in consumers_by_producer.get(producer_logical, ()):
+                    if loc_for_logical[consumer_logical][0] != dst_rank:
+                        continue
+                    fwd_transfer_count_before_sharing += sum(
+                        1
+                        for source_kind, source_a, source_b in invar_sources[consumer_logical]
+                        if (source_kind == "cluster_out" and source_a == producer_logical and source_b in output_indices)
+                    )
+        for consumer_logical, sources in enumerate(invar_sources):
+            consumer_rank = loc_for_logical[consumer_logical][0]
+            shared_bwd_outputs: set[tuple[int, int, int]] = set()
+            for source_kind, producer_logical, source_b in sources:
+                if source_kind != "cluster_out":
+                    continue
+                producer_rank = loc_for_logical[producer_logical][0]
+                if producer_rank == consumer_rank:
+                    continue
+                bwd_transfer_count_before_sharing += int(m)
+                shared_bwd_outputs.add((int(producer_logical), int(source_b), int(producer_rank)))
+            bwd_transfer_count_after_sharing += len(shared_bwd_outputs) * int(m)
+        per_logical_body_grad_leaves: dict[int, int] = {}
+        per_logical_body_grad_gib: dict[int, float] = {}
+        per_logical_shared_body_grad_leaves: dict[int, int] = {}
+        for logical, sources in enumerate(invar_sources):
+            leaf_count = 0
+            shared_count = 0
+            total_nbytes = 0
+            for source_kind, source_a, _source_b in sources:
+                if source_kind != "body_invar":
+                    continue
+                flat_idx = dynamic_flat_to_global_flat.get(source_a)
+                if flat_idx is None or flat_idx not in requested_grad_flat_indices or microbatch_mask[flat_idx]:
+                    continue
+                if flat_idx in shared_body_grad_flat_indices:
+                    shared_count += 1
+                    continue
+                leaf_count += 1
+                try:
+                    total_nbytes += _grad_global_nbytes(flat_args_live[flat_idx])
+                except Exception:
+                    pass
+            per_logical_body_grad_leaves[logical] = leaf_count
+            per_logical_body_grad_gib[logical] = round(total_nbytes / (1024.0**3), 3)
+            if shared_count:
+                per_logical_shared_body_grad_leaves[logical] = shared_count
+        virtual_stages = 1
+        try:
+            virtual_stages = max(1, int(n_logical) // max(1, physical_stages))
+        except Exception:
+            pass
+        stats = {
+            "transport_mode": "auto",
+            "ordered_async_dispatch": bool(use_ordered_deterministic_async or use_ordered_threaded_async),
+            "deterministic_nonblocking_dispatch": bool(use_ordered_deterministic_async),
+            "microbatches": int(m),
+            "physical_stages": physical_stages,
+            "logical_stages": int(n_logical),
+            "virtual_stages_per_rank": virtual_stages,
+            "microbatch_underfilled": int(m) < max(1, int(n_logical)),
+            "steady_state_microbatch_floor": max(1, int(n_logical)),
+            "rows": row_count,
+            "occupied_cells": occupied_cells,
+            "idle_cells": max(0, total_cells - occupied_cells),
+            "idle_fraction": round(max(0, total_cells - occupied_cells) / max(1, total_cells), 4),
+            "unit_count": len(units),
+            "per_rank_units": dict(sorted(per_rank_units.items())),
+            "per_phase_units": dict(sorted(per_phase_units.items())),
+            "stage_balance_spread_units": max(rank_counts, default=0) - min(rank_counts, default=0),
+            "planned_fwd_transfers_before_sharing": fwd_transfer_count_before_sharing,
+            "planned_fwd_transfers_after_sharing": fwd_transfer_count_after_sharing,
+            "planned_fwd_transfer_share_saves": max(
+                0,
+                fwd_transfer_count_before_sharing - fwd_transfer_count_after_sharing,
+            ),
+            "planned_bwd_transfers_before_sharing": bwd_transfer_count_before_sharing,
+            "planned_bwd_transfers_after_sharing": bwd_transfer_count_after_sharing,
+            "planned_bwd_transfer_share_saves": max(
+                0,
+                bwd_transfer_count_before_sharing - bwd_transfer_count_after_sharing,
+            ),
+            "per_logical_body_grad_leaves": dict(sorted(per_logical_body_grad_leaves.items())),
+            "per_logical_body_grad_gib": dict(sorted(per_logical_body_grad_gib.items())),
+            "per_logical_shared_body_grad_leaves": dict(sorted(per_logical_shared_body_grad_leaves.items())),
+        }
+        return stats
 
     ordered_collective_transport = _requires_ordered_collective_transport()
-    if (
-        ordered_collective_transport
-        and _active_profiler() is None
-        and _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_dispatch_logged", 0) < 1
-    ):
+    if ordered_collective_transport and _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_dispatch_logged", 0) < 1:
         try:
             process_index = jax.process_index()
         except Exception:
             process_index = -1
         if process_index == 0:
-            logger.warning(
-                "SpectraX MPMD schedule dispatcher using deterministic stage dispatch with deterministic "
-                "pair-transport ordering because multi-controller stage shardings use different device sets. "
-                "This preserves pair-mesh collective launch order while still relying on asynchronous "
-                "device execution."
+            logger.info(
+                "SpectraX MPMD schedule dispatcher using ordered threaded DAG dispatch because "
+                "multi-controller stage shardings use different device sets. Stage units may overlap by rank "
+                "while cross-host transfer launches are serialized through the ordered transport gate."
             )
         _SCHEDULE_TRANSPORT_DIAGNOSTICS["ordered_dispatch_logged"] = (
             _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("ordered_dispatch_logged", 0) + 1
         )
 
     use_threaded_async = _active_profiler() is None
-    use_ordered_threaded_async = _active_profiler() is None and (ordered_collective_transport or not use_threaded_async)
+    use_ordered_threaded_async = _active_profiler() is None and ordered_collective_transport
+    use_ordered_deterministic_async = False
     action_count = sum(2 if unit.kind == "fused" else 1 for unit in units)
     fused_count = sum(1 for unit in units if unit.kind == "fused")
     stats_collector = _ScheduleStatsCollector(
         dispatcher=(
-            "fused_ordered_nonblocking"
+            "fused_deterministic_async"
+            if use_ordered_deterministic_async
+            else "fused_ordered_async"
             if use_ordered_threaded_async
-            else ("fused_async" if use_threaded_async else "fused_serial_units")
+            else "fused_async"
+            if use_threaded_async
+            else "fused_serial_units"
         ),
         unit_count=len(units),
         action_count=action_count,
@@ -7681,12 +8881,69 @@ def _dispatch_schedule_fused_async(
         terminal_logical=terminal_logical,
         eager_terminal_bwd=eager_terminal_bwd,
     )
+    preflight_stats = _schedule_preflight_stats(units, deps)
+    plan["last_schedule_preflight_stats"] = preflight_stats
+    if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("preflight_logged", 0) < 8:
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index == 0:
+            logger.info(
+                "SpectraX MPMD schedule preflight; transport_mode=%s microbatches=%s physical=%s logical=%s "
+                "virtual_per_rank=%s underfilled=%s steady_floor=%s rows=%s idle_fraction=%s rank_units=%s phase_units=%s "
+                "fwd_transfers_before_sharing=%s after_sharing=%s saved=%s "
+                "bwd_transfers_before_sharing=%s after_sharing=%s saved=%s "
+                "body_grad_leaves=%s body_grad_gib=%s shared_body_grad_leaves=%s.",
+                preflight_stats.get("transport_mode"),
+                preflight_stats.get("microbatches"),
+                preflight_stats.get("physical_stages"),
+                preflight_stats.get("logical_stages"),
+                preflight_stats.get("virtual_stages_per_rank"),
+                preflight_stats.get("microbatch_underfilled"),
+                preflight_stats.get("steady_state_microbatch_floor"),
+                preflight_stats.get("rows"),
+                preflight_stats.get("idle_fraction"),
+                preflight_stats.get("per_rank_units"),
+                preflight_stats.get("per_phase_units"),
+                preflight_stats.get("planned_fwd_transfers_before_sharing"),
+                preflight_stats.get("planned_fwd_transfers_after_sharing"),
+                preflight_stats.get("planned_fwd_transfer_share_saves"),
+                preflight_stats.get("planned_bwd_transfers_before_sharing"),
+                preflight_stats.get("planned_bwd_transfers_after_sharing"),
+                preflight_stats.get("planned_bwd_transfer_share_saves"),
+                preflight_stats.get("per_logical_body_grad_leaves"),
+                preflight_stats.get("per_logical_body_grad_gib"),
+                preflight_stats.get("per_logical_shared_body_grad_leaves"),
+            )
+        _SCHEDULE_TRANSPORT_DIAGNOSTICS["preflight_logged"] = (
+            _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("preflight_logged", 0) + 1
+        )
     _warm_compile_schedule(units)
-    if use_ordered_threaded_async:
+    if use_ordered_deterministic_async:
+        _run_units_deterministic_nonblocking(
+            units,
+            deps,
+            transfer_worker_count=1,
+        )
+    elif use_ordered_threaded_async:
         event_order = _ordered_transfer_task_order(units, deps)
         event_gate = _OrderedScheduleTransportGate(event_order) if event_order else None
+        ordered_transfer_workers = len(event_order) if event_order else None
         with _ordered_schedule_transport_scope(event_gate):
-            _run_units_deterministic_nonblocking(units, deps)
+            if event_gate is not None:
+                ordered_names_by_unit = {unit.index: _ordered_launch_names_for_unit(unit) for unit in units}
+                launch_gate_names_by_unit = ordered_names_by_unit
+                _run_units_ordered_dependency_async(
+                    units,
+                    deps,
+                    event_gate=event_gate,
+                    ordered_transfer_names_by_unit=ordered_names_by_unit,
+                    launch_gate_names_by_unit=launch_gate_names_by_unit,
+                    transfer_worker_count=ordered_transfer_workers,
+                )
+            else:
+                _run_units_dependency_async(units, deps, transfer_worker_count=ordered_transfer_workers)
     elif use_threaded_async:
         _run_units_dependency_async(units, deps)
     else:
@@ -7694,6 +8951,7 @@ def _dispatch_schedule_fused_async(
             _run_unit(unit)
 
     final_grads: list[object] = []
+    _fold_stage_local_flat_grad_accums()
     terminal_const_scale = 1.0 / jnp.asarray(m, dtype=jnp.float32)
     for loc, g_consts in const_tuple_accums.items():
         for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
@@ -7701,7 +8959,7 @@ def _dispatch_schedule_fused_async(
             if flat_idx is None:
                 continue
             grad = g_consts[local_idx]
-            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
+            _accumulate_flat_grad_claimed(flat_idx, grad)
     for loc, g_consts in terminal_const_tuple_accums.items():
         scaled_consts = _scale_grad_tree(g_consts, terminal_const_scale)
         for local_idx, const_idx in enumerate(const_indices_per_loc[loc]):
@@ -7709,7 +8967,9 @@ def _dispatch_schedule_fused_async(
             if flat_idx is None:
                 continue
             grad = scaled_consts[local_idx]
-            _accumulate_flat_grad(grad_accums, flat_idx, grad, grad_targets)
+            _accumulate_flat_grad_claimed(flat_idx, grad)
+    _fold_deferred_flat_grad_updates()
+    grad_reduce_executor.shutdown(wait=True)
     _progress(
         "final-grads-enter",
         grad_accums=len(grad_accums),
@@ -7740,8 +9000,13 @@ def _dispatch_schedule_fused_async(
             final_grads.append(None)
             symbolic_zero_count += 1
 
+    if loss_terms:
+        loss_acc = loss_terms[0]
+        for loss_term in loss_terms[1:]:
+            loss_acc = loss_acc + loss_term
     mean_loss = loss_acc / jnp.asarray(m, dtype=loss_acc.dtype)
     schedule_stats = stats_collector.as_dict(deps, units)
+    schedule_stats["preflight"] = plan.get("last_schedule_preflight_stats")
     plan["last_schedule_runtime_stats"] = schedule_stats
     if _SCHEDULE_TRANSPORT_DIAGNOSTICS.get("runtime_stats_logged", 0) < 8:
         try:
@@ -7749,10 +9014,12 @@ def _dispatch_schedule_fused_async(
         except Exception:
             process_index = -1
         if process_index == 0:
-            logger.debug(
+            logger.info(
                 "SpectraX MPMD schedule runtime stats; dispatcher=%s units=%s actions=%s fused=%s "
                 "transfers=%s skipped=%s cache_hits=%s transfer_gib=%.3f total_launch_ms=%s "
-                "total_unit_ms=%s critical_path_ms=%s per_phase_ms=%s per_rank_ms=%s top_units=%s.",
+                "total_unit_ms=%s critical_path_ms=%s total_gate_wait_ms=%s gate_wait_kind_ms=%s "
+                "per_rank_gate_wait_ms=%s top_gate_wait_ms=%s transport_methods=%s boundary_shared=%s "
+                "boundary_saved=%s per_phase_ms=%s per_rank_ms=%s top_units=%s.",
                 schedule_stats.get("dispatcher"),
                 schedule_stats.get("unit_count"),
                 schedule_stats.get("action_count"),
@@ -7764,6 +9031,13 @@ def _dispatch_schedule_fused_async(
                 schedule_stats.get("total_launch_enqueue_ms"),
                 schedule_stats.get("total_unit_enqueue_ms"),
                 schedule_stats.get("critical_path_ms"),
+                schedule_stats.get("total_gate_wait_ms"),
+                schedule_stats.get("gate_wait_kind_ms"),
+                schedule_stats.get("per_rank_gate_wait_ms"),
+                schedule_stats.get("top_gate_wait_ms"),
+                schedule_stats.get("transport_methods"),
+                schedule_stats.get("boundary_shared_count"),
+                schedule_stats.get("boundary_share_saved_count"),
                 schedule_stats.get("per_phase_enqueue_ms"),
                 schedule_stats.get("per_rank_enqueue_ms"),
                 schedule_stats.get("top_unit_enqueue_ms"),
@@ -9307,6 +10581,7 @@ def _infer_leaf_shardings(
     rank_submeshes: list,
     *,
     stage_rank_resolver: Callable[[tuple[int, int] | None], int | None] | None = None,
+    graphdefs: tuple[GraphDef, ...] = (),
 ) -> tuple[list[dict[int, object]], dict[int, int]]:
     """Auto-infer per-leaf shardings from :class:`Module` logical axis annotations.
 
@@ -9323,12 +10598,71 @@ def _infer_leaf_shardings(
         n: N value consumed by this operation.
         rank_submeshes: Rank submeshes value consumed by this operation.
         stage_rank_resolver: Stage rank resolver value consumed by this operation.
+        graphdefs: Graph definitions captured by the scheduled callable.
 
     Returns:
         Result described by this helper.
     """
     leaf_shardings: list[dict[int, object]] = [{} for _ in range(n)]
     leaf_stage_owners: dict[int, int] = {}
+    graph_stage_owners: dict[tuple[str, str], int] = {}
+    for graphdef in graphdefs:
+        canonical = dict(graphdef.var_canonical)
+        for node_idx, local_ref_id in graphdef.var_refs:
+            if node_idx >= len(graphdef.nodes):
+                continue
+            node = graphdef.nodes[node_idx]
+            if not isinstance(node, VarNode):
+                continue
+            try:
+                assignment = metadata_stage_assignment(dict(node.metadata))
+            except Exception:
+                continue
+            owner = (
+                stage_rank_resolver(assignment) if stage_rank_resolver is not None else resolve_stage_rank(assignment, n)
+            )
+            path = canonical.get(local_ref_id)
+            if owner is not None and path is not None:
+                graph_stage_owners.setdefault((node.collection, path), owner)
+
+    arg_offsets: list[int] = []
+    offset = 0
+    for arg in args:
+        arg_offsets.append(offset)
+        offset += len(jax.tree.leaves(arg))
+
+    for arg, arg_offset in zip(args, arg_offsets, strict=False):
+        if isinstance(arg, State):
+            leaves = jax.tree.leaves(arg)
+            paths = arg.paths()
+            if len(leaves) == len(paths):
+                for li, (col, path) in enumerate(paths):
+                    flat_idx = arg_offset + li
+                    _STATIC_ARG_PATHS.setdefault(flat_idx, f"{col}/{path}")
+                    owner = graph_stage_owners.get((col, path))
+                    leaf = leaves[li]
+                    exact_owner = _rank_for_exact_submesh_device_set(leaf, rank_submeshes)
+                    if exact_owner is not None:
+                        owner = exact_owner
+                    if owner is not None:
+                        leaf_stage_owners[flat_idx] = owner
+                        if hasattr(_array_payload(leaf), "shape"):
+                            target = _canonical_stage_sharding(leaf, _value_sharding(leaf), rank_submeshes[owner])
+                            if target is not None:
+                                leaf_shardings[owner].setdefault(flat_idx, target)
+
+        for li, leaf in enumerate(jax.tree.leaves(arg)):
+            flat_idx = arg_offset + li
+            owner = _rank_for_exact_submesh_device_set(leaf, rank_submeshes)
+            if owner is None or flat_idx in leaf_stage_owners:
+                continue
+            leaf_stage_owners[flat_idx] = owner
+            if not hasattr(_array_payload(leaf), "shape"):
+                continue
+            target = _canonical_stage_sharding(leaf, _value_sharding(leaf), rank_submeshes[owner])
+            if target is not None:
+                leaf_shardings[owner].setdefault(flat_idx, target)
+
     for arg in args:
         if not isinstance(arg, Module):
             continue
@@ -9356,6 +10690,10 @@ def _infer_leaf_shardings(
             owner = (
                 stage_rank_resolver(assignment) if stage_rank_resolver is not None else resolve_stage_rank(assignment, n)
             )
+            if flat_idx < len(flat_init):
+                exact_owner = _rank_for_exact_submesh_device_set(flat_init[flat_idx], rank_submeshes)
+                if exact_owner is not None:
+                    owner = exact_owner
             if owner is not None:
                 leaf_stage_owners[flat_idx] = owner
             leaf_entries.append((flat_idx, col, path, owner))
@@ -10099,224 +11437,7 @@ def _place_state_on_rank(
     return type(state)(out)
 
 
-def _active_profiler() -> "_Profiler | None":
-    """Return the innermost active profiler on this thread, or ``None``.
-
-    Uses thread-local storage so concurrent ``sxcall`` calls from
-    different threads stay independent — useful for nested tests and
-    any future multi-run orchestration.
-
-    Returns:
-        Return the innermost active profiler on this thread, or ``None``.
-    """
-    return getattr(_PROFILER_STATE, "active", None)
-
-
-class _Profiler:
-    """Per-task millisecond accumulator used by :func:`collect_task_times_ms`.
-
-    Holds a flat ``task_name -> list[float_ms]`` dict that the
-    :func:`_time_call` helper appends to whenever a labelled MPMD
-    sub-task completes. One :class:`_Profiler` is active per thread at
-    a time; nested ``collect_task_times_ms`` contexts share the outer
-    profiler's dict so timings remain comparable.
-    """
-
-    def __init__(self) -> None:
-        """Create a profiler with an empty ``task_name -> list[ms]`` map.
-
-        The map is populated by :meth:`record` as :func:`sxcall`'s
-        wrapped callables fire. A fresh profiler is constructed each
-        time :func:`collect_task_times_ms` enters a new (non-nested)
-        context.
-        """
-        self.times_ms: dict[str, list[float]] = {}
-
-    def record(self, task_name: str, dt_ms: float) -> None:
-        """Append a millisecond duration to the bucket for ``task_name``.
-
-        The bucket is created on first use so callers do not need to
-        register names ahead of time.
-
-        Args:
-            task_name: Profiler label (e.g. ``"stage0_fwd_mb3"``).
-            dt_ms: Wall-clock duration of the task, including
-                :func:`jax.block_until_ready`.
-        """
-        self.times_ms.setdefault(task_name, []).append(dt_ms)
-
-
-@contextlib.contextmanager
-def collect_task_times_ms() -> Iterator[dict[str, list[float]]]:
-    """Record wall-clock milliseconds for each MPMD task in the body.
-
-    Yields a ``dict[str, list[float]]`` that's filled as
-    :func:`sxcall` executes: keys are task names like
-    ``"stage0_fwd_mb3"`` / ``"stage2_bwd_i_mb0"``, values are a list
-    of per-call durations in milliseconds (one entry per schedule
-    action). :func:`jax.block_until_ready` is called before recording,
-    so timings include actual device-side work, not just dispatch.
-
-    Only one profiler may be active per thread at a time — nested
-    calls share the outer profiler's dict.
-
-    Example::
-
-            with collect_task_times_ms() as times:
-                loss, grads = sxcall(model, (x, y), mpmd_mesh=mm, ...)
-
-            for name, ms in sorted(times.items()):
-                print(f"{name}: {ms}")
-
-    Returns:
-        Result described by this helper.
-    """
-    outer = _active_profiler()
-    if outer is not None:
-        yield outer.times_ms
-        return
-    prof = _Profiler()
-    _PROFILER_STATE.active = prof
-    try:
-        yield prof.times_ms
-    finally:
-        _PROFILER_STATE.active = None
-
-
-def _time_call(
-    task_name: str,
-    fn: Callable[..., object],
-    *args: object,
-) -> object:
-    """Invoke ``fn(*args)`` and record its wall time when a profiler is active.
-
-    When no profiler is on the current thread the call is dispatched
-    directly with no overhead. When one is active we wrap the call in
-    :func:`time.perf_counter_ns` and :func:`jax.block_until_ready` so
-    the recorded time reflects device-side work rather than just
-    Python dispatch latency.
-
-    Args:
-        task_name: Profiler bucket label.
-        fn: Callable to invoke.
-        *args: Positional arguments for ``fn``.
-
-    Returns:
-        Whatever ``fn(*args)`` returned.
-    """
-    prof = _active_profiler()
-    if prof is None:
-        return fn(*args)
-    t0 = time.perf_counter_ns()
-    out = fn(*args)
-    jax.block_until_ready(out)
-    prof.record(task_name, (time.perf_counter_ns() - t0) / 1e6)
-    return out
-
-
 TransportKind = Literal["device_put"]
-
-
-class _OrderedScheduleTransportGate:
-    """Deterministically order named schedule transfers while units run async."""
-
-    def __init__(self, task_order: tuple[str, ...]) -> None:
-        self._task_order = task_order
-        self._task_set = set(task_order)
-        self._task_positions = {name: idx for idx, name in enumerate(task_order)}
-        self._position = 0
-        self._condition = threading.Condition()
-
-    def ready_for(self, task_names: tuple[str, ...]) -> bool:
-        """Return whether a task's first ordered transfer is ready to enter."""
-        first_ordered = next((name for name in task_names if name in self._task_set), None)
-        if first_ordered is None:
-            return True
-        with self._condition:
-            if self._position >= len(self._task_order):
-                return True
-            return self._task_order[self._position] == first_ordered
-
-    def next_task(self) -> str | None:
-        """Return the next ordered transfer name, if any."""
-        with self._condition:
-            if self._position >= len(self._task_order):
-                return None
-            return self._task_order[self._position]
-
-    def position_for(self, task_names: tuple[str, ...]) -> int | None:
-        """Return the earliest deterministic position for ``task_names``."""
-        positions = [self._task_positions[name] for name in task_names if name in self._task_positions]
-        return min(positions, default=None)
-
-    def run(self, task_name: str | None, fn: Callable[[], object]) -> object:
-        """Run ``fn`` when ``task_name`` is the next deterministic transfer."""
-        if task_name is None or task_name not in self._task_set:
-            return fn()
-        with self._condition:
-            while self._position < len(self._task_order) and self._task_order[self._position] != task_name:
-                self._condition.wait()
-        try:
-            return fn()
-        finally:
-            with self._condition:
-                if self._position < len(self._task_order) and self._task_order[self._position] == task_name:
-                    self._position += 1
-                    self._condition.notify_all()
-
-    def enter(self, task_name: str | None) -> "_OrderedScheduleTransportSlot | None":
-        """Wait until ``task_name`` may launch and return an explicit release slot."""
-        if task_name is None or task_name not in self._task_set:
-            return None
-        with self._condition:
-            while self._position < len(self._task_order) and self._task_order[self._position] != task_name:
-                self._condition.wait()
-        return _OrderedScheduleTransportSlot(self, task_name)
-
-    def _release(self, task_name: str) -> None:
-        """Advance past ``task_name`` once its ordered launch has been issued."""
-        with self._condition:
-            if self._position < len(self._task_order) and self._task_order[self._position] == task_name:
-                self._position += 1
-                self._condition.notify_all()
-
-
-class _OrderedScheduleTransportSlot:
-    """Idempotent release handle for one ordered transport launch."""
-
-    def __init__(self, gate: _OrderedScheduleTransportGate, task_name: str) -> None:
-        self._gate = gate
-        self._task_name = task_name
-        self._released = False
-        self._lock = threading.Lock()
-
-    def release(self) -> None:
-        """Release the ordered slot at most once."""
-        with self._lock:
-            if self._released:
-                return
-            self._released = True
-        self._gate._release(self._task_name)
-
-
-_ORDERED_SCHEDULE_TRANSPORT_GATE: contextvars.ContextVar[_OrderedScheduleTransportGate | None] = contextvars.ContextVar(
-    "spectrax_ordered_schedule_transport_gate", default=None
-)
-_ORDERED_SCHEDULE_TRANSPORT_SLOT: contextvars.ContextVar[_OrderedScheduleTransportSlot | None] = contextvars.ContextVar(
-    "spectrax_ordered_schedule_transport_slot", default=None
-)
-
-
-@contextlib.contextmanager
-def _ordered_schedule_transport_scope(
-    gate: _OrderedScheduleTransportGate | None,
-) -> Iterator[None]:
-    """Install a deterministic transfer gate for the current schedule dispatch."""
-    token = _ORDERED_SCHEDULE_TRANSPORT_GATE.set(gate)
-    try:
-        yield
-    finally:
-        _ORDERED_SCHEDULE_TRANSPORT_GATE.reset(token)
 
 
 def _transport(
@@ -10369,6 +11490,63 @@ def _transport(
         ``x`` unchanged when it already satisfies the destination sharding, or a
         value placed according to ``dest_sharding``/the retargeted sharding.
     """
+    transport_started_s = time.perf_counter()
+
+    def log_transfer_progress(event: str, *, method: str | None = None) -> None:
+        """Emit bounded always-on transfer progress while debugging stalls."""
+        try:
+            process_index = jax.process_index()
+        except Exception:
+            process_index = -1
+        if process_index != 0:
+            return
+        focused_task = (
+            _ENABLE_FOCUSED_MPMD_DEBUG
+            and task_name is not None
+            and (
+                "transfer_fwd_stage0_to_rank1_out0_mb0" in task_name
+                or "transfer_fwd_stage0_to_rank1_out1_mb0" in task_name
+                or "stage0_to_rank3_out1_mb6" in task_name
+                or "stage2_to_stage1_mb0" in task_name
+                or "stage1_to_stage0_mb0" in task_name
+                or "stage6_to_rank0" in task_name
+                or "stage5_to_rank1" in task_name
+                or "stage7_to_stage6_mb3" in task_name
+                or "transfer_gradient_flat365" in task_name
+            )
+        )
+        if not focused_task:
+            return
+        with _TRANSPORT_PROGRESS_LOCK:
+            logged = _TRANSPORT_PROGRESS_DIAGNOSTICS.get("logged", 0)
+            if logged >= 256:
+                return
+            _TRANSPORT_PROGRESS_DIAGNOSTICS["logged"] = logged + 1
+        source_leaf = _first_array_leaf(x)
+        target_leaf = _first_sharding_leaf(dest_sharding)
+        source_sharding = getattr(source_leaf, "sharding", None) if source_leaf is not None else None
+        source_devices = _array_device_set(source_leaf) if source_leaf is not None else None
+        target_devices = _sharding_device_set(target_leaf)
+        logger.warning(
+            "SpectraX MPMD transfer progress; event=%s method=%s task=%s src_rank=%s dst_rank=%s "
+            "shape=%s dtype=%s source_axes=%s source_spec=%s source_devices=%s "
+            "target_axes=%s target_spec=%s target_devices=%s elapsed_s=%.3f.",
+            event,
+            method,
+            task_name,
+            src_rank,
+            dst_rank,
+            tuple(getattr(source_leaf, "shape", ())) if source_leaf is not None else None,
+            getattr(source_leaf, "dtype", None) if source_leaf is not None else None,
+            _mesh_axis_names(source_sharding),
+            getattr(source_sharding, "spec", None),
+            _device_id_preview(source_devices),
+            _mesh_axis_names(target_leaf),
+            getattr(target_leaf, "spec", None),
+            _device_id_preview(target_devices),
+            time.perf_counter() - transport_started_s,
+        )
+
     if kind != "device_put":
         raise ValueError(f"Unknown transport kind: {kind!r}.")
     target_sharding = _retarget_transfer_sharding(x, dest_sharding) if preserve_current_layout else dest_sharding
@@ -10402,6 +11580,28 @@ def _transport(
             src_rank=src_rank,
             dst_rank=dst_rank,
         )
+    transport_source_leaf = _first_array_leaf(x)
+    transport_target_leaf = _first_sharding_leaf(target_sharding)
+    _all_process_debug_print(
+        "transport-start",
+        task=task_name,
+        src_rank=src_rank,
+        dst_rank=dst_rank,
+        nbytes=nbytes,
+        skip=skip,
+        cache_hit=cache_hit,
+        shape=tuple(getattr(transport_source_leaf, "shape", ())) if transport_source_leaf is not None else None,
+        dtype=str(getattr(transport_source_leaf, "dtype", None)) if transport_source_leaf is not None else None,
+        source_devices=_device_id_preview(_array_device_set(transport_source_leaf))
+        if transport_source_leaf is not None
+        else None,
+        target_spec=getattr(transport_target_leaf, "spec", None),
+        target_devices=_device_id_preview(_sharding_device_set(transport_target_leaf)),
+    )
+
+    def record_method(method: str) -> None:
+        if stats is not None:
+            stats.record_transport_method(method)
 
     def put_with_target() -> object:
         """Place ``x`` on the resharded target, enforcing cross-device safety.
@@ -10445,6 +11645,8 @@ def _transport(
         with jax.named_scope(f"spectrax/mpmd/transport/{edge}"):
             rewrapped = _try_rewrap_from_target_subset(x, target_sharding)
             if rewrapped is not None:
+                record_method("subset_rewrap")
+                log_transfer_progress("method-end", method="subset_rewrap")
                 return rewrapped
 
             source_leaf_for_transport = _first_array_leaf(x)
@@ -10458,20 +11660,24 @@ def _transport(
                 and target_devices_for_transport is not None
                 and source_devices_for_transport != target_devices_for_transport
             )
+            source_is_inexact = source_leaf_for_transport is not None and jnp.issubdtype(
+                jnp.dtype(getattr(source_leaf_for_transport, "dtype", jnp.float32)), jnp.inexact
+            )
             single_controller = jax.process_count() <= 1
             if single_controller and cross_device_transport:
                 try:
-                    return jax.device_put(x, target_sharding)
+                    log_transfer_progress("method-start", method="device_put_direct_single_controller")
+                    out = jax.device_put(x, target_sharding)
+                    record_method("device_put_direct_single_controller")
+                    log_transfer_progress("method-end", method="device_put_direct_single_controller")
+                    return out
                 except (TypeError, ValueError):
                     logger.debug(
                         "Single-controller direct MPMD runtime transfer failed; falling back to compiled transport.",
                         exc_info=True,
                     )
-
-            moved = _reshard_with_jitted_identity(x, target_sharding)
-            if moved is not None and _value_matches_target_sharding(moved, target_sharding):
-                return moved
-            if cross_device_transport:
+            if cross_device_transport and source_is_inexact:
+                log_transfer_progress("method-start", method="pair_ppermute_cross_device")
                 moved = verified_pair_transport(
                     _try_pair_ppermute_transport(
                         x,
@@ -10480,22 +11686,61 @@ def _transport(
                         src_rank=src_rank,
                         dst_rank=dst_rank,
                     ),
-                    phase="post_jit_cross_device",
+                    phase="pre_jit_cross_device",
                 )
                 if moved is not None:
+                    record_method("pair_ppermute")
+                    log_transfer_progress("method-end", method="pair_ppermute_cross_device")
                     return moved
-            moved = verified_pair_transport(
-                _try_pair_ppermute_transport(
-                    x,
-                    target_sharding,
-                    task_name=task_name,
-                    src_rank=src_rank,
-                    dst_rank=dst_rank,
-                ),
-                phase="post_jit",
-            )
-            if moved is not None:
+                log_transfer_progress("method-miss", method="pair_ppermute_cross_device")
+            log_transfer_progress("method-start", method="hlo_identity")
+            moved = _reshard_with_jitted_identity(x, target_sharding)
+            if moved is not None and _value_matches_target_sharding(moved, target_sharding):
+                if gate is not None and cross_device_transport:
+                    # Ordered multi-controller transport must not advance the
+                    # Python gate before the device-side reshard has actually
+                    # completed; otherwise later collectives can overtake it.
+                    jax.block_until_ready(moved)
+                    record_method("hlo_identity_blocking_ordered")
+                    log_transfer_progress("method-end", method="hlo_identity_blocking_ordered")
+                else:
+                    record_method("hlo_identity")
+                    log_transfer_progress("method-end", method="hlo_identity")
                 return moved
+            if cross_device_transport and not source_is_inexact:
+                log_transfer_progress("method-start", method="pair_ppermute_cross_device_metadata")
+                moved = verified_pair_transport(
+                    _try_pair_ppermute_transport(
+                        x,
+                        target_sharding,
+                        task_name=task_name,
+                        src_rank=src_rank,
+                        dst_rank=dst_rank,
+                    ),
+                    phase="post_jit_cross_device_metadata",
+                )
+                if moved is not None:
+                    record_method("pair_ppermute")
+                    log_transfer_progress("method-end", method="pair_ppermute_cross_device_metadata")
+                    return moved
+                log_transfer_progress("method-miss", method="pair_ppermute_cross_device_metadata")
+            if not cross_device_transport:
+                log_transfer_progress("method-start", method="pair_ppermute")
+                moved = verified_pair_transport(
+                    _try_pair_ppermute_transport(
+                        x,
+                        target_sharding,
+                        task_name=task_name,
+                        src_rank=src_rank,
+                        dst_rank=dst_rank,
+                    ),
+                    phase="post_jit",
+                )
+                if moved is not None:
+                    record_method("pair_ppermute")
+                    log_transfer_progress("method-end", method="pair_ppermute")
+                    return moved
+                log_transfer_progress("method-miss", method="pair_ppermute")
             source_leaf = _first_array_leaf(x)
             target_leaf = _first_sharding_leaf(target_sharding)
             source_sharding = getattr(source_leaf, "sharding", None) if source_leaf is not None else None
@@ -10527,7 +11772,11 @@ def _transport(
                     f"same_index_abi={source_leaf is not None and _same_index_sharding_abi(source_leaf, target_leaf)}."
                 )
             try:
-                return jax.device_put(x, target_sharding)
+                log_transfer_progress("method-start", method="device_put")
+                out = jax.device_put(x, target_sharding)
+                record_method("device_put")
+                log_transfer_progress("method-end", method="device_put")
+                return out
             except (TypeError, ValueError) as err:
                 if target_sharding is dest_sharding:
                     raise
@@ -10549,13 +11798,42 @@ def _transport(
                         f"target_device_ids={_device_id_preview(dest_devices)}, "
                         f"target_spec={getattr(dest_leaf, 'spec', None)}."
                     ) from err
-                return jax.device_put(x, dest_sharding)
+                log_transfer_progress("method-start", method="device_put_fallback")
+                out = jax.device_put(x, dest_sharding)
+                record_method("device_put_fallback")
+                log_transfer_progress("method-end", method="device_put_fallback")
+                return out
 
     def run_transport() -> object:
         """Execute the named transport body, advancing any ordered gate even for skips."""
-        if skip:
-            return x
-        return put_with_target()
+        log_transfer_progress("start")
+        try:
+            if skip:
+                record_method("skip")
+                log_transfer_progress("skip", method="skip")
+                _all_process_debug_print(
+                    "transport-finish", task=task_name, src_rank=src_rank, dst_rank=dst_rank, method="skip"
+                )
+                return x
+            out = put_with_target()
+            log_transfer_progress("finish")
+            _all_process_debug_print(
+                "transport-finish",
+                task=task_name,
+                src_rank=src_rank,
+                dst_rank=dst_rank,
+                elapsed_s=round(time.perf_counter() - transport_started_s, 3),
+            )
+            return out
+        except BaseException as exc:
+            _all_process_debug_print(
+                "transport-error",
+                task=task_name,
+                src_rank=src_rank,
+                dst_rank=dst_rank,
+                exc=repr(exc),
+            )
+            raise
 
     gate = _ORDERED_SCHEDULE_TRANSPORT_GATE.get()
 
@@ -10751,902 +12029,6 @@ def _last_use_table(grid: list[list[object]]) -> dict[tuple[int, int], int]:
             key = (s, action.microbatch)
             last[key] = t
     return last
-
-
-def _delete_if_possible(x: object) -> None:
-    """Free an array's device buffer if JAX allows it.
-
-    :class:`jax.Array` exposes a ``.delete()`` method on newer JAX
-    versions; older versions / non-committed arrays silently ignore.
-    Exceptions are swallowed so the schedule loop never crashes on a
-    donation miss.
-
-    Args:
-        x: Input value consumed by the operation.
-    """
-    try:
-        delete = getattr(x, "delete", None)
-        if callable(delete):
-            delete()
-    except Exception:
-        pass
-
-
-def _delete_tree_arrays(x: object) -> None:
-    """Best-effort deletion for every array-like leaf in a pytree."""
-    if x is None:
-        return
-    try:
-        jax.tree.map(lambda leaf: _delete_if_possible(leaf), x, is_leaf=_is_leaf)
-    except Exception:
-        _delete_if_possible(x)
-
-
-def _is_leaf(x: object) -> bool:
-    """Stop pytree traversal at JAX arrays and Spectrax :class:`Variable` nodes.
-
-    Used as the ``is_leaf`` argument throughout the MPMD runtime so
-    that :class:`Variable` containers (which are themselves pytrees of
-    metadata + array) are kept whole — otherwise their internal
-    metadata leaks out as separate flat-leaf entries and breaks the
-    flat-arg <-> outer-jaxpr-invar correspondence.
-
-    Args:
-        x: object pytree node.
-
-    Returns:
-        ``True`` when ``x`` is a :class:`jax.Array` or
-        :class:`Variable`.
-    """
-    return isinstance(x, jax.Array | Variable)
-
-
-def _is_float0(x: object) -> bool:
-    """Return ``True`` when ``x`` carries the JAX ``float0`` zero-sized sentinel.
-
-    JAX uses ``float0`` to mark cotangents of integer-valued primals
-    (produced when ``allow_int=True`` is passed to autodiff). These
-    leaves cannot participate in arithmetic; the runtime must short
-    them out before scaling or addition.
-
-    Args:
-        x: object pytree leaf.
-
-    Returns:
-        ``True`` iff ``x.dtype == jax.dtypes.float0``.
-    """
-    return getattr(x, "dtype", None) == jax.dtypes.float0
-
-
-def _scale_grad(x: object, scale: object) -> object:
-    """Multiply ``x`` by ``scale`` unless ``x`` is a ``float0`` sentinel.
-
-    ``float0`` leaves are returned unchanged so the resulting pytree
-    can still be passed back through JAX's autodiff plumbing.
-
-    Args:
-        x: Cotangent leaf.
-        scale: Scalar multiplier.
-
-    Returns:
-        ``x * scale`` for normal arrays, ``x`` for ``float0``.
-    """
-    if x is None or _is_float0(x):
-        return x
-    return x * scale
-
-
-def _add_grad(a: object, b: object) -> object:
-    """Add two cotangent leaves treating ``float0`` as the additive identity.
-
-    When either operand is ``float0`` the other is returned untouched.
-    Mirrors JAX's autodiff convention so accumulating grads from
-    integer-input branches does not raise.
-
-    Args:
-        a: First cotangent leaf.
-        b: Second cotangent leaf.
-
-    Returns:
-        ``a + b`` (or whichever operand is non-``float0``).
-    """
-    if a is None:
-        return b
-    if b is None:
-        return a
-    if _is_float0(a):
-        return b
-    if _is_float0(b):
-        return a
-    return a + b
-
-
-def _cast_cotangent_like(cotangent: object, primal: object) -> object:
-    """Cast ``cotangent`` to its matching ``primal`` dtype before transport.
-
-    Some XLA backends complain when a cotangent's dtype differs from
-    the producer's output dtype; casting here keeps the transport
-    well-typed without forcing the upstream backward jit to widen its
-    grads. ``float0`` cotangents are returned untouched.
-
-    Args:
-        cotangent: The incoming cotangent array.
-        primal: The forward output whose dtype defines the target.
-
-    Returns:
-        ``cotangent`` cast to ``primal.dtype`` (or unchanged when
-        already matching, when one side has no dtype, or when the
-        cotangent is ``float0``).
-    """
-    if _is_float0(cotangent):
-        return cotangent
-    cot_dtype = getattr(cotangent, "dtype", None)
-    primal_dtype = getattr(primal, "dtype", None)
-    if cot_dtype is not None and primal_dtype is not None and cot_dtype != primal_dtype and hasattr(cotangent, "astype"):
-        return cotangent.astype(primal_dtype)
-    return cotangent
-
-
-def _microbatch(x: jax.Array, m: int) -> jax.Array:
-    """Reshape a ``(B, ...)`` array into ``(m, B // m, ...)`` microbatches.
-
-    The leading batch axis is split into ``m`` microbatches of equal
-    size; ``B`` must be evenly divisible by ``m``. Non-array or scalar
-    leaves are returned unchanged as a safety net.
-
-    Args:
-        x: Input array with leading batch dimension.
-        m: Number of microbatches.
-
-    Returns:
-        A new array shaped ``(m, B // m, *x.shape[1:])``, or ``x`` itself
-        if it has no batch dimension.
-
-    Raises:
-        ValueError: If ``B`` is not a multiple of ``m``.
-    """
-    if not _has_microbatch_axis(x):
-        return x
-    b = x.shape[0]
-    if b % m:
-        raise ValueError(f"Batch size {b} not divisible by number of microbatches {m}.")
-    return cast(jax.Array, _split_microbatch_stack(x, m, context="_microbatch"))
-
-
-def _partition_spec_entry_axes(axis: object) -> tuple[object, ...]:
-    """Return the concrete mesh-axis entries used by one ``PartitionSpec`` item."""
-    if axis is None:
-        return ()
-    if isinstance(axis, tuple):
-        return tuple(part for part in axis if part is not None)
-    return (axis,)
-
-
-def _merged_flattened_partition_axis(left: object, right: object) -> object:
-    """Merge the sharding axes for dimensions collapsed by a reshape."""
-    axes = _partition_spec_entry_axes(left) + _partition_spec_entry_axes(right)
-    if not axes:
-        return None
-    if len(set(axes)) != len(axes):
-        raise ValueError(
-            "SpectraX cannot flatten a microbatch stack whose first two dimensions "
-            f"reuse a mesh axis: left={left!r}, right={right!r}."
-        )
-    return axes[0] if len(axes) == 1 else axes
-
-
-def _named_sharding_with_memory_kind(sharding: jax.sharding.NamedSharding, memory_kind: object) -> object:
-    """Attach ``memory_kind`` to a ``NamedSharding`` when the backend exposes it."""
-    if memory_kind is None or not hasattr(sharding, "with_memory_kind"):
-        return sharding
-    try:
-        return sharding.with_memory_kind(memory_kind)
-    except Exception:
-        return sharding
-
-
-def _reshape_with_named_shardings(
-    value: object,
-    out_shape: tuple[int, ...],
-    *,
-    in_sharding: jax.sharding.NamedSharding,
-    out_sharding: object,
-) -> object:
-    """Run an eager reshape with explicit input/output shardings."""
-
-    def _reshape(x):
-        return jnp.reshape(x, out_shape)
-
-    return jax.jit(_reshape, in_shardings=in_sharding, out_shardings=out_sharding)(value)
-
-
-def _split_microbatch_stack(value: object, m: int, *, context: str) -> object:
-    """Split ``(batch, ...)`` into ``(microbatch, batch_per_microbatch, ...)``.
-
-    The reshape introduces a scheduler axis. That new axis is logical control
-    flow, not model/data parallelism, so any existing sharding on the original
-    batch dimension must move to the new per-microbatch batch dimension.
-    """
-    if not _has_microbatch_axis(value):
-        return value
-    shape = tuple(int(dim) for dim in value.shape)
-    batch = shape[0]
-    if batch % m:
-        raise ValueError(f"Batch size {batch} not divisible by number of microbatches {m}.")
-
-    out_shape = (int(m), batch // int(m), *shape[1:])
-    source_sharding = getattr(value, "sharding", None)
-    if not isinstance(source_sharding, jax.sharding.NamedSharding):
-        return value.reshape(out_shape)
-
-    source_parts = list(tuple(source_sharding.spec))
-    while len(source_parts) < len(shape):
-        source_parts.append(None)
-    target_spec = jax.sharding.PartitionSpec(None, *source_parts[: len(shape)])
-    mismatches = _spec_axis_shape_mismatches(target_spec, source_sharding.mesh, out_shape)
-    if mismatches:
-        raise ValueError(
-            "SpectraX cannot preserve sharding while splitting a batch into microbatches. "
-            f"context={context}, input_shape={shape}, output_shape={out_shape}, "
-            f"source_axes={getattr(source_sharding.mesh, 'axis_names', None)}, "
-            f"source_spec={source_sharding.spec}, target_spec={target_spec}, invalid_dims={mismatches}. "
-            "Change the batch size, microbatch count, or sharding policy so the "
-            "per-microbatch batch dimension is divisible by its mesh-axis product."
-        )
-
-    target_sharding = jax.sharding.NamedSharding(source_sharding.mesh, target_spec)
-    target_sharding = _named_sharding_with_memory_kind(target_sharding, getattr(source_sharding, "memory_kind", None))
-    return _reshape_with_named_shardings(
-        value,
-        out_shape,
-        in_sharding=source_sharding,
-        out_sharding=target_sharding,
-    )
-
-
-def _flatten_microbatch_stack(value: object, m: int, *, context: str) -> object:
-    """Flatten ``(microbatch, batch, ...)`` while preserving the current layout.
-
-    Forward-only MPMD auxiliary calls return full-batch tensors by collapsing the
-    schedule microbatch axis back into the logical batch axis.  The reshape must
-    carry over the value's existing sharding; otherwise XLA may choose a weaker
-    layout such as TP-only and materialize a huge per-device buffer.
-    """
-    if not hasattr(value, "shape") or getattr(value, "ndim", len(getattr(value, "shape", ()))) < 2:
-        return value
-    shape = tuple(int(dim) for dim in value.shape)
-    if shape[0] != int(m):
-        return value
-
-    out_shape = (shape[0] * shape[1], *shape[2:])
-    source_sharding = getattr(value, "sharding", None)
-    if not isinstance(source_sharding, jax.sharding.NamedSharding):
-        return value.reshape(out_shape)
-
-    source_spec = tuple(source_sharding.spec)
-    source_parts = list(source_spec)
-    while len(source_parts) < len(shape):
-        source_parts.append(None)
-
-    merged_axis = _merged_flattened_partition_axis(source_parts[0], source_parts[1])
-    target_spec = jax.sharding.PartitionSpec(merged_axis, *source_parts[2 : 1 + len(out_shape)])
-    mismatches = _spec_axis_shape_mismatches(target_spec, source_sharding.mesh, out_shape)
-    if mismatches:
-        raise ValueError(
-            "SpectraX cannot preserve sharding while flattening a microbatch stack. "
-            f"context={context}, input_shape={shape}, output_shape={out_shape}, "
-            f"source_axes={getattr(source_sharding.mesh, 'axis_names', None)}, "
-            f"source_spec={source_sharding.spec}, target_spec={target_spec}, invalid_dims={mismatches}."
-        )
-
-    target_sharding = jax.sharding.NamedSharding(source_sharding.mesh, target_spec)
-    target_sharding = _named_sharding_with_memory_kind(target_sharding, getattr(source_sharding, "memory_kind", None))
-    return _reshape_with_named_shardings(
-        value,
-        out_shape,
-        in_sharding=source_sharding,
-        out_sharding=target_sharding,
-    )
-
-
-def _split_params_rest(state: State) -> tuple[State, State]:
-    """Partition a :class:`State` into differentiable params and the remainder.
-
-    The MPMD runtime treats the ``"parameters"`` collection as the
-    grad-bearing portion and everything else (e.g. RNG state, batch
-    norm running stats) as ``rest``. Splitting up front lets each
-    stage's forward / backward jits accept ``params`` as the gradient
-    target without touching the rest.
-
-    Args:
-        state: The full module state.
-
-    Returns:
-        ``(params_state, rest_state)`` — each a :class:`State` with
-        the corresponding subset of collections.
-    """
-    raw = state.raw()
-    params_raw: dict[str, dict[str, object]] = {}
-    rest_raw: dict[str, dict[str, object]] = {}
-    for c, d in raw.items():
-        (params_raw if c == "parameters" else rest_raw)[c] = dict(d)
-    return State(params_raw), State(rest_raw)
-
-
-def _get_fused_fwd_bwd_jit(
-    fwd_jit: Callable[..., object],
-    bwd_jit: Callable[..., object],
-) -> Callable[..., object]:
-    """Return a cached jit that performs a ``(fwd_A, bwd_B)`` pair in one dispatch.
-
-    For 1F1B-family schedules at steady state each rank alternates one
-    forward (microbatch ``A``) and one backward (microbatch ``B``).
-    Dispatching each as its own jit pays two trace/dispatch costs per
-    microbatch; fusing them into one compiled kernel halves that cost
-    and lets XLA interleave their HLO for better register reuse.
-
-    The fused jit's signature is::
-
-            (params, rest, x_fwd, x_bwd, g_y_bwd)
-                -> (y_fwd, g_params_bwd, g_x_bwd)
-
-        ``x_bwd`` is the saved activation for mb ``B`` (captured during
-        its earlier forward); the runtime still manages saved_inputs /
-        recv_cots / grad_accum the same way — only the dispatch count
-        changes.
-
-    Args:
-        fwd_jit: Fwd jit value consumed by this operation.
-        bwd_jit: Bwd jit value consumed by this operation.
-
-    Returns:
-        Return a cached jit that performs a ``(fwd_A, bwd_B)`` pair in one dispatch.
-    """
-    key = (id(fwd_jit), id(bwd_jit))
-    cached = _FUSED_FWDBWD_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    @jax.jit
-    def fused(params, rest, x_fwd, x_bwd, g_y_bwd):
-        """Run forward on ``x_fwd`` and backward on ``(x_bwd, g_y_bwd)`` in one HLO.
-
-        Args:
-            params: Parameter mapping or primitive parameter dictionary.
-            rest: Rest value consumed by this operation.
-            x_fwd: X fwd value consumed by this operation.
-            x_bwd: X bwd value consumed by this operation.
-            g_y_bwd: G y bwd value consumed by this operation.
-        """
-        with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd"):
-            with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd/forward"):
-                y_fwd = fwd_jit(params, rest, x_fwd)
-            with jax.named_scope("spectrax/mpmd/train/fused_fwdbwd/backward"):
-                g_params, g_x = bwd_jit(params, rest, x_bwd, g_y_bwd)
-            return y_fwd, g_params, g_x
-
-    _FUSED_FWDBWD_CACHE[key] = fused
-    weak_invalidate(fwd_jit, _FUSED_FWDBWD_CACHE, key)
-    weak_invalidate(bwd_jit, _FUSED_FWDBWD_CACHE, key)
-    return fused
-
-
-def _get_vmap_loss_and_g_y(
-    loss_fn: Callable[..., jax.Array],
-    donate_argnums: tuple[int, ...] = (),
-) -> Callable[..., object]:
-    """Return a cached jit that vmaps ``loss_fn`` + ``d_loss/d_y`` over microbatches.
-
-    The wrapper takes ``y_stack`` of shape ``(M, ...)`` plus matching
-    target stacks and returns ``(loss_stack, g_y_stack)``. Used by the
-    GPipe vmap fast-path to compute every microbatch's loss/cotangent
-    in a single device-side launch. Cached on
-    ``(id(loss_fn), donate_argnums)`` in :data:`_VMAP_LOSS_CACHE`.
-
-    Args:
-        loss_fn: User loss callable ``(y, *targets) -> scalar``.
-        donate_argnums: Argnums whose buffers may be donated.
-
-    Returns:
-        Jitted ``(y_stack, *t_stack) -> (loss_stack, g_y_stack)``.
-    """
-    key = (id(loss_fn), donate_argnums)
-    cached = _VMAP_LOSS_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    if donate_argnums:
-
-        @functools.partial(jax.jit, donate_argnums=donate_argnums)
-        def vmap_loss(y_stack, *t_stack):
-            """Vmap ``per_mb`` over the leading microbatch axis under one jit.
-
-            Returns ``(loss_stack, g_y_stack)`` with leading axis ``M``;
-            both per-mb losses and per-mb cotangents are produced in
-            one compiled program so the GPipe fast-path can fuse the
-            terminal forward, loss, and backward.
-
-            Args:
-                y_stack: Y stack value consumed by this operation.
-                *t_stack: Additional positional arguments forwarded to the wrapped callable or backend.
-            """
-
-            def per_mb(y_, *t_):
-                """Compute ``(loss, d_loss/d_y)`` for a single microbatch slice.
-
-                Wrapped in :func:`jax.vmap` upstream so this body sees
-                one microbatch at a time even though the input tensors
-                are the full ``(M, ...)`` stacks.
-
-                Args:
-                    y_: Y  value consumed by this operation.
-                    *t_: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-                return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
-
-            with jax.named_scope("spectrax/mpmd/loss/vmap_loss_and_grad_y"):
-                return jax.vmap(per_mb)(y_stack, *t_stack)
-
-    else:
-
-        @jax.jit
-        def vmap_loss(y_stack, *t_stack):
-            """Vmap ``per_mb`` over the leading microbatch axis under one jit.
-
-            Returns ``(loss_stack, g_y_stack)`` with leading axis ``M``;
-            both per-mb losses and per-mb cotangents are produced in
-            one compiled program so the GPipe fast-path can fuse the
-            terminal forward, loss, and backward.
-
-            Args:
-                y_stack: Y stack value consumed by this operation.
-                *t_stack: Additional positional arguments forwarded to the wrapped callable or backend.
-            """
-
-            def per_mb(y_, *t_):
-                """Compute ``(loss, d_loss/d_y)`` for a single microbatch slice.
-
-                Wrapped in :func:`jax.vmap` upstream so this body sees
-                one microbatch at a time even though the input tensors
-                are the full ``(M, ...)`` stacks.
-
-                Args:
-                    y_: Y  value consumed by this operation.
-                    *t_: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-                return jax.value_and_grad(lambda yy: loss_fn(yy, *t_))(y_)
-
-            with jax.named_scope("spectrax/mpmd/loss/vmap_loss_and_grad_y"):
-                return jax.vmap(per_mb)(y_stack, *t_stack)
-
-    _VMAP_LOSS_CACHE[key] = vmap_loss
-    weak_invalidate(loss_fn, _VMAP_LOSS_CACHE, key)
-    return vmap_loss
-
-
-@jax.jit
-def _vmap_sum_grads(g_stack):
-    """Sum a per-microbatch gradient stack along its leading axis.
-
-    The GPipe vmap fast-path produces gradients shaped
-    ``(M, *param_shape)`` because each microbatch contributes
-    independently. Summing along axis 0 collapses the stack into the
-    same parameter shape as a serial accumulation would yield.
-
-    Args:
-        g_stack: Pytree of arrays whose leading axis indexes
-            microbatches.
-
-    Returns:
-        Pytree of arrays with the leading axis summed away.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/vmap_sum"):
-        return jax.tree.map(lambda x: x.sum(axis=0), g_stack, is_leaf=_is_leaf)
-
-
-@jax.jit
-def _accumulate_state(acc, add):
-    """Module-level cached grad accumulator: ``acc + add`` leaf-wise.
-
-    Defined at module scope so JAX's trace cache hits across every
-    ``sxcall`` call and across every stage with matching pytree
-    shape — eliminates the per-call re-trace cost that previously
-    dominated step time at small batch sizes.
-
-    Args:
-        acc: Acc value consumed by this operation.
-        add: Add value consumed by this operation.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/accumulate_state"):
-        return jax.tree.map(lambda a, b: a + b, acc, add, is_leaf=_is_leaf)
-
-
-def _accumulate_grad_tree_impl(acc, add):
-    """Add two grad pytrees leaf-wise under a cached jit, preserving ``float0``.
-
-    Module-scope so JAX's trace cache reuses the compiled HLO across
-    every :func:`sxcall` invocation that handles the same param tree
-    shape.
-
-    Args:
-        acc: Running gradient accumulator pytree.
-        add: New gradient contribution to fold in.
-
-    Returns:
-        ``acc + add`` leaf-wise, with ``float0`` leaves treated as
-        additive zero.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/accumulate_grad_tree"):
-        return jax.tree.map(_add_grad, acc, add, is_leaf=_is_leaf)
-
-
-_accumulate_grad_tree = jax.jit(_accumulate_grad_tree_impl)
-_accumulate_grad_tree_donate = jax.jit(_accumulate_grad_tree_impl, donate_argnums=(0,))
-
-
-@jax.jit
-def _scale_grad_tree(state, scalar):
-    """Scale every leaf of a grad pytree by ``scalar`` under a cached jit.
-
-    Companion to :func:`_accumulate_grad_tree`; ``float0`` leaves
-    pass through unchanged so integer-input branches stay valid.
-
-    Args:
-        state: Pytree of grad leaves.
-        scalar: Multiplier (typically ``1/M``).
-
-    Returns:
-        Grad pytree with each leaf scaled.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/scale_grad_tree"):
-        return jax.tree.map(lambda x: _scale_grad(x, scalar), state, is_leaf=_is_leaf)
-
-
-@jax.jit
-def _zeros_like_state(state):
-    """Module-level cached ``zeros_like`` over a State pytree.
-
-    Replaces the per-call ``jax.tree.map(jnp.zeros_like, sp)`` which
-    issued one eager dispatch per parameter leaf — ~0.3 ms each on
-    TPU, easily 60+ ms per step on medium models.
-
-    Args:
-        state: SpectraX state tree or transform state passed into the operation.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/zeros_like_state"):
-        return jax.tree.map(jnp.zeros_like, state, is_leaf=_is_leaf)
-
-
-@jax.jit
-def _scale_state(state, scalar):
-    """Multiply every array leaf of ``state`` by ``scalar`` under one jit.
-
-    Used to apply the ``1/M`` mean-loss / mean-grad scaling. Defined at
-    module scope so JAX's trace cache hits across every :func:`sxcall`
-    invocation with the same state pytree shape.
-
-    Args:
-        state: Pytree of arrays (or :class:`State` /
-            :class:`Variable`-leaved tree).
-        scalar: Multiplicative factor (typically ``1.0 / M``).
-
-    Returns:
-        Same pytree structure with every array leaf scaled.
-    """
-    with jax.named_scope("spectrax/mpmd/grad/scale_state"):
-        return jax.tree.map(lambda g: g * scalar, state, is_leaf=_is_leaf)
-
-
-def _get_loss_and_g_y(
-    loss_fn: Callable[..., jax.Array],
-    has_aux: bool = False,
-    donate_argnums: tuple[int, ...] = (),
-) -> Callable[..., object]:
-    """Return a jitted ``(y, *targets) -> (loss, grad_wrt_y, [aux])`` for ``loss_fn``.
-
-    When ``has_aux=True``, ``loss_fn`` must return ``(scalar, aux_pytree)``.
-    The returned wrapper yields ``(loss, g_y, aux)`` so the caller can
-    accumulate aux across microbatches.
-
-    Cached on ``(id(loss_fn), has_aux, donate_argnums)``.
-
-    Args:
-        loss_fn: Loss fn value consumed by this operation.
-        has_aux: Has aux value consumed by this operation.
-        donate_argnums: Donate argnums value consumed by this operation.
-
-    Returns:
-        Return a jitted ``(y, *targets) -> (loss, grad_wrt_y, [aux])`` for ``loss_fn``.
-    """
-    key = (id(loss_fn), has_aux, donate_argnums)
-    cached = _LOSS_JIT_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    if has_aux:
-        if donate_argnums:
-
-            @functools.partial(jax.jit, donate_argnums=donate_argnums)
-            def loss_and_g_y(y, *targets):
-                """Return ``(loss, d_loss/d_y, aux)`` for an aux-returning loss.
-
-                The auxiliary pytree is passed through unchanged so the
-                caller can accumulate it across microbatches without
-                running a second pass through the loss.
-
-                Args:
-                    y: Secondary input value consumed by the operation.
-                    *targets: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-
-                def local_loss(y_):
-                    """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``.
-
-                    Args:
-                        y_: Y  value consumed by this operation.
-                    """
-                    return loss_fn(y_, *targets)
-
-                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y_aux"):
-                    (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
-                    return loss_val, g_y, aux
-
-        else:
-
-            @jax.jit
-            def loss_and_g_y(y, *targets):
-                """Return ``(loss, d_loss/d_y, aux)`` for an aux-returning loss.
-
-                The auxiliary pytree is passed through unchanged so the
-                caller can accumulate it across microbatches without
-                running a second pass through the loss.
-
-                Args:
-                    y: Secondary input value consumed by the operation.
-                    *targets: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-
-                def local_loss(y_):
-                    """Loss closure used by :func:`jax.value_and_grad`; returns ``(scalar, aux)``.
-
-                    Args:
-                        y_: Y  value consumed by this operation.
-                    """
-                    return loss_fn(y_, *targets)
-
-                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y_aux"):
-                    (loss_val, aux), g_y = jax.value_and_grad(local_loss, has_aux=True)(y)
-                    return loss_val, g_y, aux
-
-    else:
-        if donate_argnums:
-
-            @functools.partial(jax.jit, donate_argnums=donate_argnums)
-            def loss_and_g_y(y, *targets):
-                """Return ``(loss, d_loss/d_y)`` for a plain scalar-loss callable.
-
-                ``targets`` are bound at call time; the returned grad
-                is taken with respect to ``y`` only.
-
-                Args:
-                    y: Secondary input value consumed by the operation.
-                    *targets: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-
-                def local_loss(y_):
-                    """Scalar loss closure passed to :func:`jax.value_and_grad`.
-
-                    Args:
-                        y_: Y  value consumed by this operation.
-                    """
-                    return loss_fn(y_, *targets)
-
-                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y"):
-                    return jax.value_and_grad(local_loss)(y)
-
-        else:
-
-            @jax.jit
-            def loss_and_g_y(y, *targets):
-                """Return ``(loss, d_loss/d_y)`` for a plain scalar-loss callable.
-
-                ``targets`` are bound at call time; the returned grad
-                is taken with respect to ``y`` only.
-
-                Args:
-                    y: Secondary input value consumed by the operation.
-                    *targets: Additional positional arguments forwarded to the wrapped callable or backend.
-                """
-
-                def local_loss(y_):
-                    """Scalar loss closure passed to :func:`jax.value_and_grad`.
-
-                    Args:
-                        y_: Y  value consumed by this operation.
-                    """
-                    return loss_fn(y_, *targets)
-
-                with jax.named_scope("spectrax/mpmd/loss/loss_and_grad_y"):
-                    return jax.value_and_grad(local_loss)(y)
-
-    _LOSS_JIT_CACHE[key] = loss_and_g_y
-    weak_invalidate(loss_fn, _LOSS_JIT_CACHE, key)
-    return loss_and_g_y
-
-
-def _build_stage_callables(
-    stage: Module,
-    donate_fwd: tuple[int, ...] = (),
-    donate_bwd: tuple[int, ...] = (),
-) -> tuple[
-    Callable[..., object],
-    Callable[..., object],
-    State,
-    State,
-    object,
-]:
-    """Compile forward and unified-backward functions for a stage.
-
-    Two jits per stage:
-
-        * ``fwd_only(params, rest, x) -> y`` — the forward pass.
-        * ``bwd_only(params, rest, x, g_y) -> (g_params, g_x)`` — the full
-          VJP via :func:`jax.vjp` (``linearize`` is avoided because it
-    fails on integer-valued inputs such as token-id embeddings).
-    For :class:`~spectrax.runtime.schedules.ZeroBubbleH1`, both
-    :attr:`Phase.BWD_I` and :attr:`Phase.BWD_W` call this same jit
-    but discard one of the two outputs; XLA's dead-code elimination
-    collapses each half-call to roughly half the work of the full
-    backward.
-
-    Compared to an earlier implementation with three separate VJP
-    jits (``bwd``, ``bwd_i``, ``bwd_w``), this trims tracing cost by
-    eliminating the redundant re-tracings of ``stage_fn``.
-
-    ``rest`` and ``gdef`` are passed as explicit arguments to the jit
-    (not closure-captured) so JAX's trace cache keys on ``(arg avals)``
-    alone — every subsequent call with the same shape signature hits
-    the cache, even across distinct ``sxcall`` invocations.
-
-    Returns:
-            ``(fwd_only, bwd_only, params, rest, gdef)`` — ``parameters`` /
-            ``rest`` are the initial state split; ``gdef`` is the stage's
-            :class:`GraphDef` (retained for potential reuse).
-
-    Args:
-        stage: Stage value consumed by this operation.
-        donate_fwd: Donate fwd value consumed by this operation.
-        donate_bwd: Donate bwd value consumed by this operation.
-    """
-    gdef, state = export(stage)
-    params, rest = _split_params_rest(state)
-
-    n_leaves = len(jax.tree.leaves(params))
-    cache_key = (id(stage), donate_fwd, donate_bwd)
-    cached = _STAGE_CALLABLE_CACHE.get(cache_key)
-    if cached is not None:
-        cached_fwd, cached_bwd, cached_n_leaves = cached
-        if cached_n_leaves == n_leaves:
-            return cached_fwd, cached_bwd, params, rest, gdef
-        del _STAGE_CALLABLE_CACHE[cache_key]
-
-    if donate_fwd:
-
-        @functools.partial(jax.jit, donate_argnums=donate_fwd)
-        def fwd_only(params, rest, x):
-            """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
-
-            Args:
-                params: The differentiable parameter :class:`State`
-                    placed on this rank.
-                rest: Non-parameter state (overlaid on ``params``).
-                x: Stage input activation.
-
-            Returns:
-                The stage's output activation.
-            """
-            with jax.named_scope("spectrax/mpmd/train/stage_forward"):
-                module = bind(gdef, params.overlay(rest))
-                return module(x)
-
-    else:
-
-        @jax.jit
-        def fwd_only(params, rest, x):
-            """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
-
-            Args:
-                params: The differentiable parameter :class:`State`
-                    placed on this rank.
-                rest: Non-parameter state (overlaid on ``params``).
-                x: Stage input activation.
-
-            Returns:
-                The stage's output activation.
-            """
-            with jax.named_scope("spectrax/mpmd/train/stage_forward"):
-                module = bind(gdef, params.overlay(rest))
-                return module(x)
-
-    if donate_bwd:
-
-        @functools.partial(jax.jit, donate_argnums=donate_bwd)
-        def bwd_only(params, rest, x, g_y):
-            """(g_params, g_x) via :func:`jax.vjp`.
-
-            Uses ``vjp`` instead of ``linearize + linear_transpose`` because
-            ``linearize`` fails on stages whose inputs contain integers
-            (e.g. an embedding layer taking token IDs). ``vjp`` handles the
-            int-to-float boundary correctly.
-
-            Args:
-                params: Parameter mapping or primitive parameter dictionary.
-                rest: Rest value consumed by this operation.
-                x: Input value consumed by the operation.
-                g_y: G y value consumed by this operation.
-            """
-
-            def stage_fn(p, r, xi):
-                """Pure forward closure used as the :func:`jax.vjp` target.
-
-                Re-binds the stage from ``gdef`` on every call so the
-                VJP can differentiate through fresh leaves rather than
-                the captured originals (necessary because :func:`vjp`
-                tracks the identity of its inputs).
-
-                Args:
-                    p: P value consumed by this operation.
-                    r: R value consumed by this operation.
-                    xi: Xi value consumed by this operation.
-                """
-                return bind(gdef, p.overlay(r))(xi)
-
-            with jax.named_scope("spectrax/mpmd/train/stage_backward"):
-                _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
-                g_params, _g_rest, g_x = vjp_fn(g_y)
-                return g_params, g_x
-
-    else:
-
-        @jax.jit
-        def bwd_only(params, rest, x, g_y):
-            """(g_params, g_x) via :func:`jax.vjp`.
-
-            Uses ``vjp`` instead of ``linearize + linear_transpose`` because
-            ``linearize`` fails on stages whose inputs contain integers
-            (e.g. an embedding layer taking token IDs). ``vjp`` handles the
-            int-to-float boundary correctly.
-
-            Args:
-                params: Parameter mapping or primitive parameter dictionary.
-                rest: Rest value consumed by this operation.
-                x: Input value consumed by the operation.
-                g_y: G y value consumed by this operation.
-            """
-
-            def stage_fn(p, r, xi):
-                """Pure forward closure used as the :func:`jax.vjp` target.
-
-                Re-binds the stage from ``gdef`` on every call so the
-                VJP can differentiate through fresh leaves rather than
-                the captured originals (necessary because :func:`vjp`
-                tracks the identity of its inputs).
-
-                Args:
-                    p: P value consumed by this operation.
-                    r: R value consumed by this operation.
-                    xi: Xi value consumed by this operation.
-                """
-                return bind(gdef, p.overlay(r))(xi)
-
-            with jax.named_scope("spectrax/mpmd/train/stage_backward"):
-                _y, vjp_fn = jax.vjp(stage_fn, params, rest, x)
-                g_params, _g_rest, g_x = vjp_fn(g_y)
-                return g_params, g_x
-
-    _STAGE_CALLABLE_CACHE[cache_key] = (fwd_only, bwd_only, n_leaves)
-    weak_invalidate(stage, _STAGE_CALLABLE_CACHE, cache_key)
-    return fwd_only, bwd_only, params, rest, gdef
 
 
 def _normalize_target(

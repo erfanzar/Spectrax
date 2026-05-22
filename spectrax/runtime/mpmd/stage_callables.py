@@ -15,6 +15,7 @@ from ...core._weakcache import weak_invalidate
 from ...core.graph import bind, export
 from ...core.module import Module
 from ...core.state import State
+from ...transforms.jit import jit as spx_jit
 from .grad_core import _split_params_rest
 
 _STAGE_CALLABLE_CACHE: dict[int, tuple[Callable[..., object], Callable[..., object], int]] = {}
@@ -78,7 +79,7 @@ def _build_stage_callables(
 
     if donate_fwd:
 
-        @functools.partial(jax.jit, donate_argnums=donate_fwd)
+        @functools.partial(spx_jit, donate_argnums=donate_fwd)
         def fwd_only(params, rest, x):
             """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
 
@@ -97,7 +98,7 @@ def _build_stage_callables(
 
     else:
 
-        @jax.jit
+        @spx_jit
         def fwd_only(params, rest, x):
             """Run a single stage forward by re-binding ``(params, rest)`` into ``gdef``.
 
@@ -116,7 +117,7 @@ def _build_stage_callables(
 
     if donate_bwd:
 
-        @functools.partial(jax.jit, donate_argnums=donate_bwd)
+        @functools.partial(spx_jit, donate_argnums=donate_bwd)
         def bwd_only(params, rest, x, g_y):
             """(g_params, g_x) via :func:`jax.vjp`.
 
@@ -154,7 +155,7 @@ def _build_stage_callables(
 
     else:
 
-        @jax.jit
+        @spx_jit
         def bwd_only(params, rest, x, g_y):
             """(g_params, g_x) via :func:`jax.vjp`.
 

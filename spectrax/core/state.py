@@ -24,7 +24,7 @@ import jax
 from ._typing import Array, Path
 from .paths import path_to_str, str_to_path
 
-__all__ = ["State"]
+__all__ = ["State", "StateCallABI", "state_call_abi"]
 
 Leaf = Array | object
 """A stored leaf. Typically an :class:`Array` but left wide for traced values."""
@@ -552,8 +552,8 @@ _KeyedSubtreeAux = tuple[tuple[object, bool], ...]
 
 def _keyed_subtree_children(
     tree: _KeyedSubtree,
-) -> tuple[tuple[tuple[jax.tree_util.DictKey, object], ...], _KeyedSubtreeAux]:
-    key_children: list[tuple[jax.tree_util.DictKey, object]] = []
+) -> tuple[tuple[tuple[jax.tree_util.DictKey, object], ...], _KeyedSubtreeAux]:  # type: ignore
+    key_children: list[tuple[jax.tree_util.DictKey, object]] = []  # type: ignore
     aux: list[tuple[object, bool]] = []
     for key, value in sorted(tree.data.items(), key=lambda item: _sort_key(item[0])):
         is_subtree = isinstance(value, dict) and bool(value)
@@ -597,9 +597,10 @@ class State:
     ``copy=True`` to return a detached snapshot instead.
     """
 
-    __slots__ = ("_data", "_writers")
+    __slots__ = ("__weakref__", "_data", "_version", "_writers")
 
     _data: dict[str, dict[str, Leaf]]
+    _version: int
     _writers: dict[tuple[str, str], Writer] | None
 
     def __init__(self, data: Mapping[str, Mapping[str, Leaf]] | None = None) -> None:
@@ -627,6 +628,7 @@ class State:
                 is_nested = any(isinstance(v, dict) and v for v in inner_dict.values())
                 d[c] = inner_dict if is_nested else _flat_to_nested(inner_dict)
         object.__setattr__(self, "_data", d)
+        object.__setattr__(self, "_version", 0)
         object.__setattr__(self, "_writers", None)
 
     @classmethod
@@ -651,8 +653,13 @@ class State:
         """
         obj = cls.__new__(cls)
         object.__setattr__(obj, "_data", data)
+        object.__setattr__(obj, "_version", 0)
         object.__setattr__(obj, "_writers", dict(writers) if writers else None)
         return obj
+
+    def _touch(self) -> None:
+        """Mark the state as structurally or leaf-value changed."""
+        object.__setattr__(self, "_version", self._version + 1)
 
     def copy(self) -> State:
         """Return a detached nested structure with shared immutable leaves.
@@ -711,6 +718,7 @@ class State:
         """
         dotted = path_to_str(path)
         _nested_set(self._data.setdefault(collection, {}), path, value)
+        self._touch()
         if self._writers is None:
             return
         writer = self._writers.get((collection, dotted))
@@ -750,6 +758,7 @@ class State:
         """
         replacement = _normalize_inner_mapping(value)
         self._data[collection] = {}
+        self._touch()
         _sync_nested(self, collection, replacement)
         self._restrict_writers()
 
@@ -794,9 +803,11 @@ class State:
     def raw(self) -> dict[str, dict[str, Leaf]]:
         """Return the backing nested-dict.
 
-        Direct nested-dict mutation bypasses live write-through hooks.
-        Prefer :meth:`set`, :meth:`merge`, or :meth:`map` when you want
-        live-backed updates to propagate.
+        Direct nested-dict mutation bypasses live write-through hooks
+        and versioned call-boundary cache invalidation. Prefer
+        :meth:`set`, :meth:`merge`, or :meth:`map` when you want
+        updates to propagate through live modules and cached
+        :func:`spectrax.jit` State arguments.
 
         Returns:
             The internal two-level ``{collection: {path: leaf}}`` dict.
@@ -846,6 +857,7 @@ class State:
         filtered = {c: self._data[c] for c in collections if c in self._data}
         self._data.clear()
         self._data.update(filtered)
+        self._touch()
         self._restrict_writers()
         return self
 
@@ -868,6 +880,7 @@ class State:
         remaining = {c: d for c, d in self._data.items() if c not in collections}
         self._data.clear()
         self._data.update(remaining)
+        self._touch()
         self._restrict_writers()
         return self
 
@@ -926,6 +939,7 @@ class State:
                 continue
             mapped = _map_nested(d, fn, collection=c, arity=arity)
             target._data[c] = mapped
+            target._touch()
             if target._writers is not None:
                 for path_tuple, value in _nested_items(mapped):
                     writer = target._writers.get((c, path_to_str(path_tuple)))
@@ -980,6 +994,32 @@ class State:
                 out[f"{c}/{path_to_str(path_tuple)}"] = v
         return out
 
+    def call_abi(self) -> StateCallABI:
+        """Return a cached flat-call ABI for this state's current pytree shape.
+
+        ``State`` remains a normal JAX pytree for transforms, checkpointing, and
+        training code. This helper is for hot serving loops that repeatedly pass
+        the same state structure into a jitted callable and want the cheapest
+        call boundary: cache the treedef once, pass only the leaf tuple each
+        step, and reconstruct the :class:`State` inside the compiled function.
+
+        Returns:
+            A :class:`StateCallABI` specialized to this state's pytree layout.
+        """
+        return StateCallABI(self)
+
+    def call_leaves(self) -> tuple[Leaf, ...]:
+        """Return the flat leaf tuple used by :class:`StateCallABI`.
+
+        This is intentionally different from :meth:`flatten`, which returns a
+        keyed dictionary for serialization/debugging. ``call_leaves`` preserves
+        JAX pytree order and is meant for jitted call arguments.
+
+        Returns:
+            Tuple of state leaves in deterministic pytree order.
+        """
+        return tuple(jax.tree_util.tree_leaves(self))
+
     @classmethod
     def from_flat(cls, flat: Mapping[str, Leaf]) -> State:
         """Construct a :class:`State` from the dict produced by :meth:`flatten`.
@@ -1012,6 +1052,123 @@ class State:
         total = len(self)
         cols = ", ".join(f"{c}={sum(1 for _ in _nested_paths(d))}" for c, d in self._data.items())
         return f"State({total} leaves | {cols})"
+
+
+class StateCallABI:
+    """Flat call ABI for repeatedly passing a :class:`State` through ``jax.jit``.
+
+    JAX already knows how to flatten :class:`State`, but repeatedly passing the
+    full wrapper object through a latency-sensitive decode loop can add
+    avoidable Python/pytree overhead at the dispatch boundary. ``StateCallABI``
+    caches the state treedef once so callers can pass a plain tuple of array
+    leaves and reconstruct the state inside the compiled body.
+
+    Example:
+        >>> gdef, state = spx.export(model)
+        >>> abi = state.call_abi()
+        >>>
+        >>> @jax.jit
+        ... def step(state_leaves, x):
+        ...     state = abi.unflatten(state_leaves)
+        ...     return spx.bind(gdef, state)(x)
+        >>>
+        >>> y = step(abi.flatten(state), x)
+    """
+
+    __slots__ = ("num_leaves", "treedef", "treedef_key")
+
+    treedef: object
+    treedef_key: str
+    num_leaves: int
+
+    def __init__(self, template: State) -> None:
+        """Create an ABI from a template state.
+
+        Args:
+            template: State whose pytree structure defines this ABI.
+        """
+        leaves, treedef = jax.tree_util.tree_flatten(template)
+        self.treedef = treedef
+        self.treedef_key = repr(treedef)
+        self.num_leaves = len(leaves)
+
+    @classmethod
+    def from_state(cls, state: State) -> StateCallABI:
+        """Build a :class:`StateCallABI` from ``state``."""
+        return cls(state)
+
+    @classmethod
+    def _from_flattened(cls, leaves: tuple[Leaf, ...] | list[Leaf], treedef: object) -> StateCallABI:
+        """Build an ABI from an already-computed flatten result."""
+        obj = cls.__new__(cls)
+        obj.treedef = treedef
+        obj.treedef_key = repr(treedef)
+        obj.num_leaves = len(leaves)
+        return obj
+
+    def flatten(self, state: State) -> tuple[Leaf, ...]:
+        """Flatten ``state`` to the leaf tuple expected by this ABI.
+
+        Args:
+            state: State with the same pytree structure as the template.
+
+        Returns:
+            Tuple of leaves suitable for a jitted call argument.
+
+        Raises:
+            ValueError: If ``state`` has a different pytree structure.
+        """
+        leaves, treedef = jax.tree_util.tree_flatten(state)
+        if treedef != self.treedef:
+            raise ValueError("StateCallABI.flatten received a State with a different pytree structure.")
+        return tuple(leaves)
+
+    def unflatten(self, leaves: tuple[Leaf, ...] | list[Leaf]) -> State:
+        """Reconstruct a :class:`State` from call leaves.
+
+        Args:
+            leaves: Leaf sequence previously produced by :meth:`flatten`.
+
+        Returns:
+            Reconstructed :class:`State`.
+
+        Raises:
+            ValueError: If the leaf count does not match this ABI.
+        """
+        leaves_tuple = tuple(leaves)
+        if len(leaves_tuple) != self.num_leaves:
+            raise ValueError(
+                f"StateCallABI.unflatten leaf count mismatch: expected {self.num_leaves}, got {len(leaves_tuple)}."
+            )
+        return jax.tree_util.tree_unflatten(self.treedef, leaves_tuple)
+
+    def flatten_sharding(self, sharding_tree: object) -> tuple[object, ...]:
+        """Flatten a state-shaped sharding tree for ``jax.jit(in_shardings=...)``.
+
+        Args:
+            sharding_tree: Sharding pytree with the same leaf count as the state.
+
+        Returns:
+            Tuple of sharding leaves matching :meth:`flatten`.
+
+        Raises:
+            ValueError: If the sharding tree has a different leaf count.
+        """
+        leaves = tuple(jax.tree_util.tree_leaves(sharding_tree))
+        if len(leaves) != self.num_leaves:
+            raise ValueError(
+                f"StateCallABI.flatten_sharding leaf count mismatch: expected {self.num_leaves}, got {len(leaves)}."
+            )
+        return leaves
+
+
+def state_call_abi(state: State) -> StateCallABI:
+    """Return a :class:`StateCallABI` for ``state``.
+
+    This top-level helper mirrors :meth:`State.call_abi` for code that prefers
+    function-style APIs.
+    """
+    return StateCallABI(state)
 
 
 _StateAux = tuple[tuple[str, str], ...]
@@ -1055,7 +1212,7 @@ def _state_flatten_with_keys(
     Returns:
         Result described by this helper.
     """
-    key_children: list[tuple[jax.tree_util.DictKey, _KeyedSubtree]] = []
+    key_children: list[tuple[jax.tree_util.DictKey, _KeyedSubtree]] = []  # type: ignore
     spec: list[tuple[str, str]] = []
     for c, inner in sorted(s._data.items(), key=lambda x: _sort_key(x[0])):
         if not inner:

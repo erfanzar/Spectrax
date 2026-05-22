@@ -142,7 +142,7 @@ from .core.selector import (
 )
 from .core.sharding import AxisNames, Sharding
 from .core.stage_assignment import assign_stage
-from .core.state import State
+from .core.state import State, StateCallABI, state_call_abi
 from .core.static import Static
 from .core.variable import (
     Buffer,
@@ -267,6 +267,7 @@ __all__ = [
     "SpxMesh",
     "State",
     "StateAxes",
+    "StateCallABI",
     "Static",
     "Std1F1B",
     "Variable",
@@ -340,6 +341,7 @@ __all__ = [
     "sharding",
     "split_rngs",
     "split_stream_keys",
+    "state_call_abi",
     "switch",
     "sxcall",
     "sxgrad",

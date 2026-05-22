@@ -33,6 +33,7 @@ from ...core.graph import bind, export, strip_pipeline_stage_metadata
 from ...core.state import State
 from ...core.variable import Variable
 from ...nn.pipeline_sequential import PipelineSequential
+from ...transforms.jit import jit as spx_jit
 from ..schedules import Schedule
 
 __all__ = ["spmd_run"]
@@ -508,7 +509,7 @@ def _build_spmd_step(
         per_mb_losses = jax.vmap(per_mb)(xs, *targets)
         return per_mb_losses.mean().astype(jnp.float32)
 
-    @jax.jit
+    @spx_jit
     def step(stacked_params, stacked_rest, *mb_batch):
         """Jitted step: ``(stacked_params, stacked_rest, *mb_batch) -> (loss, per_stage_grads)``.
 

@@ -14,6 +14,7 @@ import jax.numpy as jnp
 
 from ...core._weakcache import weak_invalidate
 from ...core.state import State
+from ...transforms.jit import jit as spx_jit
 from .utils.tree import _add_grad, _is_leaf, _scale_grad
 
 _FUSED_FWDBWD_CACHE: dict[tuple[int, int], Callable[..., object]] = {}
@@ -79,7 +80,7 @@ def _get_fused_fwd_bwd_jit(
     if cached is not None:
         return cached
 
-    @jax.jit
+    @spx_jit
     def fused(params, rest, x_fwd, x_bwd, g_y_bwd):
         """Run forward on ``x_fwd`` and backward on ``(x_bwd, g_y_bwd)`` in one HLO.
 

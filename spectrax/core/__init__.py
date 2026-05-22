@@ -22,6 +22,7 @@ from .policy import Policy
 from .registry import qualified_name, resolve_class
 from .sharding import AxisNames, Sharding
 from .stage_assignment import assign_stage
+from .state import State, StateCallABI, state_call_abi
 from .static import Static
 from .variable import Buffer, InitPlacementHook, Parameter, Variable, variable_init_placement
 
@@ -38,6 +39,8 @@ __all__ = [
     "SelectorError",
     "Sharding",
     "SpecTraxError",
+    "State",
+    "StateCallABI",
     "Static",
     "Variable",
     "assign_stage",
@@ -45,6 +48,7 @@ __all__ = [
     "path_to_str",
     "qualified_name",
     "resolve_class",
+    "state_call_abi",
     "str_to_path",
     "variable_init_placement",
 ]

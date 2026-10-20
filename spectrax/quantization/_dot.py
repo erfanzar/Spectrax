@@ -439,8 +439,6 @@ def dot_general(
       floating point regardless and XLA can fuse the dequantize;
     * a quantized operand's type cannot be dequantized on the output
       (``"nf4"``, whose values are code-book indices);
-    * a quantized operand carries a floating zero point, whose fractional
-      correction cannot be accumulated in an integer contraction;
     * a contracted axis is tiled below
       :data:`MIN_TILE_SIZE_FOR_OUTPUT_DEQUANT`, where the promoted batch
       axis costs more than the low-precision contraction saves.
@@ -465,11 +463,7 @@ def dot_general(
             continue
 
         validate_qarray(operand)
-        if not numerics.can_dequantize_on_output(operand.qtype) or (
-            operand.zero_point is not None and jnp.issubdtype(operand.zero_point.dtype, jnp.floating)
-        ):
-            # An exact-affine zero point is fractional (and may lie outside
-            # the code range). Integer output corrections would truncate it.
+        if not numerics.can_dequantize_on_output(operand.qtype):
             dequantize_on_input = True
             break
         for axis in contracting:

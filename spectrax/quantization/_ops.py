@@ -56,7 +56,6 @@ from ._calibrate import (
     Calibration,
     HowToQuantize,
     calibrate,
-    calibrate_across_axis,
     compute_scale_zero_point,
     dequantize,
     quantize,
@@ -82,7 +81,6 @@ def fake_quant(
     is_weight: bool = True,
     tile_size: int | float | None | object = ...,
     calibration_transform: Callable[[Calibration], Calibration] | None = None,
-    calibration_axis_name: str | tuple[str, ...] | None = None,
 ) -> Array:
     """Round ``array`` onto its quantized grid and reconstruct it, gradient-transparently.
 
@@ -123,11 +121,6 @@ def fake_quant(
             statistic. It is also the hook for static-range quantization,
             where the scale comes from a running average rather than from
             this step's values.
-        calibration_axis_name: Mesh axis (or ordered axes) partitioning the
-            first contracted operand axis. Calibration combines only pieces
-            belonging to the same global tile; complete local tiles remain
-            independent. Applied before ``calibration_transform``. Defaults
-            to local calibration.
 
     Returns:
         An array equal to the dequantized quantization of ``array``, with
@@ -148,23 +141,11 @@ def fake_quant(
         calibration_method=rule.weight_calibration_method if is_weight else rule.act_calibration_method,
         power_of_two_scale=rule.power_of_two_scale,
     )
-    if calibration_axis_name is not None and not contracting_axes:
-        raise ValueError("calibration_axis_name requires a contracted operand axis.")
-    # Statistics define the forward grid, never the STE derivative. Detach
-    # before collective calibration: pmax/pmin have no JAX AD rule, even
-    # when their final reconstruction is later wrapped in stop_gradient.
-    calibration = calibrate_across_axis(
-        jax.lax.stop_gradient(array),
-        how,
-        calibration_axis_name,
-        array_axis=contracting_axes[0] % array.ndim if contracting_axes else 0,
-    )
+    calibration = calibrate(array, how)
     if calibration_transform is not None:
         calibration = calibration_transform(calibration)
     scale, zero_point = compute_scale_zero_point(calibration, qtype, power_of_two_scale=rule.power_of_two_scale)
-    quantized = quantize_with_scale_zero_point(
-        array, qtype, scale, zero_point, how.noise_fn, exact_affine="affine_neg_min" in calibration
-    )
+    quantized = quantize_with_scale_zero_point(array, qtype, scale, zero_point, how.noise_fn)
     reconstructed = dequantize(quantized).astype(array.dtype)
     # Exactly `reconstructed` in the forward (adding an exact zero is
     # exact in IEEE arithmetic) and exactly the identity in the backward.
@@ -405,19 +386,11 @@ def _dot_general_qt_fwd(
         ``(result, residuals)`` in the shape :func:`jax.custom_vjp` wants.
     """
     if lhs_calibration is not None:
-        scale, zero_point = compute_scale_zero_point(
-            lhs_calibration, config.lhs_qtype, power_of_two_scale=config.power_of_two_scale
-        )
-        lhs = quantize_with_scale_zero_point(
-            lhs, config.lhs_qtype, scale, zero_point, exact_affine="affine_neg_min" in lhs_calibration
-        )
+        scale, zero_point = compute_scale_zero_point(lhs_calibration, config.lhs_qtype)
+        lhs = quantize_with_scale_zero_point(lhs, config.lhs_qtype, scale, zero_point)
     if rhs_calibration is not None:
-        scale, zero_point = compute_scale_zero_point(
-            rhs_calibration, config.rhs_qtype, power_of_two_scale=config.power_of_two_scale
-        )
-        rhs = quantize_with_scale_zero_point(
-            rhs, config.rhs_qtype, scale, zero_point, exact_affine="affine_neg_min" in rhs_calibration
-        )
+        scale, zero_point = compute_scale_zero_point(rhs_calibration, config.rhs_qtype)
+        rhs = quantize_with_scale_zero_point(rhs, config.rhs_qtype, scale, zero_point)
     return quantized_dot_general(lhs, rhs, dimension_numbers), (lhs, rhs)
 
 
@@ -470,16 +443,12 @@ def _dot_general_qt_bwd(
             grad_method = config.drhs_grad_calibration_method
 
         if grad_qtype and numerics.should_quantize(operand_cotangent.dtype):
-            if (
-                isinstance(residual, QArray)
-                and not tiled_axes(residual)
-                and residual.zero_point is None
-                and residual.qtype == residual.qvalue.dtype
-            ):
+            if isinstance(residual, QArray) and not tiled_axes(residual):
                 # The residual's channelwise scales were chosen for the
                 # forward contraction and sit on the wrong axes here.
-                # Folding them into the cotangent is exact only for a
-                # symmetric arithmetic grid, not affine or code-book values.
+                # Folding them into the cotangent is exact and avoids a
+                # second quantization of the residual.
+                assert residual.zero_point is None and residual.qtype == residual.qvalue.dtype
                 operand_cotangent = _fold_residual_scale_into_cotangent(
                     operand_cotangent, residual.scale, backward_dnums
                 )
